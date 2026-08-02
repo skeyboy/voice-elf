@@ -1,6 +1,5 @@
 mod asr;
 mod translator;
-mod tts;
 
 use std::{sync::Arc, time::Duration};
 
@@ -12,18 +11,11 @@ use crate::config::{AppConfig, BackendMode};
 
 pub use asr::{DemoTranscriber, NoSpeechDetected, QwenAsrTranscriber};
 pub use translator::{DemoTranslator, LlamaCppTranslator, LocalLlmTranslator};
-pub use tts::{DemoSynthesizer, QwenTtsSynthesizer};
 
 #[derive(Clone, Debug)]
 pub struct Transcription {
     pub text: String,
     pub language: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct SynthesizedAudio {
-    pub samples: Vec<i16>,
-    pub sample_rate: u32,
 }
 
 pub struct LiveTranscription {
@@ -97,17 +89,10 @@ pub trait Translator: Send + Sync {
     ) -> Result<String>;
 }
 
-#[async_trait]
-pub trait Synthesizer: Send + Sync {
-    async fn synthesize(&self, text: &str, language: &str, voice: &str)
-    -> Result<SynthesizedAudio>;
-}
-
 #[derive(Clone)]
 pub struct AppServices {
     pub transcriber: Arc<dyn Transcriber>,
     pub translator: Arc<dyn Translator>,
-    pub synthesizer: Arc<dyn Synthesizer>,
     pub backend_name: &'static str,
 }
 
@@ -118,7 +103,6 @@ impl AppServices {
             BackendMode::Demo => Ok(Self {
                 transcriber: Arc::new(DemoTranscriber::new()),
                 translator: Arc::new(DemoTranslator::new()),
-                synthesizer: Arc::new(DemoSynthesizer::new()),
                 backend_name: "demo",
             }),
             BackendMode::Local => {
@@ -139,10 +123,6 @@ impl AppServices {
                         config.inference_timeout,
                     )?),
                     translator,
-                    synthesizer: Arc::new(QwenTtsSynthesizer::new(
-                        config.tts.clone(),
-                        config.inference_timeout,
-                    )?),
                     backend_name: "local",
                 })
             }

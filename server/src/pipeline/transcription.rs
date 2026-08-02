@@ -10,21 +10,19 @@ use crate::{
 use super::{
     PipelineContext,
     events::{send_event, send_state},
-    jobs::{TextWorkload, TranslationJob, UtteranceJob},
+    jobs::{TranslationJob, UtteranceJob},
 };
 
 pub(super) async fn run_transcription_worker(
     context: PipelineContext,
     mut input: mpsc::Receiver<UtteranceJob>,
     output: mpsc::Sender<TranslationJob>,
-    workload: TextWorkload,
 ) {
     while let Some(job) = input.recv().await {
         let utterance_id = job.id;
         match transcribe(&context, job).await {
             Ok(job) => {
                 if output.send(job).await.is_err() {
-                    workload.finish();
                     break;
                 }
             }
@@ -54,7 +52,6 @@ pub(super) async fn run_transcription_worker(
                     },
                 )
                 .await;
-                workload.finish();
             }
         }
     }

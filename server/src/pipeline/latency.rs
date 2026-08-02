@@ -22,7 +22,6 @@ pub(super) struct LatencyObserver {
     t1: Option<(Instant, u64)>,
     t2: Option<(Instant, u64)>,
     t3: Option<(Instant, u64)>,
-    t4: Option<(Instant, u64)>,
 }
 
 impl LatencyObserver {
@@ -32,7 +31,6 @@ impl LatencyObserver {
             t1: None,
             t2: None,
             t3: None,
-            t4: None,
         }
     }
 
@@ -48,10 +46,6 @@ impl LatencyObserver {
         self.t3 = Some(mark());
     }
 
-    pub(super) fn mark_tts_complete(&mut self) {
-        self.t4 = Some(mark());
-    }
-
     pub(super) fn text_report(&self, input_samples: usize) -> LatencyReport {
         self.report_with_t4(
             input_samples,
@@ -65,10 +59,6 @@ impl LatencyObserver {
 
     pub(super) fn transcription_report(&self, input_samples: usize) -> LatencyReport {
         self.report_with_t4(input_samples, self.t2.expect("STT timestamp must be set"))
-    }
-
-    pub(super) fn complete_report(&self, input_samples: usize) -> LatencyReport {
-        self.report_with_t4(input_samples, self.t4.expect("TTS timestamp must be set"))
     }
 
     fn report_with_t4(&self, input_samples: usize, t4: (Instant, u64)) -> LatencyReport {

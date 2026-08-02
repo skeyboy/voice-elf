@@ -2,7 +2,8 @@ use anyhow::anyhow;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -16,7 +17,10 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    storage::{Database, RoomSummary, UserRecord, UtteranceHistory},
+    protocol::LatencyReport,
+    storage::{
+        BrowserTtsTarget, Database, RoomSummary, UserRecord, UtteranceAudioUpdate, UtteranceHistory,
+    },
 };
 
 pub const AUTH_COOKIE: &str = "voice_elf_session";
@@ -34,6 +38,74 @@ pub fn router() -> Router<AppState> {
             get(room_detail).patch(update_room).delete(delete_room),
         )
         .route("/rooms/{room_id}/join", post(join_room))
+        .route(
+            "/utterances/{utterance_id}/translated-audio",
+            post(upload_translated_audio).layer(DefaultBodyLimit::max(MAX_BROWSER_TTS_BYTES)),
+        )
+}
+
+const MAX_BROWSER_TTS_BYTES: usize = 24 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct BrowserTtsQuery {
+    sample_rate: u32,
+    synthesis_ms: u64,
+}
+
+#[derive(Serialize)]
+struct BrowserTtsResponse {
+    utterance_id: Uuid,
+    translated_audio_url: String,
+    latency: LatencyReport,
+}
+
+async fn upload_translated_audio(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path(utterance_id): Path<Uuid>,
+    Query(query): Query<BrowserTtsQuery>,
+    body: Bytes,
+) -> Result<Json<BrowserTtsResponse>, ApiError> {
+    let user = authenticate(&state, &cookies).await?;
+    if !(8_000..=48_000).contains(&query.sample_rate) {
+        return Err(ApiError::bad_request("译声采样率必须为 8 kHz 到 48 kHz"));
+    }
+    if body.len() < 2 || body.len() > MAX_BROWSER_TTS_BYTES || body.len() % 2 != 0 {
+        return Err(ApiError::bad_request("译声 PCM16 数据长度无效"));
+    }
+    let database = database(&state)?;
+    let target: BrowserTtsTarget = database
+        .browser_tts_target(utterance_id, user.id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::forbidden("只能为自己的已完成译文保存译声"))?;
+    let samples = body
+        .chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    let media = state
+        .media
+        .save_translated(target.session_id, utterance_id, &samples, query.sample_rate)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut latency = target.latency;
+    latency.tts_ms = query.synthesis_ms.min(10 * 60 * 1_000);
+    latency.total_ms = latency.total_ms.saturating_add(latency.tts_ms);
+    latency.t4_unix_ms = latency.t3_unix_ms.saturating_add(latency.tts_ms);
+    database
+        .complete_utterance_audio(UtteranceAudioUpdate {
+            id: utterance_id,
+            translated_audio_path: &media.path,
+            translated_audio_url: &media.url,
+            latency: &latency,
+        })
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(BrowserTtsResponse {
+        utterance_id,
+        translated_audio_url: media.url,
+        latency,
+    }))
 }
 
 #[derive(Debug)]

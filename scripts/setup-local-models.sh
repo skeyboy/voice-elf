@@ -61,7 +61,6 @@ download() {
 }
 
 clone_if_missing "https://github.com/antirez/qwen-asr.git" "${SRC_DIR}/qwen-asr"
-clone_if_missing "https://github.com/TrevorS/qwen3-tts-rs.git" "${SRC_DIR}/qwen3-tts-rs"
 clone_if_missing "https://github.com/ggml-org/llama.cpp.git" "${SRC_DIR}/llama.cpp"
 
 ASR_PATCH="${ROOT}/scripts/patches/qwen-asr-low-latency.patch"
@@ -77,12 +76,6 @@ fi
 echo "[build] Qwen3 ASR with Apple Accelerate"
 make -C "${SRC_DIR}/qwen-asr" blas
 cp "${SRC_DIR}/qwen-asr/qwen_asr" "${BIN_DIR}/qwen_asr"
-
-echo "[build] Qwen3 TTS with Apple Accelerate"
-CARGO_TARGET_DIR="${BUILD_DIR}/qwen3-tts" cargo build \
-  --manifest-path "${SRC_DIR}/qwen3-tts-rs/Cargo.toml" \
-  --release --features cli,accelerate --bin generate_audio
-cp "${BUILD_DIR}/qwen3-tts/release/generate_audio" "${BIN_DIR}/generate_audio"
 
 echo "[build] llama.cpp translator"
 cmake -S "${SRC_DIR}/llama.cpp" -B "${BUILD_DIR}/llama.cpp" \
@@ -104,23 +97,11 @@ download "Qwen/Qwen3-ASR-0.6B" "generation_config.json" "${ASR_DIR}/generation_c
 download "Qwen/Qwen3-ASR-0.6B" "vocab.json" "${ASR_DIR}/vocab.json"
 download "Qwen/Qwen3-ASR-0.6B" "merges.txt" "${ASR_DIR}/merges.txt"
 
-TTS_DIR="${MODEL_DIR}/qwen3-tts-0.6b-customvoice"
-for file in config.json generation_config.json merges.txt preprocessor_config.json tokenizer_config.json vocab.json; do
-  download "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice" "${file}" "${TTS_DIR}/${file}"
-done
-for file in config.json configuration.json preprocessor_config.json; do
-  download "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice" "speech_tokenizer/${file}" "${TTS_DIR}/speech_tokenizer/${file}"
-done
 LLM_DIR="${MODEL_DIR}/qwen3-0.6b"
 
 echo "[download] model weights"
 download "Qwen/Qwen3-ASR-0.6B" "model.safetensors" "${ASR_DIR}/model.safetensors" \
   "79d6cbd4c98c7bbffe9db2edac07f56cd6637d0d5944b27f6c2b8353840323ea"
-download "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice" "model.safetensors" "${TTS_DIR}/model.safetensors" \
-  "bc3c7e785eb961179c25450d1acff03f839e0002f2f3a5aeb67b5735c0fa2adb"
-download "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice" "speech_tokenizer/model.safetensors" \
-  "${TTS_DIR}/speech_tokenizer/model.safetensors" \
-  "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258"
 download "Qwen/Qwen3-0.6B-GGUF" "Qwen3-0.6B-Q8_0.gguf" "${LLM_DIR}/Qwen3-0.6B-Q8_0.gguf" \
   "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031"
 

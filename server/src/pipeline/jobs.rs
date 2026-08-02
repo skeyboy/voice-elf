@@ -1,13 +1,7 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::{
-    sync::{Notify, mpsc},
-    task::JoinHandle,
-};
+use tokio::{sync::mpsc, task::JoinHandle};
 use uuid::Uuid;
 
 use crate::{
@@ -19,13 +13,11 @@ use super::{
     PipelineContext,
     events::{send_event, send_state},
     latency::{LatencyObserver, SpeechStart},
-    synthesis::run_synthesis_worker,
     transcription::run_transcription_worker,
     translation::run_translation_worker,
 };
 
 const TEXT_QUEUE_CAPACITY: usize = 64;
-const SYNTHESIS_QUEUE_CAPACITY: usize = 32;
 
 pub(super) struct UtteranceJob {
     pub id: Uuid,
@@ -91,97 +83,30 @@ pub(super) struct TranslationJob {
     pub transcription: Transcription,
 }
 
-pub(super) struct SynthesisJob {
-    pub utterance: UtteranceJob,
-    pub translated: String,
-}
-
-#[derive(Clone, Default)]
-pub(super) struct TextWorkload {
-    pending: Arc<AtomicUsize>,
-    idle: Arc<Notify>,
-    work: Arc<Notify>,
-}
-
-impl TextWorkload {
-    pub(super) fn add(&self) {
-        self.pending.fetch_add(1, Ordering::AcqRel);
-        self.work.notify_waiters();
-    }
-
-    pub(super) fn finish(&self) {
-        let previous = self.pending.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "text workload underflow");
-        if previous == 1 {
-            self.idle.notify_waiters();
-        }
-    }
-
-    pub(super) async fn wait_until_idle(&self) {
-        loop {
-            let notified = self.idle.notified();
-            if self.pending.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    pub(super) async fn wait_for_work(&self) {
-        loop {
-            let notified = self.work.notified();
-            if self.pending.load(Ordering::Acquire) > 0 {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    #[cfg(test)]
-    fn pending(&self) -> usize {
-        self.pending.load(Ordering::Acquire)
-    }
-}
-
 pub(super) struct PipelineWorkers {
     transcription_tx: mpsc::Sender<UtteranceJob>,
     transcriber: Arc<dyn Transcriber>,
-    workload: TextWorkload,
     handles: Vec<JoinHandle<()>>,
 }
 
 impl PipelineWorkers {
     pub(super) fn start(context: PipelineContext) -> Self {
         let transcriber = context.services.transcriber.clone();
-        let workload = TextWorkload::default();
         let (transcription_tx, transcription_rx) = mpsc::channel(TEXT_QUEUE_CAPACITY);
         let (translation_tx, translation_rx) = mpsc::channel(TEXT_QUEUE_CAPACITY);
-        let (synthesis_tx, synthesis_rx) = mpsc::channel(SYNTHESIS_QUEUE_CAPACITY);
 
         let handles = vec![
             tokio::spawn(run_transcription_worker(
                 context.clone(),
                 transcription_rx,
                 translation_tx,
-                workload.clone(),
             )),
-            tokio::spawn(run_translation_worker(
-                context.clone(),
-                translation_rx,
-                synthesis_tx,
-                workload.clone(),
-            )),
-            tokio::spawn(run_synthesis_worker(
-                context,
-                synthesis_rx,
-                workload.clone(),
-            )),
+            tokio::spawn(run_translation_worker(context, translation_rx)),
         ];
 
         Self {
             transcription_tx,
             transcriber,
-            workload,
             handles,
         }
     }
@@ -255,7 +180,6 @@ impl PipelineWorkers {
         )
         .await?;
         send_state(output, PipelinePhase::Transcribing, Some(&utterance_id)).await?;
-        self.workload.add();
         Ok(LiveUtterance {
             id,
             config: config.clone(),
@@ -277,7 +201,6 @@ impl PipelineWorkers {
             })
             .await
         {
-            self.workload.finish();
             return Err(error).context("transcription worker stopped");
         }
         Ok(())
@@ -290,7 +213,6 @@ impl PipelineWorkers {
     ) {
         let utterance_id = live.id.to_string();
         drop(live);
-        self.workload.finish();
         let _ = send_event(
             output,
             ServerEvent::RecognitionFailed {
@@ -319,7 +241,6 @@ impl PipelineWorkers {
             },
         )
         .await?;
-        self.workload.add();
         if let Err(error) = self
             .transcription_tx
             .send(UtteranceJob {
@@ -331,7 +252,6 @@ impl PipelineWorkers {
             })
             .await
         {
-            self.workload.finish();
             return Err(error).context("transcription worker stopped");
         }
         Ok(())
@@ -357,8 +277,8 @@ mod tests {
 
     use crate::{
         backends::{
-            AppServices, DemoSynthesizer, DemoTranscriber, DemoTranslator, NoSpeechDetected,
-            Transcriber, Transcription,
+            AppServices, DemoTranscriber, DemoTranslator, NoSpeechDetected, Transcriber,
+            Transcription,
         },
         media::MediaStore,
         protocol::SessionConfig,
@@ -367,18 +287,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn workload_reports_new_text_while_tts_waits() {
-        let workload = TextWorkload::default();
-        workload.add();
-        workload.wait_for_work().await;
-        assert_eq!(workload.pending(), 1);
-        workload.finish();
-        workload.wait_until_idle().await;
-        assert_eq!(workload.pending(), 0);
-    }
-
-    #[tokio::test]
-    async fn completes_all_pending_text_before_starting_audio() {
+    async fn completes_all_pending_text_without_server_audio() {
         let directory = tempfile::tempdir().unwrap();
         let media = MediaStore::new(directory.path().join("media"))
             .await
@@ -386,7 +295,6 @@ mod tests {
         let services = Arc::new(AppServices {
             transcriber: Arc::new(DemoTranscriber::new()),
             translator: Arc::new(DemoTranslator::new()),
-            synthesizer: Arc::new(DemoSynthesizer::new()),
             backend_name: "demo",
         });
         let (output, mut events) = mpsc::channel(256);
@@ -421,7 +329,7 @@ mod tests {
                 let event: Value = serde_json::from_str(&text).unwrap();
                 match event["type"].as_str() {
                     Some("translation") => translations += 1,
-                    Some("audio_start") => break,
+                    Some("latency") if translations == 2 => break,
                     _ => {}
                 }
             }
@@ -456,7 +364,6 @@ mod tests {
         let services = Arc::new(AppServices {
             transcriber: Arc::new(EmptyTranscriber),
             translator: Arc::new(DemoTranslator::new()),
-            synthesizer: Arc::new(DemoSynthesizer::new()),
             backend_name: "test",
         });
         let (output, mut events) = mpsc::channel(64);

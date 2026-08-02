@@ -3,7 +3,6 @@ mod events;
 mod jobs;
 mod latency;
 mod session;
-mod synthesis;
 mod transcription;
 mod translation;
 

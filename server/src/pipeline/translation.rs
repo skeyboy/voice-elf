@@ -10,38 +10,17 @@ use crate::{
 use super::{
     PipelineContext,
     events::{send_event, send_state},
-    jobs::{SynthesisJob, TextWorkload, TranslationJob},
+    jobs::TranslationJob,
 };
 
 pub(super) async fn run_translation_worker(
     context: PipelineContext,
     mut input: mpsc::Receiver<TranslationJob>,
-    output: mpsc::Sender<SynthesisJob>,
-    workload: TextWorkload,
 ) {
     while let Some(job) = input.recv().await {
         let utterance_id = job.utterance.id;
         match translate(&context, job).await {
-            Ok(job) => {
-                if let Err(error) = output.try_send(job) {
-                    let reason = match error {
-                        mpsc::error::TrySendError::Full(_) => {
-                            "语音生成队列已满，本条原文和译文已保留，但暂不生成译声。"
-                        }
-                        mpsc::error::TrySendError::Closed(_) => {
-                            "语音生成服务已停止，本条原文和译文已保留。"
-                        }
-                    };
-                    let _ = send_event(
-                        &context.output,
-                        ServerEvent::Warning {
-                            message: reason.to_owned(),
-                        },
-                    )
-                    .await;
-                }
-                workload.finish();
-            }
+            Ok(()) => {}
             Err(error) => {
                 if let Some(database) = &context.database
                     && let Err(storage_error) = database
@@ -64,13 +43,12 @@ pub(super) async fn run_translation_worker(
                     },
                 )
                 .await;
-                workload.finish();
             }
         }
     }
 }
 
-async fn translate(context: &PipelineContext, mut job: TranslationJob) -> Result<SynthesisJob> {
+async fn translate(context: &PipelineContext, mut job: TranslationJob) -> Result<()> {
     let utterance_id = job.utterance.id.to_string();
     send_state(
         &context.output,
@@ -133,6 +111,18 @@ async fn translate(context: &PipelineContext, mut job: TranslationJob) -> Result
         .await?;
     }
     job.utterance.latency.mark_translation_complete();
+    let text_latency = job.utterance.latency.text_report(job.utterance.audio.len());
+    if let Some(database) = &context.database {
+        database
+            .save_utterance_translation(TranslationUpdate {
+                id: job.utterance.id,
+                translated_text: &translated,
+                target_language: &job.utterance.config.target_language,
+                latency: &text_latency,
+            })
+            .await
+            .context("failed to persist translation")?;
+    }
     send_event(
         &context.output,
         ServerEvent::TranslationDelta {
@@ -148,29 +138,20 @@ async fn translate(context: &PipelineContext, mut job: TranslationJob) -> Result
         &context.output,
         ServerEvent::Translation {
             utterance_id: utterance_id.clone(),
-            source_text: job.transcription.text.clone(),
-            translated_text: translated.clone(),
-            source_language: job.transcription.language.clone(),
-            target_language: job.utterance.config.target_language.clone(),
+            source_text: job.transcription.text,
+            translated_text: translated,
+            source_language: job.transcription.language,
+            target_language: job.utterance.config.target_language,
         },
     )
     .await?;
-
-    let text_latency = job.utterance.latency.text_report(job.utterance.audio.len());
-    if let Some(database) = &context.database {
-        database
-            .save_utterance_translation(TranslationUpdate {
-                id: job.utterance.id,
-                translated_text: &translated,
-                target_language: &job.utterance.config.target_language,
-                latency: &text_latency,
-            })
-            .await
-            .context("failed to persist translation")?;
-    }
-
-    Ok(SynthesisJob {
-        utterance: job.utterance,
-        translated,
-    })
+    send_event(
+        &context.output,
+        ServerEvent::Latency {
+            utterance_id,
+            latency: text_latency,
+        },
+    )
+    .await?;
+    Ok(())
 }

@@ -10,7 +10,6 @@ pub struct AppConfig {
     pub backend_mode: BackendMode,
     pub asr: AsrConfig,
     pub translator: TranslatorConfig,
-    pub tts: TtsConfig,
     pub inference_timeout: Duration,
     pub database_url: Option<String>,
 }
@@ -38,14 +37,6 @@ pub struct TranslatorConfig {
     pub binary: PathBuf,
     pub model_path: Option<PathBuf>,
     pub threads: usize,
-}
-
-#[derive(Clone, Debug)]
-pub struct TtsConfig {
-    pub binary: PathBuf,
-    pub model_dir: Option<PathBuf>,
-    pub speaker: String,
-    pub device: String,
 }
 
 impl AppConfig {
@@ -111,14 +102,6 @@ impl AppConfig {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(8),
             },
-            tts: TtsConfig {
-                binary: env::var("QWEN_TTS_BINARY")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| PathBuf::from("generate_audio")),
-                model_dir: env::var("QWEN_TTS_MODEL_DIR").ok().map(PathBuf::from),
-                speaker: env::var("QWEN_TTS_SPEAKER").unwrap_or_else(|_| "ryan".to_owned()),
-                device: env::var("QWEN_TTS_DEVICE").unwrap_or_else(|_| "auto".to_owned()),
-            },
             inference_timeout: Duration::from_secs(timeout_seconds),
             database_url: env::var("DATABASE_URL").ok().filter(|url| !url.is_empty()),
         })
@@ -137,17 +120,6 @@ impl AppConfig {
             anyhow::bail!(
                 "QWEN_ASR_MODEL_DIR is not a directory: {}",
                 asr_model.display()
-            );
-        }
-        let tts_model = self
-            .tts
-            .model_dir
-            .as_ref()
-            .context("QWEN_TTS_MODEL_DIR is required when VOICE_ELF_BACKEND=local")?;
-        if !tts_model.is_dir() {
-            anyhow::bail!(
-                "QWEN_TTS_MODEL_DIR is not a directory: {}",
-                tts_model.display()
             );
         }
         if let Some(model) = &self.translator.model_path

@@ -481,6 +481,6 @@ impl Database {
 mod history;
 
 pub use history::{
-    NewUtteranceAttempt, TranscriptUpdate, TranslationUpdate, UtteranceAudioUpdate,
-    UtteranceHistory,
+    BrowserTtsTarget, NewUtteranceAttempt, TranscriptUpdate, TranslationUpdate,
+    UtteranceAudioUpdate, UtteranceHistory,
 };
