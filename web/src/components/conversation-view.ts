@@ -218,6 +218,13 @@ export class ConversationView {
         line.querySelector<HTMLElement>('.translation-text')!.textContent = message;
         refreshIcons(line);
       }
+    } else {
+      const status = article.querySelector<HTMLElement>('.tts-generation');
+      if (status) {
+        status.classList.add('failed');
+        status.innerHTML = `<i data-lucide="circle-alert"></i><span>${message}</span>`;
+        refreshIcons(status);
+      }
     }
     this.setItemStatus(id, stage === 'translation' ? '翻译未完成' : '译声未完成');
     this.followIfEnabled();
@@ -284,11 +291,30 @@ export class ConversationView {
       );
     }
     if (event.translated_audio_url && !translated) {
+      translatedContainer.querySelector('.tts-generation')?.remove();
       translatedContainer.append(
         this.createMediaPlayer(event.translated_audio_url, '译声', event.utterance_id, true),
       );
     }
     refreshIcons(article);
+    this.followIfEnabled();
+  }
+
+  updateTtsProgress(id: string, value: number) {
+    const container = this.rows.get(id)?.querySelector<HTMLElement>('.translated-media');
+    if (!container) return;
+    let status = container.querySelector<HTMLElement>('.tts-generation');
+    if (!status) {
+      status = document.createElement('div');
+      status.className = 'tts-generation';
+      status.innerHTML = '<i data-lucide="audio-lines"></i><span>浏览器生成译声</span><progress max="100" value="0"></progress><output>0%</output>';
+      container.append(status);
+      refreshIcons(status);
+    }
+    const progress = Math.max(0, Math.min(100, Math.round(value)));
+    status.querySelector<HTMLProgressElement>('progress')!.value = progress;
+    status.querySelector<HTMLOutputElement>('output')!.textContent = `${progress}%`;
+    this.setItemStatus(id, progress < 100 ? '浏览器生成译声' : '译声已保存');
     this.followIfEnabled();
   }
 

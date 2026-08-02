@@ -13,15 +13,8 @@ export const languageNames: Record<string, string> = {
 };
 
 export const voices: Record<string, string> = {
-  ryan: 'Ryan',
-  serena: 'Serena',
-  vivian: 'Vivian',
-  aiden: 'Aiden',
-  dylan: 'Dylan',
-  eric: 'Eric',
-  sohee: 'Sohee',
-  onoanna: 'Ono Anna',
-  unclefu: 'Uncle Fu',
+  F1: 'F1 女声',
+  M1: 'M1 男声',
 };
 
 export function languageOptions(includeAuto: boolean) {

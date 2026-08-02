@@ -1,10 +1,12 @@
+import { voices } from './languages';
+
 export interface PlaybackPreferences {
   voice: string;
   autoplay: boolean;
 }
 
 const defaults: PlaybackPreferences = {
-  voice: 'vivian',
+  voice: 'F1',
   autoplay: true,
 };
 
@@ -16,7 +18,7 @@ export function loadPreferences(userId: string): PlaybackPreferences {
   try {
     const stored = JSON.parse(localStorage.getItem(storageKey(userId)) ?? '{}') as Partial<PlaybackPreferences>;
     return {
-      voice: typeof stored.voice === 'string' ? stored.voice : defaults.voice,
+      voice: typeof stored.voice === 'string' && stored.voice in voices ? stored.voice : defaults.voice,
       autoplay: typeof stored.autoplay === 'boolean' ? stored.autoplay : defaults.autoplay,
     };
   } catch {

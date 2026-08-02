@@ -38,7 +38,7 @@ export class SettingsPage implements Page {
     autoplay.checked = preferences.autoplay;
     const persist = () => {
       savePreferences(this.userId, { voice: voice.value, autoplay: autoplay.checked });
-      root.querySelector('.voice-preview')!.textContent = `${voices[voice.value] ?? voice.value} · Qwen3 TTS`;
+      root.querySelector('.voice-preview')!.textContent = `${voices[voice.value] ?? voice.value} · Supertonic Web TTS`;
       const saved = root.querySelector('.settings-saved')!;
       saved.textContent = '设置已保存';
       window.setTimeout(() => {
