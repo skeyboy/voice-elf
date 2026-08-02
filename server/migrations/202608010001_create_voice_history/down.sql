@@ -1,0 +1,6 @@
+DROP TABLE IF EXISTS voice_utterances;
+DROP TABLE IF EXISTS voice_sessions;
+DROP TABLE IF EXISTS room_members;
+DROP TABLE IF EXISTS rooms;
+DROP TABLE IF EXISTS auth_sessions;
+DROP TABLE IF EXISTS users;

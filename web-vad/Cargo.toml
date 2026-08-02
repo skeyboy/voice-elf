@@ -1,0 +1,10 @@
+[package]
+name = "voice-elf-web-vad"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lele = { version = "=0.1.12", default-features = false }

@@ -1,0 +1,379 @@
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use diesel::{
+    BoolExpressionMethods, ExpressionMethods, Insertable, PgTextExpressionMethods, QueryDsl,
+    SelectableHelper,
+};
+use diesel_async::RunQueryDsl;
+use serde::Serialize;
+use uuid::Uuid;
+
+use crate::{
+    protocol::LatencyReport,
+    schema::{rooms, voice_sessions, voice_utterances},
+};
+
+use super::Database;
+
+pub struct NewUtteranceAttempt<'a> {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub user_id: Uuid,
+    pub room_id: Uuid,
+    pub source_language: &'a str,
+    pub target_language: &'a str,
+    pub source_audio_path: Option<&'a str>,
+    pub source_audio_url: Option<&'a str>,
+    pub latency: &'a LatencyReport,
+}
+
+pub struct TranscriptUpdate<'a> {
+    pub id: Uuid,
+    pub source_text: &'a str,
+    pub source_language: &'a str,
+    pub latency: &'a LatencyReport,
+}
+
+pub struct TranslationUpdate<'a> {
+    pub id: Uuid,
+    pub translated_text: &'a str,
+    pub target_language: &'a str,
+    pub latency: &'a LatencyReport,
+}
+
+pub struct UtteranceAudioUpdate<'a> {
+    pub id: Uuid,
+    pub translated_audio_path: &'a str,
+    pub translated_audio_url: &'a str,
+    pub latency: &'a LatencyReport,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = voice_utterances)]
+struct UtteranceRow<'a> {
+    id: Uuid,
+    session_id: Uuid,
+    user_id: Option<Uuid>,
+    room_id: Option<Uuid>,
+    source_text: &'a str,
+    translated_text: &'a str,
+    source_language: &'a str,
+    target_language: &'a str,
+    source_audio_path: Option<&'a str>,
+    source_audio_url: Option<&'a str>,
+    translated_audio_path: Option<&'a str>,
+    translated_audio_url: Option<&'a str>,
+    audio_ms: i64,
+    vad_ms: i64,
+    stt_ms: i64,
+    translation_ms: i64,
+    tts_ms: i64,
+    total_ms: i64,
+    t0_unix_ms: i64,
+    t1_unix_ms: i64,
+    t2_unix_ms: i64,
+    t3_unix_ms: i64,
+    t4_unix_ms: i64,
+    status: &'a str,
+    processing_error: Option<&'a str>,
+}
+
+#[derive(diesel::Queryable, diesel::Selectable)]
+#[diesel(table_name = voice_utterances)]
+struct UtteranceHistoryRow {
+    id: Uuid,
+    source_text: String,
+    translated_text: String,
+    source_language: String,
+    target_language: String,
+    source_audio_url: Option<String>,
+    translated_audio_url: Option<String>,
+    status: String,
+    processing_error: Option<String>,
+    audio_ms: i64,
+    vad_ms: i64,
+    stt_ms: i64,
+    translation_ms: i64,
+    tts_ms: i64,
+    total_ms: i64,
+    t0_unix_ms: i64,
+    t1_unix_ms: i64,
+    t2_unix_ms: i64,
+    t3_unix_ms: i64,
+    t4_unix_ms: i64,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UtteranceHistory {
+    pub id: Uuid,
+    pub source_text: String,
+    pub translated_text: String,
+    pub source_language: String,
+    pub target_language: String,
+    pub source_audio_url: Option<String>,
+    pub translated_audio_url: Option<String>,
+    pub status: String,
+    pub processing_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub latency: LatencyReport,
+}
+
+impl Database {
+    pub async fn recover_interrupted_utterances(&self) -> Result<usize> {
+        let mut connection = self.pool.get().await?;
+        let mut updated = 0;
+        updated += diesel::update(
+            voice_utterances::table.filter(voice_utterances::status.eq("recognizing")),
+        )
+        .set((
+            voice_utterances::status.eq("recognition_interrupted"),
+            voice_utterances::processing_error
+                .eq(Some("Server restarted before recognition completed")),
+        ))
+        .execute(&mut connection)
+        .await?;
+        updated += diesel::update(
+            voice_utterances::table.filter(voice_utterances::status.eq("translating")),
+        )
+        .set((
+            voice_utterances::status.eq("translation_interrupted"),
+            voice_utterances::processing_error
+                .eq(Some("Server restarted before translation completed")),
+        ))
+        .execute(&mut connection)
+        .await?;
+        updated += diesel::update(
+            voice_utterances::table.filter(voice_utterances::status.eq("text_ready")),
+        )
+        .set((
+            voice_utterances::status.eq("tts_interrupted"),
+            voice_utterances::processing_error
+                .eq(Some("Server restarted before speech synthesis completed")),
+        ))
+        .execute(&mut connection)
+        .await?;
+        diesel::update(voice_sessions::table.filter(voice_sessions::ended_at.is_null()))
+            .set(voice_sessions::ended_at.eq(diesel::dsl::now))
+            .execute(&mut connection)
+            .await?;
+        Ok(updated)
+    }
+
+    pub async fn interrupt_session_utterances(
+        &self,
+        session_id: Uuid,
+        reason: &str,
+    ) -> Result<usize> {
+        let mut connection = self.pool.get().await?;
+        let mut updated = 0;
+        updated += diesel::update(
+            voice_utterances::table
+                .filter(voice_utterances::session_id.eq(session_id))
+                .filter(voice_utterances::status.eq("recognizing")),
+        )
+        .set((
+            voice_utterances::status.eq("recognition_interrupted"),
+            voice_utterances::processing_error.eq(Some(reason)),
+        ))
+        .execute(&mut connection)
+        .await?;
+        updated += diesel::update(
+            voice_utterances::table
+                .filter(voice_utterances::session_id.eq(session_id))
+                .filter(voice_utterances::status.eq("translating")),
+        )
+        .set((
+            voice_utterances::status.eq("translation_interrupted"),
+            voice_utterances::processing_error.eq(Some(reason)),
+        ))
+        .execute(&mut connection)
+        .await?;
+        updated += diesel::update(
+            voice_utterances::table
+                .filter(voice_utterances::session_id.eq(session_id))
+                .filter(voice_utterances::status.eq("text_ready")),
+        )
+        .set((
+            voice_utterances::status.eq("tts_interrupted"),
+            voice_utterances::processing_error.eq(Some(reason)),
+        ))
+        .execute(&mut connection)
+        .await?;
+        Ok(updated)
+    }
+
+    pub async fn create_utterance_attempt(&self, utterance: NewUtteranceAttempt<'_>) -> Result<()> {
+        let latency = utterance.latency;
+        let row = UtteranceRow {
+            id: utterance.id,
+            session_id: utterance.session_id,
+            user_id: Some(utterance.user_id),
+            room_id: Some(utterance.room_id),
+            source_text: "",
+            translated_text: "",
+            source_language: utterance.source_language,
+            target_language: utterance.target_language,
+            source_audio_path: utterance.source_audio_path,
+            source_audio_url: utterance.source_audio_url,
+            translated_audio_path: None,
+            translated_audio_url: None,
+            audio_ms: to_i64(latency.audio_ms),
+            vad_ms: to_i64(latency.vad_ms),
+            stt_ms: to_i64(latency.stt_ms),
+            translation_ms: to_i64(latency.translation_ms),
+            tts_ms: to_i64(latency.tts_ms),
+            total_ms: to_i64(latency.total_ms),
+            t0_unix_ms: to_i64(latency.t0_unix_ms),
+            t1_unix_ms: to_i64(latency.t1_unix_ms),
+            t2_unix_ms: to_i64(latency.t2_unix_ms),
+            t3_unix_ms: to_i64(latency.t3_unix_ms),
+            t4_unix_ms: to_i64(latency.t4_unix_ms),
+            status: "recognizing",
+            processing_error: None,
+        };
+        let mut connection = self.pool.get().await?;
+        diesel::insert_into(voice_utterances::table)
+            .values(row)
+            .execute(&mut connection)
+            .await?;
+        diesel::update(rooms::table.find(utterance.room_id))
+            .set(rooms::updated_at.eq(diesel::dsl::now))
+            .execute(&mut connection)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn save_utterance_transcript(&self, update: TranscriptUpdate<'_>) -> Result<()> {
+        let latency = update.latency;
+        let mut connection = self.pool.get().await?;
+        diesel::update(voice_utterances::table.find(update.id))
+            .set((
+                voice_utterances::source_text.eq(update.source_text),
+                voice_utterances::source_language.eq(update.source_language),
+                voice_utterances::stt_ms.eq(to_i64(latency.stt_ms)),
+                voice_utterances::total_ms.eq(to_i64(latency.total_ms)),
+                voice_utterances::t2_unix_ms.eq(to_i64(latency.t2_unix_ms)),
+                voice_utterances::t3_unix_ms.eq(to_i64(latency.t3_unix_ms)),
+                voice_utterances::t4_unix_ms.eq(to_i64(latency.t4_unix_ms)),
+                voice_utterances::status.eq("translating"),
+                voice_utterances::processing_error.eq(None::<String>),
+            ))
+            .execute(&mut connection)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn save_utterance_translation(&self, update: TranslationUpdate<'_>) -> Result<()> {
+        let latency = update.latency;
+        let mut connection = self.pool.get().await?;
+        diesel::update(voice_utterances::table.find(update.id))
+            .set((
+                voice_utterances::translated_text.eq(update.translated_text),
+                voice_utterances::target_language.eq(update.target_language),
+                voice_utterances::translation_ms.eq(to_i64(latency.translation_ms)),
+                voice_utterances::total_ms.eq(to_i64(latency.total_ms)),
+                voice_utterances::t3_unix_ms.eq(to_i64(latency.t3_unix_ms)),
+                voice_utterances::t4_unix_ms.eq(to_i64(latency.t4_unix_ms)),
+                voice_utterances::status.eq("text_ready"),
+                voice_utterances::processing_error.eq(None::<String>),
+            ))
+            .execute(&mut connection)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_utterance_failed(&self, id: Uuid, status: &str, error: &str) -> Result<()> {
+        let mut connection = self.pool.get().await?;
+        diesel::update(voice_utterances::table.find(id))
+            .set((
+                voice_utterances::status.eq(status),
+                voice_utterances::processing_error.eq(Some(error)),
+            ))
+            .execute(&mut connection)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn complete_utterance_audio(&self, update: UtteranceAudioUpdate<'_>) -> Result<()> {
+        let latency = update.latency;
+        let mut connection = self.pool.get().await?;
+        diesel::update(voice_utterances::table.find(update.id))
+            .set((
+                voice_utterances::translated_audio_path.eq(Some(update.translated_audio_path)),
+                voice_utterances::translated_audio_url.eq(Some(update.translated_audio_url)),
+                voice_utterances::tts_ms.eq(to_i64(latency.tts_ms)),
+                voice_utterances::total_ms.eq(to_i64(latency.total_ms)),
+                voice_utterances::t4_unix_ms.eq(to_i64(latency.t4_unix_ms)),
+                voice_utterances::status.eq("completed"),
+                voice_utterances::processing_error.eq(None::<String>),
+            ))
+            .execute(&mut connection)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_utterances(
+        &self,
+        room_id: Uuid,
+        search: Option<&str>,
+    ) -> Result<Vec<UtteranceHistory>> {
+        let mut connection = self.pool.get().await?;
+        let mut query = voice_utterances::table
+            .filter(voice_utterances::room_id.eq(Some(room_id)))
+            .into_boxed();
+        if let Some(search) = search.filter(|value| !value.trim().is_empty()) {
+            let pattern = format!("%{}%", search.trim());
+            query = query.filter(
+                voice_utterances::source_text
+                    .ilike(pattern.clone())
+                    .or(voice_utterances::translated_text.ilike(pattern)),
+            );
+        }
+        let rows = query
+            .order(voice_utterances::created_at.desc())
+            .limit(200)
+            .select(UtteranceHistoryRow::as_select())
+            .load(&mut connection)
+            .await?;
+        Ok(rows.into_iter().map(UtteranceHistory::from).collect())
+    }
+}
+
+impl From<UtteranceHistoryRow> for UtteranceHistory {
+    fn from(row: UtteranceHistoryRow) -> Self {
+        Self {
+            id: row.id,
+            source_text: row.source_text,
+            translated_text: row.translated_text,
+            source_language: row.source_language,
+            target_language: row.target_language,
+            source_audio_url: row.source_audio_url,
+            translated_audio_url: row.translated_audio_url,
+            status: row.status,
+            processing_error: row.processing_error,
+            created_at: row.created_at,
+            latency: LatencyReport {
+                audio_ms: to_u64(row.audio_ms),
+                vad_ms: to_u64(row.vad_ms),
+                stt_ms: to_u64(row.stt_ms),
+                translation_ms: to_u64(row.translation_ms),
+                tts_ms: to_u64(row.tts_ms),
+                total_ms: to_u64(row.total_ms),
+                t0_unix_ms: to_u64(row.t0_unix_ms),
+                t1_unix_ms: to_u64(row.t1_unix_ms),
+                t2_unix_ms: to_u64(row.t2_unix_ms),
+                t3_unix_ms: to_u64(row.t3_unix_ms),
+                t4_unix_ms: to_u64(row.t4_unix_ms),
+            },
+        }
+    }
+}
+
+fn to_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+fn to_u64(value: i64) -> u64 {
+    value.max(0) as u64
+}

@@ -1,0 +1,4 @@
+[workspace]
+members = ["server", "web-vad"]
+exclude = [".local/src/qwen3-tts-rs"]
+resolver = "2"
