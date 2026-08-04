@@ -240,7 +240,22 @@ stop_one() {
   local target="$1" label pid elapsed
   label="$(label_for "${target}")"
   if uses_launchd && launchd_service_exists "${target}"; then
+    pid="$(launchd_pid "${target}")"
     launchctl bootout "gui/$(id -u)/$(launchd_label "${target}")"
+    elapsed=0
+    while (( elapsed < 10 )); do
+      if ! launchd_service_exists "${target}" \
+        && { [[ ! "${pid}" =~ ^[0-9]+$ ]] || ! kill -0 "${pid}" 2>/dev/null; }; then
+        break
+      fi
+      sleep 1
+      elapsed=$((elapsed + 1))
+    done
+    if launchd_service_exists "${target}" \
+      || { [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; }; then
+      echo "${label}隧道未在 10s 内退出" >&2
+      return 1
+    fi
     rm -f "$(pid_file "${target}")" "$(url_file "${target}")" "$(plist_file "${target}")"
     echo "${label}隧道已停止"
     return
