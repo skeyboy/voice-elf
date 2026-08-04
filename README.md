@@ -42,11 +42,11 @@ cd ..
 cargo run --bin voice-elf-server
 ```
 
-Open <http://127.0.0.1:3000>. Microphone access works on localhost in current browsers.
+Open <http://127.0.0.1:3001>. Microphone access works on localhost in current browsers.
 
-With `VOICE_ELF_BIND=0.0.0.0:3000`, other devices on the same LAN can open `http://<server-lan-ip>:3000` for account, room, history, and audio playback testing. Browser microphone capture requires a secure context: `localhost` works over HTTP, while a LAN IP normally requires a trusted HTTPS certificate. The client reports this explicitly instead of failing silently.
+With `VOICE_ELF_BIND=0.0.0.0:3001`, other devices on the same LAN can open `http://<server-lan-ip>:3001` for account, room, history, and audio playback testing. Browser microphone capture requires a secure context: `localhost` works over HTTP, while a LAN IP normally requires a trusted HTTPS certificate. The client reports this explicitly instead of failing silently.
 
-For frontend development, run `npm run dev` from `web/`; Vite listens on all interfaces and proxies `/ws`, `/api`, and `/media` to port 3000. LAN clients can use `http://<server-lan-ip>:5173` with HMR. Run `npm run deploy:watch` to compile the Rust VAD once and continuously rebuild `web/dist`; the Axum service on port 3000 serves each new frontend build without a backend restart.
+For frontend development, run `npm run dev` from `web/`; Vite listens on all interfaces and proxies `/ws`, `/api`, and `/media` to port 3001. LAN clients can use `http://<server-lan-ip>:5173` with HMR. Run `npm run deploy:watch` to compile the Rust VAD once and continuously rebuild `web/dist`; the Axum service on port 3001 serves each new frontend build without a backend restart.
 
 For temporary Internet testing over trusted HTTPS, install `cloudflared` and use the local tunnel manager. It starts the tunnel in the background, waits for the public health check, and prints the resulting address:
 
@@ -78,7 +78,7 @@ cp .env.example .env
 cargo run --release --bin voice-elf-server
 ```
 
-The server loads `.env` automatically. The default installed configuration uses the open-source Qwen3-ASR-0.6B model through the MIT-licensed `qwen_asr` C runtime for offline streaming recognition, and `llama-completion` with Qwen3-0.6B for offline translation. It covers `zh/en/ja/ko/fr/de/es/it/pt/ru` and emits stable source tokens while audio is still arriving. You can instead configure an OpenAI-compatible translation endpoint with `LOCAL_LLM_BASE_URL` and `LOCAL_LLM_MODEL`. Set `TTS_KOKORO_MODEL_DIR`, `TTS_SUPERTONIC_MODEL_DIR`, and `TTS_THREADS` to override the server TTS defaults.
+The server loads `.env` automatically. Relative filesystem paths in the server configuration are resolved from the workspace root, so the server can be launched from the root or `server/` directory without changing model paths. The default installed configuration uses the open-source Qwen3-ASR-0.6B model through the MIT-licensed `qwen_asr` C runtime for offline streaming recognition, and `llama-completion` with Qwen3-0.6B for offline translation. It covers `zh/en/ja/ko/fr/de/es/it/pt/ru` and emits stable source tokens while audio is still arriving. You can instead configure an OpenAI-compatible translation endpoint with `LOCAL_LLM_BASE_URL` and `LOCAL_LLM_MODEL`. Set `TTS_KOKORO_MODEL_DIR`, `TTS_SUPERTONIC_MODEL_DIR`, and `TTS_THREADS` to override the server TTS defaults.
 
 The ASR adapter starts at the VAD speech-start edge and receives PCM continuously while the speaker is still talking. Its low-latency defaults can be tuned with `QWEN_ASR_STREAM_UNFIXED_CHUNKS`, `QWEN_ASR_STREAM_MAX_NEW_TOKENS`, and `QWEN_ASR_ENCODER_WINDOW_SECONDS`; the adapter invokes:
 
@@ -135,12 +135,13 @@ GET    /api/rooms/{room_id}?q=transcript-text
 PATCH  /api/rooms/{room_id}
 DELETE /api/rooms/{room_id}
 POST   /api/rooms/{room_id}/join
+PATCH  /api/rooms/{room_id}/members/{user_id}
 ```
 
-Room update/delete and realtime audio publication are owner-only. Joined members can read room details and protected audio files, and subscribe to the same room WebSocket for realtime events. The endpoint requires the session cookie and an authorized room ID: `ws://localhost:3000/ws?room_id={room_id}`. The first server event confirms whether the connection can publish:
+Room update/delete and speaking-permission management are owner-only. Every joined, unmuted member can publish Web VAD boundaries and 16 kHz PCM16 frames through the room WebSocket. The server aligns 512-sample frames from active speakers, mixes them into one room-level ASR/translation/TTS pipeline, and broadcasts member presence, speaking state, speaker attribution, text, and audio to all participants. The endpoint requires the session cookie and an authorized room ID: `ws://localhost:3001/ws?room_id={room_id}`. The first server event confirms whether the current member can publish:
 
 ```json
-{"type":"room_subscribed","room_id":"...","can_publish":false,"backend":"local"}
+{"type":"room_subscribed","room_id":"...","can_publish":true,"user_id":"...","backend":"local"}
 ```
 
 Client text frames:
@@ -152,7 +153,7 @@ Client text frames:
 {"type":"flush"}
 ```
 
-Owner client binary frames are fixed 512-sample little-endian PCM16 at 16 kHz, mono, and are sent only between matching `start` and `end` messages. Member client data frames are ignored. `start` declares the VAD engine/frame configuration; `end` carries the VAD boundary reason and sent sample count. The server validates these hints against the received PCM. Server text frames carry state, incremental `transcript_delta` and `translation_delta` updates, final text, media URLs, audio metadata, latency events, and `utterance_discarded` for silent placeholders. Source media is returned after persistence; after asynchronous TTS finishes, a second `media` event updates only the translated URL, followed by `audio_start`, binary PCM16 frames, and `audio_end`. These server frames are broadcast in order to every online member of the room.
+Every unmuted client sends fixed 512-sample little-endian PCM16 frames at 16 kHz, mono, only between its matching `start` and `end` messages. `start` declares the VAD engine/frame configuration; `end` carries the VAD boundary reason and sent sample count. The room mixer drains one frame per active speaker every 32 ms, averages simultaneous samples to avoid clipping, closes on aggregate silence, and enforces the room's 20-second maximum segment duration. Server text frames carry `room_members`, `utterance_speakers`, state, incremental `transcript_delta` and `translation_delta` updates, final text, media URLs, audio metadata, latency events, and `utterance_discarded` for silent placeholders. Source media is returned after persistence; after asynchronous TTS finishes, a second `media` event updates only the translated URL, followed by `audio_start`, binary PCM16 frames, and `audio_end`. These server frames are broadcast in order to every online member of the room.
 
 ```json
 {"type":"media","utterance_id":"...","source_audio_url":"/media/...-source.wav","translated_audio_url":null}
@@ -168,11 +169,31 @@ The frontend uses SvelteKit file routing and is split into route pages, reusable
 ```text
 /login             account login and registration
 /rooms             searchable room directory
-/rooms/{room_id}   translation, room records, and read-only preview
+/rooms/{room_id}   translation, participant controls, live room state, and history
 /settings          voice and automatic playback preferences
 ```
 
 Refreshing any of these paths is handled by the Axum SPA fallback. SvelteKit route modules are in `web/src/routes/`, existing feature pages are in `pages/`, reusable UI is in `components/`, and WebSocket/microphone ownership is in `controllers/voice-session.ts`. The static adapter writes the deployable SPA to `web/dist`.
+
+## Tauri applications
+
+The Web client can also be packaged for macOS, Windows, Android, and iOS with Tauri 2. The application shell embeds `web/dist` in its Rust library and starts an Axum server on a random loopback port before creating the WebView. The WebView loads that Axum origin, so SPA fallback, workers, AudioWorklet, and the VAD WASM use normal HTTP paths on every platform.
+
+The embedded Axum service owns only the application delivery layer. It serves static assets and proxies `/api`, `/media`, and `/ws` to the existing Voice Elf server. This keeps the Web client same-origin while avoiding an unsupported mobile link of PostgreSQL, sherpa-onnx, and external model binaries. In the packaged app, the API address can be changed from the login screen or Settings page and is persisted in the platform application-config directory for later launches. The current packaged default upstream is `http://192.168.0.63:3001`; set `VOICE_ELF_APP_SERVER_URL` while running or building the shell when the backend is on another host:
+
+```bash
+# macOS development against a local backend
+make server
+make app-dev
+
+# Production package against a deployed HTTPS backend
+cd web
+VOICE_ELF_APP_SERVER_URL=https://voice.example.com npm run app:build
+VOICE_ELF_APP_SERVER_URL=https://voice.example.com npm run app:android:build
+VOICE_ELF_APP_SERVER_URL=https://voice.example.com npm run app:ios:build
+```
+
+Run Windows packaging on Windows, macOS/iOS packaging on macOS, and Android packaging on a host with the Android SDK, NDK 28+, and JDK 17+. Apple device builds also require `APPLE_DEVELOPMENT_TEAM` or the corresponding Tauri iOS config. Android API 24 and iOS 14 are the configured minimums. See [the Tauri platform architecture](docs/tauri-platform-architecture.md) for the packaging flow, platform permissions, validation matrix, and design constraints.
 
 ## Checks
 

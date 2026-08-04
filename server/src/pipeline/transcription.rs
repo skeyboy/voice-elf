@@ -199,6 +199,7 @@ async fn prepare_utterance(context: &PipelineContext, job: &mut UtteranceJob) ->
                 source_audio_path: source_media.as_ref().map(|media| media.path.as_str()),
                 source_audio_url: source_media.as_ref().map(|media| media.url.as_str()),
                 latency: &latency,
+                speakers: &job.speakers,
             })
             .await
             .context("failed to create utterance record")?;

@@ -24,7 +24,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tower_cookies::{CookieManagerLayer, Cookies};
 use tower_http::{
     compression::CompressionLayer,
@@ -38,7 +38,6 @@ use crate::{
     backends::AppServices,
     config::AppConfig,
     media::MediaStore,
-    pipeline::{PipelineIdentity, PipelineInput, run_pipeline},
     protocol::{ClientEvent, ServerEvent},
     room_hub::RoomHub,
     storage::Database,
@@ -207,54 +206,53 @@ async fn websocket(
         .await
         .map_err(api::ApiError::internal)?
         .ok_or_else(|| api::ApiError::not_found("房间不存在"))?;
-    let can_publish = room.owner_id == user.id;
-    if !can_publish
-        && !database
-            .can_view_room(room.id, user.id)
-            .await
-            .map_err(api::ApiError::internal)?
+    if !database
+        .can_view_room(room.id, user.id)
+        .await
+        .map_err(api::ApiError::internal)?
     {
         return Err(api::ApiError::forbidden("请先加入房间"));
     }
-    let identity = can_publish.then_some(PipelineIdentity {
-        user_id: user.id,
-        room_id: room.id,
-    });
+    let members = database
+        .list_room_members(room.id)
+        .await
+        .map_err(api::ApiError::internal)?;
     Ok(ws
         .max_message_size(256 * 1024)
         .max_frame_size(256 * 1024)
-        .on_upgrade(move |socket| {
-            handle_socket(
-                socket,
-                state.services,
-                state.database,
-                state.media,
-                state.rooms,
-                room.id,
-                identity,
-            )
-        })
+        .on_upgrade(move |socket| handle_socket(socket, state, room, user, members))
         .into_response())
 }
 
 async fn handle_socket(
     socket: axum::extract::ws::WebSocket,
-    services: Arc<AppServices>,
-    database: Option<Database>,
-    media: MediaStore,
-    rooms: RoomHub,
-    room_id: uuid::Uuid,
-    identity: Option<PipelineIdentity>,
+    state: AppState,
+    room: storage::RoomRecord,
+    user: storage::UserRecord,
+    members: Vec<storage::RoomMemberRecord>,
 ) {
-    let can_publish = identity.is_some();
-    let mut room_events = rooms.subscribe(room_id);
+    let room_id = room.id;
+    let user_id = user.id;
+    let connection = state.rooms.connect(
+        &room,
+        &user,
+        &members,
+        state.services.clone(),
+        state.database.clone(),
+        state.media.clone(),
+    );
+    let rooms = state.rooms;
+    let can_publish = connection.can_publish;
+    let mut room_events = connection.events;
     let (mut socket_writer, mut socket_reader) = socket.split();
     let subscribed = ServerEvent::RoomSubscribed {
         room_id: room_id.to_string(),
         can_publish,
-        backend: services.backend_name.to_owned(),
+        user_id,
+        backend: state.services.backend_name.to_owned(),
     };
     let Ok(subscribed) = serde_json::to_string(&subscribed) else {
+        rooms.disconnect(room_id, user_id).await;
         return;
     };
     if socket_writer
@@ -262,27 +260,9 @@ async fn handle_socket(
         .await
         .is_err()
     {
+        rooms.disconnect(room_id, user_id).await;
         return;
     }
-
-    let (input_tx, mut pipeline, forwarder) = if let Some(identity) = identity {
-        let (output_tx, mut output_rx) = mpsc::channel::<Message>(256);
-        let (input_tx, input_rx) = mpsc::channel::<PipelineInput>(192);
-        let room_publisher = rooms.publisher(room_id);
-        let forwarder = tokio::spawn(async move {
-            while let Some(message) = output_rx.recv().await {
-                if matches!(message, Message::Text(_) | Message::Binary(_)) {
-                    let _ = room_publisher.send(message);
-                }
-            }
-        });
-        let pipeline = tokio::spawn(run_pipeline(
-            services, database, media, identity, input_rx, output_tx,
-        ));
-        (Some(input_tx), Some(pipeline), Some(forwarder))
-    } else {
-        (None, None, None)
-    };
 
     loop {
         tokio::select! {
@@ -308,63 +288,36 @@ async fn handle_socket(
                 let Some(result) = incoming else {
                     break;
                 };
-                let input = match result {
-                    Ok(Message::Binary(bytes)) if can_publish => {
-                        Some(PipelineInput::Audio(bytes.to_vec()))
+                match result {
+                    Ok(Message::Binary(bytes)) => {
+                        if !rooms.send_audio(room_id, user_id, bytes.to_vec()).await {
+                            tracing::debug!(%room_id, %user_id, "ignored audio from muted room member");
+                        }
                     }
-                    Ok(Message::Text(text)) if can_publish => Some(
+                    Ok(Message::Text(text)) => {
                         match serde_json::from_str::<ClientEvent>(&text) {
-                            Ok(event) => PipelineInput::Event(event),
-                            Err(error) => PipelineInput::Invalid(
-                                format!("Invalid client message: {error}"),
-                            ),
-                        },
-                    ),
-                    Ok(Message::Binary(_) | Message::Text(_)) => {
-                        tracing::warn!(%room_id, "ignoring realtime input from read-only room member");
-                        None
+                            Ok(event) => {
+                                if !rooms.send_event(room_id, user_id, event).await {
+                                    tracing::debug!(%room_id, %user_id, "ignored event from muted room member");
+                                }
+                            }
+                            Err(error) => {
+                                let warning = ServerEvent::Warning {
+                                    message: format!("Invalid client message: {error}"),
+                                };
+                                if let Ok(warning) = serde_json::to_string(&warning) {
+                                    let _ = socket_writer.send(Message::Text(warning.into())).await;
+                                }
+                            }
+                        }
                     }
-                    Ok(Message::Ping(_) | Message::Pong(_)) => None,
+                    Ok(Message::Ping(_) | Message::Pong(_)) => {}
                     Ok(Message::Close(_)) | Err(_) => break,
                 };
-                if let Some(input) = input {
-                    let Some(sender) = input_tx.as_ref() else {
-                        break;
-                    };
-                    if sender.send(input).await.is_err() {
-                        break;
-                    }
-                }
-            }
-            result = async {
-                pipeline
-                    .as_mut()
-                    .expect("publisher pipeline must exist while this branch is enabled")
-                    .await
-            }, if pipeline.is_some() => {
-                match result {
-                    Ok(Ok(())) => tracing::warn!(%room_id, "room pipeline stopped unexpectedly"),
-                    Ok(Err(error)) => tracing::warn!(%error, %room_id, "room pipeline failed"),
-                    Err(error) => tracing::warn!(%error, %room_id, "room pipeline task stopped"),
-                }
-                pipeline = None;
-                break;
             }
         }
     }
 
     drop(room_events);
-    drop(input_tx);
-    if let Some(pipeline) = pipeline {
-        match pipeline.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(%error, %room_id, "room pipeline failed"),
-            Err(error) => tracing::warn!(%error, %room_id, "room pipeline task stopped"),
-        }
-    }
-    if let Some(forwarder) = forwarder
-        && let Err(error) = forwarder.await
-    {
-        tracing::warn!(%error, %room_id, "room broadcast task stopped");
-    }
+    rooms.disconnect(room_id, user_id).await;
 }

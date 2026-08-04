@@ -15,7 +15,16 @@
     "deploy:public:restart": "../scripts/public-tunnel.sh restart production",
     "deploy:public:status": "../scripts/public-tunnel.sh status all",
     "deploy:public:stop": "../scripts/public-tunnel.sh stop all",
-    "preview": "vite preview --host 0.0.0.0"
+    "preview": "vite preview --host 0.0.0.0",
+    "tauri": "tauri",
+    "app:dev": "tauri dev",
+    "app:build": "tauri build",
+    "app:android:init": "tauri android init",
+    "app:android:dev": "tauri android dev",
+    "app:android:build": "tauri android build",
+    "app:ios:init": "tauri ios init",
+    "app:ios:dev": "tauri ios dev",
+    "app:ios:build": "tauri ios build"
   },
   "dependencies": {
     "lucide": "^0.468.0",
@@ -25,6 +34,7 @@
     "@sveltejs/adapter-static": "^3.0.10",
     "@sveltejs/kit": "^2.70.2",
     "@sveltejs/vite-plugin-svelte": "^6.2.4",
+    "@tauri-apps/cli": "^2.11.4",
     "@types/node": "^26.1.2",
     "svelte-check": "^4.7.4",
     "typescript": "^5.7.2",

@@ -41,7 +41,7 @@ normalize_target() {
 }
 
 origin_for() {
-  [[ "$1" == production ]] && printf '%s\n' http://127.0.0.1:3000 || printf '%s\n' http://127.0.0.1:5173
+  [[ "$1" == production ]] && printf '%s\n' http://127.0.0.1:3001 || printf '%s\n' http://127.0.0.1:5173
 }
 
 label_for() {
@@ -87,6 +87,8 @@ write_launchd_plist() {
       <string>${binary}</string>
       <string>tunnel</string>
       <string>--no-autoupdate</string>
+      <string>--protocol</string>
+      <string>http2</string>
       <string>--url</string>
       <string>${origin}</string>
 ${host_header}
@@ -181,11 +183,11 @@ start_one() {
     launchctl bootstrap "gui/$(id -u)" "$(plist_file "${target}")"
     pid=""
   elif [[ "${target}" == production ]]; then
-    nohup "${binary}" tunnel --no-autoupdate --url "${origin}" >"${log}" 2>&1 < /dev/null &
+    nohup "${binary}" tunnel --no-autoupdate --protocol http2 --url "${origin}" >"${log}" 2>&1 < /dev/null &
     pid=$!
     printf '%s\n' "${pid}" > "$(pid_file "${target}")"
   else
-    nohup "${binary}" tunnel --no-autoupdate --url "${origin}" \
+    nohup "${binary}" tunnel --no-autoupdate --protocol http2 --url "${origin}" \
       --http-host-header localhost >"${log}" 2>&1 < /dev/null &
     pid=$!
     printf '%s\n' "${pid}" > "$(pid_file "${target}")"

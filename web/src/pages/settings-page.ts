@@ -1,3 +1,4 @@
+import { loadAppConfig, saveAppConfig } from '../app-config';
 import { refreshIcons } from '../components/icons';
 import { voiceOptions, voices } from '../shared/languages';
 import { loadPreferences, savePreferences } from '../shared/preferences';
@@ -9,6 +10,7 @@ export class SettingsPage implements Page {
   constructor(
     private readonly userId: string,
     private readonly onRooms: () => void,
+    private readonly onServerChanged: () => void,
   ) {}
 
   mount(root: HTMLElement) {
@@ -20,7 +22,7 @@ export class SettingsPage implements Page {
           <button class="icon-button settings-back" type="button" title="返回房间" aria-label="返回房间"><i data-lucide="arrow-left"></i></button>
           <div><span class="section-kicker"><i data-lucide="settings-2"></i> PLAYBACK SETTINGS</span><h1>设置</h1></div>
         </section>
-        <section class="settings-form" aria-label="语音播报设置">
+        <section class="settings-form" aria-label="应用设置">
           <div class="settings-section-heading"><i data-lucide="volume-2"></i><div><strong>翻译播报</strong><span>设置译文语音与生成后是否自动播放</span></div></div>
           <label class="settings-field"><span>播报音色</span><select class="settings-voice">${voiceOptions()}</select><small class="voice-preview"></small></label>
           <label class="toggle-field">
@@ -34,7 +36,15 @@ export class SettingsPage implements Page {
             <input class="settings-voice-filter" type="checkbox" role="switch">
             <span class="toggle-track" aria-hidden="true"></span>
           </label>
-          <div class="settings-saved" role="status" aria-live="polite"></div>
+          <div class="app-server-settings" hidden>
+            <div class="settings-section-heading"><i data-lucide="server"></i><div><strong>服务连接</strong><span>设置 App 请求的 Voice Elf API 地址</span></div></div>
+            <label class="settings-field settings-api-field"><span>API 地址</span><input class="settings-api-url" type="url" inputmode="url" autocomplete="url" autocapitalize="none" spellcheck="false" placeholder="https://voice.example.com" required><small>切换服务后需要重新登录</small></label>
+            <div class="settings-server-actions">
+              <button class="primary-command compact settings-server-save" type="button"><i data-lucide="save"></i><span>保存地址</span></button>
+              <span class="settings-server-status" role="status" aria-live="polite"></span>
+            </div>
+          </div>
+          <div class="settings-saved playback-saved" role="status" aria-live="polite"></div>
         </section>
       </main>
     `;
@@ -51,7 +61,7 @@ export class SettingsPage implements Page {
         enhancedVoiceFilter: enhancedVoiceFilter.checked,
       });
       root.querySelector('.voice-preview')!.textContent = `${voices[voice.value] ?? voice.value} · 服务端 TTS`;
-      const saved = root.querySelector('.settings-saved')!;
+      const saved = root.querySelector('.playback-saved')!;
       saved.textContent = '设置已保存';
       window.setTimeout(() => {
         if (this.root) saved.textContent = '';
@@ -63,9 +73,39 @@ export class SettingsPage implements Page {
     enhancedVoiceFilter.addEventListener('change', persist);
     persist();
     refreshIcons(root);
+    void this.mountAppConfig(root);
   }
 
   destroy() {
     this.root = null;
+  }
+
+  private async mountAppConfig(root: HTMLElement) {
+    const config = await loadAppConfig();
+    if (!config || this.root !== root) return;
+    const section = root.querySelector<HTMLElement>('.app-server-settings')!;
+    const input = section.querySelector<HTMLInputElement>('.settings-api-url')!;
+    const save = section.querySelector<HTMLButtonElement>('.settings-server-save')!;
+    const status = section.querySelector<HTMLElement>('.settings-server-status')!;
+    section.hidden = false;
+    input.value = config.api_url;
+    save.addEventListener('click', async () => {
+      status.classList.remove('error');
+      status.textContent = '';
+      if (!input.reportValidity()) return;
+      save.disabled = true;
+      try {
+        const saved = await saveAppConfig(input.value);
+        input.value = saved.api_url;
+        status.textContent = '已保存，正在切换服务';
+        this.onServerChanged();
+      } catch (error) {
+        status.classList.add('error');
+        status.textContent = error instanceof Error ? error.message : '无法保存 API 地址';
+      } finally {
+        save.disabled = false;
+      }
+    });
+    refreshIcons(section);
   }
 }

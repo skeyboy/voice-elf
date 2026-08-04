@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use diesel::{
@@ -9,8 +11,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
-    protocol::LatencyReport,
-    schema::{rooms, voice_sessions, voice_utterances},
+    protocol::{LatencyReport, SpeakerIdentity},
+    schema::{rooms, voice_sessions, voice_utterance_speakers, voice_utterances},
 };
 
 use super::Database;
@@ -25,6 +27,7 @@ pub struct NewUtteranceAttempt<'a> {
     pub source_audio_path: Option<&'a str>,
     pub source_audio_url: Option<&'a str>,
     pub latency: &'a LatencyReport,
+    pub speakers: &'a [SpeakerIdentity],
 }
 
 pub struct TranscriptUpdate<'a> {
@@ -78,6 +81,23 @@ struct UtteranceRow<'a> {
     processing_error: Option<&'a str>,
 }
 
+#[derive(Insertable)]
+#[diesel(table_name = voice_utterance_speakers)]
+struct UtteranceSpeakerRow<'a> {
+    id: Uuid,
+    utterance_id: Uuid,
+    user_id: Option<Uuid>,
+    username: &'a str,
+}
+
+#[derive(diesel::Queryable, diesel::Selectable)]
+#[diesel(table_name = voice_utterance_speakers)]
+struct UtteranceSpeakerHistoryRow {
+    utterance_id: Uuid,
+    user_id: Option<Uuid>,
+    username: String,
+}
+
 #[derive(diesel::Queryable, diesel::Selectable)]
 #[diesel(table_name = voice_utterances)]
 struct UtteranceHistoryRow {
@@ -117,6 +137,7 @@ pub struct UtteranceHistory {
     pub processing_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub latency: LatencyReport,
+    pub speakers: Vec<SpeakerIdentity>,
 }
 
 impl Database {
@@ -207,7 +228,11 @@ impl Database {
         let row = UtteranceRow {
             id: utterance.id,
             session_id: utterance.session_id,
-            user_id: Some(utterance.user_id),
+            user_id: match utterance.speakers {
+                [speaker] => speaker.user_id,
+                [] => Some(utterance.user_id),
+                _ => None,
+            },
             room_id: Some(utterance.room_id),
             source_text: "",
             translated_text: "",
@@ -236,6 +261,23 @@ impl Database {
             .values(row)
             .execute(&mut connection)
             .await?;
+        if !utterance.speakers.is_empty() {
+            let speakers = utterance
+                .speakers
+                .iter()
+                .map(|speaker| UtteranceSpeakerRow {
+                    id: Uuid::new_v4(),
+                    utterance_id: utterance.id,
+                    user_id: speaker.user_id,
+                    username: &speaker.username,
+                })
+                .collect::<Vec<_>>();
+            diesel::insert_into(voice_utterance_speakers::table)
+                .values(speakers)
+                .on_conflict_do_nothing()
+                .execute(&mut connection)
+                .await?;
+        }
         diesel::update(rooms::table.find(utterance.room_id))
             .set(rooms::updated_at.eq(diesel::dsl::now))
             .execute(&mut connection)
@@ -335,7 +377,36 @@ impl Database {
             .select(UtteranceHistoryRow::as_select())
             .load(&mut connection)
             .await?;
-        Ok(rows.into_iter().map(UtteranceHistory::from).collect())
+        let utterance_ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let speaker_rows = if utterance_ids.is_empty() {
+            Vec::new()
+        } else {
+            voice_utterance_speakers::table
+                .filter(voice_utterance_speakers::utterance_id.eq_any(&utterance_ids))
+                .order(voice_utterance_speakers::created_at.asc())
+                .select(UtteranceSpeakerHistoryRow::as_select())
+                .load(&mut connection)
+                .await?
+        };
+        let mut speakers_by_utterance = HashMap::<Uuid, Vec<SpeakerIdentity>>::new();
+        for speaker in speaker_rows {
+            speakers_by_utterance
+                .entry(speaker.utterance_id)
+                .or_default()
+                .push(SpeakerIdentity {
+                    user_id: speaker.user_id,
+                    username: speaker.username,
+                });
+        }
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let row_id = row.id;
+                let mut history = UtteranceHistory::from(row);
+                history.speakers = speakers_by_utterance.remove(&row_id).unwrap_or_default();
+                history
+            })
+            .collect())
     }
 }
 
@@ -365,6 +436,7 @@ impl From<UtteranceHistoryRow> for UtteranceHistory {
                 t3_unix_ms: to_u64(row.t3_unix_ms),
                 t4_unix_ms: to_u64(row.t4_unix_ms),
             },
+            speakers: Vec::new(),
         }
     }
 }

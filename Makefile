@@ -1,4 +1,4 @@
-.PHONY: dev server web web-deploy-watch web-public web-dev-public web-public-status web-public-stop setup-models build test
+.PHONY: dev server web web-deploy-watch web-public web-dev-public web-public-status web-public-stop app-dev app-build app-android-dev app-android-build app-ios-dev app-ios-build setup-models build test
 
 dev:
 	@echo "Run 'make server' and 'make web' in separate terminals"
@@ -23,6 +23,24 @@ web-public-status:
 
 web-public-stop:
 	./scripts/public-tunnel.sh stop all
+
+app-dev:
+	cd web && npm run app:dev
+
+app-build:
+	cd web && npm run app:build
+
+app-android-dev:
+	cd web && npm run app:android:dev
+
+app-android-build:
+	cd web && npm run app:android:build
+
+app-ios-dev:
+	cd web && npm run app:ios:dev
+
+app-ios-build:
+	cd web && npm run app:ios:build
 
 setup-models:
 	./scripts/setup-local-models.sh

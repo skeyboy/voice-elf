@@ -35,10 +35,26 @@ export interface UtteranceHistory {
   processing_error: string | null;
   created_at: string;
   latency: LatencyReport;
+  speakers: SpeakerIdentity[];
+}
+
+export interface SpeakerIdentity {
+  user_id: string | null;
+  username: string;
+}
+
+export interface RoomMemberState {
+  user_id: string;
+  username: string;
+  is_owner: boolean;
+  is_muted: boolean;
+  is_online: boolean;
+  is_speaking: boolean;
 }
 
 export interface RoomDetail {
   room: RoomSummary;
+  members: RoomMemberState[];
   utterances: UtteranceHistory[];
 }
 

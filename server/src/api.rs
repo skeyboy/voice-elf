@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
+    protocol::RoomMemberState,
     storage::{Database, RoomSummary, UserRecord, UtteranceHistory},
 };
 
@@ -34,6 +35,10 @@ pub fn router() -> Router<AppState> {
             get(room_detail).patch(update_room).delete(delete_room),
         )
         .route("/rooms/{room_id}/join", post(join_room))
+        .route(
+            "/rooms/{room_id}/members/{user_id}",
+            patch(update_room_member),
+        )
 }
 
 #[derive(Debug)]
@@ -207,7 +212,13 @@ struct SearchQuery {
 #[derive(Serialize)]
 struct RoomDetailResponse {
     room: RoomSummary,
+    members: Vec<RoomMemberState>,
     utterances: Vec<UtteranceHistory>,
+}
+
+#[derive(Deserialize)]
+struct RoomMemberInput {
+    is_muted: bool,
 }
 
 async fn list_rooms(
@@ -300,10 +311,57 @@ async fn room_detail(
         .list_utterances(room_id, query.q.as_deref())
         .await
         .map_err(ApiError::internal)?;
+    let member_records = database
+        .list_room_members(room_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let members = state.rooms.member_states(room_id, &member_records);
     Ok(Json(RoomDetailResponse {
         room: summary,
+        members,
         utterances,
     }))
+}
+
+async fn update_room_member(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path((room_id, member_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<RoomMemberInput>,
+) -> Result<Json<RoomMemberState>, ApiError> {
+    let user = authenticate(&state, &cookies).await?;
+    let database = database(&state)?;
+    let room = database
+        .get_room(room_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("房间不存在"))?;
+    if room.owner_id != user.id {
+        return Err(ApiError::forbidden("只有房主可以管理发言权限"));
+    }
+    if member_id == room.owner_id {
+        return Err(ApiError::bad_request("房主不能禁言自己"));
+    }
+    database
+        .set_room_member_muted(room_id, user.id, member_id, input.is_muted)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("房间成员不存在"))?;
+    state
+        .rooms
+        .set_muted(room_id, member_id, input.is_muted)
+        .await;
+    let members = database
+        .list_room_members(room_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let member = state
+        .rooms
+        .member_states(room_id, &members)
+        .into_iter()
+        .find(|member| member.user_id == member_id)
+        .ok_or_else(|| ApiError::not_found("房间成员不存在"))?;
+    Ok(Json(member))
 }
 
 async fn update_room(

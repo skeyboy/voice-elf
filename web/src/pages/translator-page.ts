@@ -1,4 +1,11 @@
-import { ApiRequestError, apiRequest, type RoomDetail, type RoomInput, type RoomSummary } from '../api';
+import {
+  ApiRequestError,
+  apiRequest,
+  type RoomDetail,
+  type RoomInput,
+  type RoomMemberState,
+  type RoomSummary,
+} from '../api';
 import { PcmPlayer } from '../audio';
 import { ConversationView } from '../components/conversation-view';
 import { LanguageDialog } from '../components/language-dialog';
@@ -31,6 +38,9 @@ export class TranslatorPage implements Page {
   private enhancedVoiceFilter = true;
   private readonly latencyIds = new Set<string>();
   private historySync: Promise<void> | null = null;
+  private members: RoomMemberState[] = [];
+  private canPublish = false;
+  private connectionStatus: ConnectionStatus = 'offline';
 
   constructor(
     private readonly userId: string,
@@ -52,6 +62,9 @@ export class TranslatorPage implements Page {
       return;
     }
     this.room = detail.room;
+    this.members = detail.members;
+    const currentMember = detail.members.find((member) => member.user_id === this.userId);
+    this.canPublish = detail.room.is_owner || Boolean(currentMember && !currentMember.is_muted);
     this.sourceLanguage = detail.room.source_language;
     this.targetLanguage = detail.room.target_language;
     this.maxUtteranceSeconds = detail.room.max_utterance_seconds;
@@ -60,6 +73,7 @@ export class TranslatorPage implements Page {
     this.enhancedVoiceFilter = preferences.enhancedVoiceFilter;
     this.player.muted = !preferences.autoplay;
     root.innerHTML = this.template(detail.room);
+    this.renderMembers();
     this.conversation = new ConversationView(this.player, this.onError, (active) =>
       this.voiceSession?.setExternalPlaybackActive(active),
     );
@@ -78,7 +92,7 @@ export class TranslatorPage implements Page {
 
     this.voiceSession = new VoiceSession(
       detail.room.id,
-      detail.room.is_owner,
+      this.canPublish,
       root.querySelector<HTMLCanvasElement>('#waveform')!,
       this.player,
       () => this.sessionConfig(),
@@ -97,10 +111,6 @@ export class TranslatorPage implements Page {
       },
     );
     this.voiceSession.connect();
-    if (!detail.room.is_owner) {
-      root.querySelector<HTMLButtonElement>('.record-button')!.disabled = true;
-      root.querySelector('.capture-state')!.textContent = '连接实时同步';
-    }
   }
 
   async destroy() {
@@ -141,7 +151,7 @@ export class TranslatorPage implements Page {
           <div class="room-identity-static">
             <span class="room-status-icon"><i data-lucide="door-open"></i></span>
             <span><small>当前房间</small><strong class="room-name">${escapeHtml(room.name)}</strong></span>
-            <span class="room-role${room.is_owner ? ' owner' : ''}">${room.is_owner ? '房主控制' : '成员同步'}</span>
+            <span class="room-role${room.is_owner ? ' owner' : ''}">${room.is_owner ? '房主控制' : this.canPublish ? '成员发言' : '已被禁言'}</span>
           </div>
           <form class="record-search">
             <i data-lucide="search"></i><input type="search" placeholder="检索转写或翻译记录" aria-label="检索房间记录"><button type="submit">检索</button>
@@ -157,7 +167,7 @@ export class TranslatorPage implements Page {
             <div class="panel-heading">
               <div><span class="section-kicker"><i data-lucide="radio"></i> LIVE SESSION</span><h1>实时对话</h1></div>
               <div class="panel-actions">
-                <span class="capture-session-badge"><span class="session-dot"></span><span class="session-badge-text">${room.is_owner ? '等待录音' : '连接同步中'}</span></span>
+                <span class="capture-session-badge"><span class="session-dot"></span><span class="session-badge-text">${this.canPublish ? '等待录音' : '已被禁言'}</span></span>
                 <div class="monitor-mount"></div>
                 <button class="icon-button refresh-history" type="button" title="刷新记录" aria-label="刷新记录"><i data-lucide="refresh-cw"></i></button>
               </div>
@@ -174,6 +184,10 @@ export class TranslatorPage implements Page {
               <div class="capture-readout"><strong class="capture-state">连接中</strong><span class="capture-time">00:00</span></div>
             </div>
           </section>
+          <aside class="member-panel" aria-label="房间成员">
+            <div class="member-panel-heading"><div><span class="section-kicker"><i data-lucide="users"></i> PARTICIPANTS</span><h2>房间成员</h2></div><span class="member-count">0 人</span></div>
+            <div class="member-list"></div>
+          </aside>
         </div>
       </main>
     `;
@@ -199,6 +213,10 @@ export class TranslatorPage implements Page {
       if (this.room) this.roomEditor?.open(this.room);
     });
     this.root.querySelector('.delete-room')?.addEventListener('click', () => void this.deleteRoom());
+    this.root.querySelector('.member-list')?.addEventListener('click', (event) => {
+      const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-mute-user]');
+      if (button) void this.toggleMemberMute(button);
+    });
   }
 
   private sessionConfig(): SessionConfig {
@@ -215,12 +233,16 @@ export class TranslatorPage implements Page {
     switch (event.type) {
       case 'room_subscribed':
         this.monitor?.setBackend(event.backend);
-        if (!event.can_publish) {
-          this.root.querySelector('.session-badge-text')!.textContent = '实时同步中';
-          this.root.querySelector('.capture-state')!.textContent = '等待发言';
-        }
+        this.updatePublishPermission(event.can_publish);
         void this.reconcileHistory();
         break;
+      case 'room_members': {
+        this.members = event.members;
+        this.renderMembers();
+        const self = event.members.find((member) => member.user_id === this.userId);
+        this.updatePublishPermission(Boolean(self && (self.is_owner || !self.is_muted)));
+        break;
+      }
       case 'ready':
         this.monitor?.setBackend(event.backend);
         break;
@@ -256,6 +278,9 @@ export class TranslatorPage implements Page {
         break;
       case 'utterance_discarded':
         this.conversation?.removeUtterance(event.utterance_id);
+        break;
+      case 'utterance_speakers':
+        this.conversation?.applySpeakers(event.utterance_id, event.speakers);
         break;
       case 'recognition_failed':
         this.conversation?.markRecognitionFailed(event.utterance_id, event.message);
@@ -307,16 +332,16 @@ export class TranslatorPage implements Page {
   }
 
   private setConnection(status: ConnectionStatus) {
-    const isOwner = Boolean(this.room?.is_owner);
-    this.onConnection(!isOwner && status === 'connected' ? 'viewer' : status);
+    this.connectionStatus = status;
+    this.onConnection(!this.canPublish && status === 'connected' ? 'viewer' : status);
     if (!this.root) return;
     this.root.querySelector<HTMLButtonElement>('.record-button')!.disabled =
-      !isOwner || status !== 'connected';
+      !this.canPublish || status !== 'connected';
     if (status === 'connected') {
-      this.root.querySelector('.capture-state')!.textContent = isOwner ? '就绪' : '等待发言';
-    } else if (!isOwner) {
+      this.root.querySelector('.capture-state')!.textContent = this.canPublish ? '就绪' : '已被禁言';
+    } else {
       this.root.querySelector('.capture-state')!.textContent =
-        status === 'connecting' ? '连接实时同步' : '同步已中断';
+        status === 'connecting' ? '连接实时会话' : '连接已中断';
     }
   }
 
@@ -330,8 +355,16 @@ export class TranslatorPage implements Page {
     console.classList.toggle('is-recording', recording);
     badge.classList.toggle('active', recording);
     this.root.querySelector('.translator-page')?.classList.toggle('is-recording', recording);
-    this.root.querySelector('.session-badge-text')!.textContent = recording ? '连续录音中' : '等待录音';
-    this.root.querySelector('.capture-state')!.textContent = recording ? '持续聆听' : '就绪';
+    this.root.querySelector('.session-badge-text')!.textContent = recording
+      ? '连续录音中'
+      : this.canPublish
+        ? '等待录音'
+        : '已被禁言';
+    this.root.querySelector('.capture-state')!.textContent = recording
+      ? '持续聆听'
+      : this.canPublish
+        ? '就绪'
+        : '已被禁言';
     button.innerHTML = `<i data-lucide="${recording ? 'circle-stop' : 'mic'}"></i>`;
     button.title = recording ? '停止录音' : '开始录音';
     button.ariaLabel = button.title;
@@ -372,6 +405,8 @@ export class TranslatorPage implements Page {
   private async loadHistory(search = '') {
     try {
       const detail = await this.getDetail(search);
+      this.members = detail.members;
+      this.renderMembers();
       this.conversation?.renderHistory(detail);
       this.resetLatency(detail);
     } catch (error) {
@@ -383,6 +418,8 @@ export class TranslatorPage implements Page {
     if (this.historySync) return this.historySync;
     this.historySync = this.getDetail()
       .then((detail) => {
+        this.members = detail.members;
+        this.renderMembers();
         this.conversation?.mergeHistory(detail);
         detail.utterances
           .slice()
@@ -430,6 +467,73 @@ export class TranslatorPage implements Page {
       languageNames[this.sourceLanguage] ?? this.sourceLanguage;
     this.root.querySelector('.language-target-label')!.textContent =
       languageNames[this.targetLanguage] ?? this.targetLanguage;
+  }
+
+  private updatePublishPermission(canPublish: boolean) {
+    this.canPublish = canPublish;
+    this.voiceSession?.setCanPublish(canPublish);
+    if (!this.root) return;
+    const button = this.root.querySelector<HTMLButtonElement>('.record-button')!;
+    button.disabled = !canPublish || this.connectionStatus !== 'connected';
+    const role = this.root.querySelector<HTMLElement>('.room-role');
+    if (role && !this.room?.is_owner) {
+      role.textContent = canPublish ? '成员发言' : '已被禁言';
+      role.classList.toggle('muted', !canPublish);
+    }
+    if (!this.recording && this.connectionStatus === 'connected') {
+      this.root.querySelector('.capture-state')!.textContent = canPublish ? '就绪' : '已被禁言';
+      this.root.querySelector('.session-badge-text')!.textContent = canPublish ? '等待录音' : '已被禁言';
+    }
+  }
+
+  private renderMembers() {
+    if (!this.root) return;
+    const list = this.root.querySelector<HTMLElement>('.member-list');
+    if (!list) return;
+    const ordered = this.members
+      .slice()
+      .sort((left, right) => Number(right.is_owner) - Number(left.is_owner) || left.username.localeCompare(right.username));
+    list.innerHTML = ordered
+      .map((member) => {
+        const status = member.is_speaking
+          ? '正在发言'
+          : member.is_muted
+            ? '已禁言'
+            : member.is_online
+              ? '在线'
+              : '离线';
+        const control = this.room?.is_owner && !member.is_owner
+          ? `<button class="icon-button member-mute" type="button" data-mute-user="${member.user_id}" data-muted="${member.is_muted}" title="${member.is_muted ? '允许发言' : '禁言'}" aria-label="${member.is_muted ? '允许发言' : '禁言'}"><i data-lucide="${member.is_muted ? 'mic' : 'mic-off'}"></i></button>`
+          : '';
+        return `<div class="member-row${member.is_speaking ? ' speaking' : ''}${member.is_muted ? ' muted' : ''}${member.is_online ? ' online' : ''}">
+          <span class="member-avatar">${escapeHtml(member.username.slice(0, 1).toUpperCase())}</span>
+          <span class="member-copy"><strong>${escapeHtml(member.username)}${member.user_id === this.userId ? '<small>你</small>' : ''}</strong><span><i></i>${member.is_owner ? '房主 · ' : ''}${status}</span></span>
+          ${control}
+        </div>`;
+      })
+      .join('');
+    const count = this.root.querySelector<HTMLElement>('.member-count');
+    if (count) count.textContent = `${this.members.filter((member) => member.is_online).length}/${this.members.length} 在线`;
+    refreshIcons(list);
+  }
+
+  private async toggleMemberMute(button: HTMLButtonElement) {
+    if (!this.room?.is_owner || button.disabled) return;
+    const userId = button.dataset.muteUser;
+    if (!userId) return;
+    const isMuted = button.dataset.muted === 'true';
+    button.disabled = true;
+    try {
+      const updated = await apiRequest<RoomMemberState>(
+        `/api/rooms/${this.room.id}/members/${userId}`,
+        { method: 'PATCH', body: JSON.stringify({ is_muted: !isMuted }) },
+      );
+      this.members = this.members.map((member) => member.user_id === updated.user_id ? updated : member);
+      this.renderMembers();
+    } catch (error) {
+      button.disabled = false;
+      this.onError(error instanceof Error ? error.message : '无法更新发言权限');
+    }
   }
 
   private async deleteRoom() {

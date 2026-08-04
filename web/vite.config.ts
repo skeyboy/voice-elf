@@ -27,10 +27,10 @@ export default defineConfig({
     port: 5173,
     strictPort: false,
     proxy: {
-      '/api': 'http://127.0.0.1:3000',
-      '/media': 'http://127.0.0.1:3000',
+      '/api': 'http://127.0.0.1:3001',
+      '/media': 'http://127.0.0.1:3001',
       '/ws': {
-        target: 'ws://127.0.0.1:3000',
+        target: 'ws://127.0.0.1:3001',
         ws: true,
       },
     },

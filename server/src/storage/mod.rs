@@ -120,6 +120,15 @@ pub struct RoomSummary {
     pub preview_text: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct RoomMemberRecord {
+    pub user_id: Uuid,
+    pub username: String,
+    pub is_owner: bool,
+    pub is_muted: bool,
+    pub joined_at: DateTime<Utc>,
+}
+
 impl Database {
     pub async fn connect(url: &str) -> Result<Self> {
         ensure_database_exists(url).await?;
@@ -400,6 +409,71 @@ impl Database {
             .execute(&mut connection)
             .await?;
         Ok(())
+    }
+
+    pub async fn list_room_members(&self, room_id: Uuid) -> Result<Vec<RoomMemberRecord>> {
+        let room = self
+            .get_room(room_id)
+            .await?
+            .context("room does not exist")?;
+        let mut connection = self.pool.get().await?;
+        let rows = room_members::table
+            .inner_join(users::table)
+            .filter(room_members::room_id.eq(room_id))
+            .order((room_members::joined_at.asc(), users::username.asc()))
+            .select((
+                room_members::user_id,
+                users::username,
+                room_members::is_muted,
+                room_members::joined_at,
+            ))
+            .load::<(Uuid, String, bool, DateTime<Utc>)>(&mut connection)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(user_id, username, is_muted, joined_at)| RoomMemberRecord {
+                    user_id,
+                    username,
+                    is_owner: user_id == room.owner_id,
+                    is_muted,
+                    joined_at,
+                },
+            )
+            .collect())
+    }
+
+    pub async fn set_room_member_muted(
+        &self,
+        room_id: Uuid,
+        owner_id: Uuid,
+        user_id: Uuid,
+        is_muted: bool,
+    ) -> Result<Option<RoomMemberRecord>> {
+        let Some(room) = self.get_room(room_id).await? else {
+            return Ok(None);
+        };
+        if room.owner_id != owner_id || user_id == room.owner_id {
+            return Ok(None);
+        }
+        let mut connection = self.pool.get().await?;
+        let changed = diesel::update(
+            room_members::table
+                .filter(room_members::room_id.eq(room_id))
+                .filter(room_members::user_id.eq(user_id)),
+        )
+        .set(room_members::is_muted.eq(is_muted))
+        .execute(&mut connection)
+        .await?;
+        drop(connection);
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(self
+            .list_room_members(room_id)
+            .await?
+            .into_iter()
+            .find(|member| member.user_id == user_id))
     }
 
     pub async fn can_view_room(&self, room_id: Uuid, user_id: Uuid) -> Result<bool> {

@@ -3,6 +3,22 @@ use uuid::Uuid;
 
 pub const INPUT_SAMPLE_RATE: u32 = 16_000;
 
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct SpeakerIdentity {
+    pub user_id: Option<Uuid>,
+    pub username: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RoomMemberState {
+    pub user_id: Uuid,
+    pub username: String,
+    pub is_owner: bool,
+    pub is_muted: bool,
+    pub is_online: bool,
+    pub is_speaking: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientEvent {
@@ -97,7 +113,11 @@ pub enum ServerEvent {
     RoomSubscribed {
         room_id: String,
         can_publish: bool,
+        user_id: Uuid,
         backend: String,
+    },
+    RoomMembers {
+        members: Vec<RoomMemberState>,
     },
     Ready {
         session_id: String,
@@ -125,6 +145,10 @@ pub enum ServerEvent {
     UtteranceQueued {
         utterance_id: String,
         tc_id: String,
+    },
+    UtteranceSpeakers {
+        utterance_id: String,
+        speakers: Vec<SpeakerIdentity>,
     },
     UtteranceDiscarded {
         utterance_id: String,
@@ -271,6 +295,7 @@ mod tests {
         let value = serde_json::to_value(ServerEvent::RoomSubscribed {
             room_id: "room-1".to_owned(),
             can_publish: false,
+            user_id: Uuid::nil(),
             backend: "local".to_owned(),
         })
         .unwrap();

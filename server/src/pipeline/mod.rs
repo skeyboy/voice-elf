@@ -13,7 +13,9 @@ use axum::extract::ws::Message;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::{backends::AppServices, media::MediaStore, storage::Database};
+use crate::{
+    backends::AppServices, media::MediaStore, protocol::SpeakerIdentity, storage::Database,
+};
 
 pub use session::run_pipeline;
 
@@ -21,7 +23,10 @@ pub use session::run_pipeline;
 pub enum PipelineInput {
     Event(crate::protocol::ClientEvent),
     Audio(Vec<u8>),
-    Invalid(String),
+    Speakers {
+        utterance_id: Uuid,
+        speakers: Vec<SpeakerIdentity>,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -1,4 +1,4 @@
-import type { RoomDetail } from '../api';
+import type { RoomDetail, SpeakerIdentity } from '../api';
 import { PcmPlayer } from '../audio';
 import type { ServerEvent } from '../protocol';
 import { languageNames } from '../shared/languages';
@@ -9,6 +9,7 @@ type TranscriptEvent = {
   text: string;
   language: string;
   created_at?: string;
+  speakers?: SpeakerIdentity[];
 };
 
 export class ConversationView {
@@ -16,7 +17,9 @@ export class ConversationView {
   private readonly list: HTMLElement;
   private readonly emptyState: HTMLElement;
   private readonly scrollButton: HTMLButtonElement;
+  private readonly speakerDialog: HTMLDialogElement;
   private readonly rows = new Map<string, HTMLElement>();
+  private readonly speakers = new Map<string, SpeakerIdentity[]>();
   private readonly mediaAudios = new Set<HTMLAudioElement>();
   private readonly mediaObjectUrls = new Set<string>();
   private activeMediaAudio: HTMLAudioElement | null = null;
@@ -40,16 +43,28 @@ export class ConversationView {
         </div>
       </div>
       <button class="scroll-latest" type="button" hidden><i data-lucide="arrow-down"></i><span>最新记录</span></button>
+      <dialog class="speaker-dialog">
+        <div class="speaker-dialog-heading"><div><small>本条音频</small><strong>发言成员</strong></div><button class="icon-button speaker-dialog-close" type="button" aria-label="关闭" title="关闭"><i data-lucide="x"></i></button></div>
+        <div class="speaker-dialog-list"></div>
+      </dialog>
     `;
     this.list = this.element.querySelector('.conversation-list')!;
     this.emptyState = this.element.querySelector('.empty-state')!;
     this.scrollButton = this.element.querySelector('.scroll-latest')!;
+    this.speakerDialog = this.element.querySelector('.speaker-dialog')!;
     this.list.addEventListener('scroll', () => this.handleScroll(), { passive: true });
     this.scrollButton.addEventListener('click', () => this.scrollToBottom(true));
+    this.speakerDialog.querySelector('.speaker-dialog-close')?.addEventListener('click', () =>
+      this.speakerDialog.close(),
+    );
+    this.speakerDialog.addEventListener('click', (event) => {
+      if (event.target === this.speakerDialog) this.speakerDialog.close();
+    });
     refreshIcons(this.element);
   }
 
   reset() {
+    if (this.speakerDialog.open) this.speakerDialog.close();
     this.mediaAudios.forEach((audio) => audio.pause());
     this.mediaAudios.clear();
     this.mediaObjectUrls.forEach((url) => URL.revokeObjectURL(url));
@@ -57,6 +72,7 @@ export class ConversationView {
     this.activeMediaAudio = null;
     this.player.stop();
     this.rows.clear();
+    this.speakers.clear();
     this.list.replaceChildren(this.emptyState);
     this.list.classList.add('empty');
     this.autoFollow = true;
@@ -88,6 +104,7 @@ export class ConversationView {
               text: utterance.source_text,
               language: utterance.source_language,
               created_at: utterance.created_at,
+              speakers: utterance.speakers,
             },
             recognizing,
           );
@@ -131,6 +148,7 @@ export class ConversationView {
 
   upsertTranscript(event: TranscriptEvent, streaming: boolean) {
     const article = this.ensureTranscriptRow(event);
+    if (event.speakers) this.applySpeakers(event.utterance_id, event.speakers);
     this.setSourceText(article, event.text, streaming);
     const pendingLabel = article.querySelector<HTMLElement>('.translation-line.pending small');
     const pendingText = article.querySelector<HTMLElement>('.translation-line.pending .translation-text');
@@ -150,6 +168,7 @@ export class ConversationView {
     });
     article.remove();
     this.rows.delete(id);
+    this.speakers.delete(id);
     if (this.rows.size === 0) {
       this.list.replaceChildren(this.emptyState);
       this.list.classList.add('empty');
@@ -167,6 +186,7 @@ export class ConversationView {
       article.innerHTML = `
         <div class="utterance-meta">
           <span class="source-language">${languageNames[event.language] ?? event.language}</span>
+          <span class="speaker-slot"></span>
           <time>${formatTimestamp(event.created_at)}</time>
         </div>
         <div class="source-block">
@@ -192,7 +212,56 @@ export class ConversationView {
     }
     article.querySelector<HTMLElement>('.source-language')!.textContent =
       languageNames[event.language] ?? event.language;
+    const speakers = event.speakers ?? this.speakers.get(event.utterance_id);
+    if (speakers) this.renderSpeakers(article, speakers);
     return article;
+  }
+
+  applySpeakers(utteranceId: string, speakers: SpeakerIdentity[]) {
+    this.speakers.set(utteranceId, speakers);
+    const article = this.rows.get(utteranceId);
+    if (article) this.renderSpeakers(article, speakers);
+  }
+
+  private renderSpeakers(article: HTMLElement, speakers: SpeakerIdentity[]) {
+    const slot = article.querySelector<HTMLElement>('.speaker-slot');
+    if (!slot) return;
+    slot.replaceChildren();
+    if (speakers.length === 0) return;
+    if (speakers.length === 1) {
+      const badge = document.createElement('span');
+      badge.className = 'speaker-badge';
+      badge.innerHTML = '<i data-lucide="user-round"></i><span></span>';
+      badge.querySelector('span')!.textContent = speakers[0].username;
+      slot.append(badge);
+    } else {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'speaker-badge multiple';
+      button.innerHTML = '<i data-lucide="users"></i><span></span>';
+      button.querySelector('span')!.textContent = `多人发言 · ${speakers.length}`;
+      button.addEventListener('click', () => this.openSpeakerDialog(speakers));
+      slot.append(button);
+    }
+    refreshIcons(slot);
+  }
+
+  private openSpeakerDialog(speakers: SpeakerIdentity[]) {
+    const list = this.speakerDialog.querySelector<HTMLElement>('.speaker-dialog-list')!;
+    list.replaceChildren(
+      ...speakers.map((speaker) => {
+        const row = document.createElement('div');
+        row.className = 'speaker-dialog-member';
+        const avatar = document.createElement('span');
+        avatar.className = 'speaker-dialog-avatar';
+        avatar.textContent = speaker.username.slice(0, 1).toUpperCase();
+        const name = document.createElement('strong');
+        name.textContent = speaker.username;
+        row.append(avatar, name);
+        return row;
+      }),
+    );
+    if (!this.speakerDialog.open) this.speakerDialog.showModal();
   }
 
   applyTranscriptDelta(event: Extract<ServerEvent, { type: 'transcript_delta' }>) {

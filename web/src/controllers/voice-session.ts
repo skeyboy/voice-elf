@@ -43,7 +43,7 @@ export class VoiceSession {
 
   constructor(
     private readonly roomId: string,
-    private readonly canPublish: boolean,
+    private canPublish: boolean,
     canvas: HTMLCanvasElement,
     private readonly player: PcmPlayer,
     private readonly config: () => SessionConfig,
@@ -80,6 +80,12 @@ export class VoiceSession {
   sendConfig() {
     if (!this.canPublish) return;
     this.sendJson({ type: 'configure', ...this.config() });
+  }
+
+  setCanPublish(canPublish: boolean) {
+    if (this.canPublish === canPublish) return;
+    this.canPublish = canPublish;
+    if (!canPublish && this.recording) void this.stopRecording();
   }
 
   async toggleRecording() {
@@ -276,7 +282,17 @@ export class VoiceSession {
       });
       return;
     }
-    const event = JSON.parse(message.data as string) as ServerEvent;
+    let event: ServerEvent;
+    try {
+      event = JSON.parse(message.data as string) as ServerEvent;
+    } catch {
+      this.callbacks.onCaptureError('服务端返回了无效的实时消息');
+      return;
+    }
+    if (event.type === 'room_subscribed') {
+      this.setCanPublish(event.can_publish);
+      if (event.can_publish) this.sendConfig();
+    }
     if (event.type === 'ready' && this.canPublish) this.sendConfig();
     if (event.type === 'audio_start') {
       this.audioSampleRate = event.sample_rate;

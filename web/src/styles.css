@@ -459,6 +459,112 @@ input:disabled {
   font-size: 11px;
 }
 
+.auth-server {
+  padding-top: 14px;
+  display: grid;
+  gap: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.auth-server[hidden],
+.auth-server-editor[hidden] {
+  display: none;
+}
+
+.auth-server-toggle {
+  min-width: 0;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  text-align: left;
+  cursor: pointer;
+}
+
+.auth-server-toggle > span {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.auth-server-toggle > span > svg {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  color: var(--green);
+}
+
+.auth-server-toggle > span > span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.auth-server-toggle strong {
+  font-size: 12px;
+}
+
+.auth-server-current {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auth-server-toggle > svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  color: var(--muted);
+  transition: transform 160ms ease;
+}
+
+.auth-server-toggle[aria-expanded="true"] > svg {
+  transform: rotate(180deg);
+}
+
+.auth-server-editor {
+  display: grid;
+  gap: 10px;
+}
+
+.server-save {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  color: var(--green);
+  background: var(--green-soft);
+  border: 1px solid #c4d9cc;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.server-save svg {
+  width: 14px;
+  height: 14px;
+}
+
+.server-config-status {
+  min-height: 16px;
+  margin: 0;
+  color: var(--green);
+  font-size: 10px;
+}
+
+.server-config-status.error {
+  color: #a64f3b;
+}
+
 dialog {
   color: var(--ink);
 }

@@ -27,13 +27,29 @@ export interface LatencyReport {
   t4_unix_ms: number;
 }
 
+export interface SpeakerIdentity {
+  user_id: string | null;
+  username: string;
+}
+
+export interface RoomMemberState {
+  user_id: string;
+  username: string;
+  is_owner: boolean;
+  is_muted: boolean;
+  is_online: boolean;
+  is_speaking: boolean;
+}
+
 export type ServerEvent =
   | {
       type: 'room_subscribed';
       room_id: string;
       can_publish: boolean;
+      user_id: string;
       backend: string;
     }
+  | { type: 'room_members'; members: RoomMemberState[] }
   | {
       type: 'ready';
       session_id: string;
@@ -60,6 +76,7 @@ export type ServerEvent =
       sample_count: number;
     }
   | { type: 'utterance_queued'; utterance_id: string; tc_id: string }
+  | { type: 'utterance_speakers'; utterance_id: string; speakers: SpeakerIdentity[] }
   | {
       type: 'utterance_discarded';
       utterance_id: string;

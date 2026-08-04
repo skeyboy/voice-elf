@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     backends::{LiveTranscription, Transcriber, Transcription, Translator},
-    protocol::{PipelinePhase, ServerEvent, SessionConfig},
+    protocol::{PipelinePhase, ServerEvent, SessionConfig, SpeakerIdentity},
 };
 
 use super::{
@@ -31,6 +31,7 @@ pub(super) struct UtteranceJob {
     pub config: SessionConfig,
     pub latency: LatencyObserver,
     pub live: Option<LivePreview>,
+    pub speakers: Vec<SpeakerIdentity>,
 }
 
 pub(super) struct LiveUtterance {
@@ -218,7 +219,12 @@ impl PipelineWorkers {
         })
     }
 
-    pub(super) async fn finish_live(&self, audio: Vec<i16>, mut live: LiveUtterance) -> Result<()> {
+    pub(super) async fn finish_live(
+        &self,
+        audio: Vec<i16>,
+        mut live: LiveUtterance,
+        speakers: Vec<SpeakerIdentity>,
+    ) -> Result<()> {
         live.latency.mark_vad_complete();
         self.transcription_tx
             .send(UtteranceJob {
@@ -227,6 +233,7 @@ impl PipelineWorkers {
                 config: live.config,
                 latency: live.latency,
                 live: live.preview.take(),
+                speakers,
             })
             .await
             .context("transcription worker stopped")
@@ -261,6 +268,7 @@ impl PipelineWorkers {
                 config: config.clone(),
                 latency,
                 live: None,
+                speakers: Vec::new(),
             })
             .await
         {

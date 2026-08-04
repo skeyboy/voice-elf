@@ -10,7 +10,7 @@ use crate::{
     media::MediaStore,
     protocol::{
         ClientEvent, ClientVadStart, INPUT_SAMPLE_RATE, PipelinePhase, ServerEvent, SessionConfig,
-        VadEndReason,
+        SpeakerIdentity, VadEndReason,
     },
     storage::Database,
 };
@@ -34,6 +34,7 @@ struct ActiveSegment {
     live: LiveUtterance,
     wall_started: Instant,
     audio: Vec<i16>,
+    speakers: Vec<SpeakerIdentity>,
 }
 
 pub async fn run_pipeline(
@@ -170,6 +171,7 @@ pub async fn run_pipeline(
                     live,
                     wall_started: Instant::now(),
                     audio: Vec::new(),
+                    speakers: Vec::new(),
                 });
                 send_event(
                     &output,
@@ -349,8 +351,25 @@ pub async fn run_pipeline(
                     send_state(&output, PipelinePhase::Listening, None).await?;
                 }
             }
-            PipelineInput::Invalid(message) => {
-                send_event(&output, ServerEvent::Warning { message }).await?;
+            PipelineInput::Speakers {
+                utterance_id,
+                speakers,
+            } => {
+                let Some(segment) = active_segment.as_mut() else {
+                    continue;
+                };
+                if segment.tc_id != utterance_id {
+                    continue;
+                }
+                segment.speakers = speakers.clone();
+                send_event(
+                    &output,
+                    ServerEvent::UtteranceSpeakers {
+                        utterance_id: utterance_id.to_string(),
+                        speakers,
+                    },
+                )
+                .await?;
             }
         }
     }
@@ -388,7 +407,9 @@ async fn finish_segment(
         discard_segment(output, segment.tc_id, reason).await?;
         return Ok(false);
     }
-    workers.finish_live(segment.audio, segment.live).await?;
+    workers
+        .finish_live(segment.audio, segment.live, segment.speakers)
+        .await?;
     Ok(true)
 }
 

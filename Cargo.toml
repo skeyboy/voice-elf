@@ -1,4 +1,4 @@
 [workspace]
-members = ["server", "web-vad"]
+members = ["server", "web-vad", "web/src-tauri"]
 exclude = [".local/src/qwen3-tts-rs"]
 resolver = "2"
