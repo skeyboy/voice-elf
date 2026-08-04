@@ -1,14 +1,17 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use diesel::{
-    BoolExpressionMethods, ExpressionMethods, Insertable, OptionalExtension,
-    PgTextExpressionMethods, QueryDsl, SelectableHelper,
+    BoolExpressionMethods, Connection, ExpressionMethods, Insertable, OptionalExtension,
+    PgConnection, PgTextExpressionMethods, QueryDsl, QueryableByName, SelectableHelper,
+    sql_types::{Bool, Text},
 };
 use diesel_async::{
-    AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection,
+    AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection,
     pooled_connection::{AsyncDieselConnectionManager, bb8::Pool},
 };
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use serde::Serialize;
+use url::Url;
 use uuid::Uuid;
 
 use crate::{
@@ -16,8 +19,13 @@ use crate::{
     schema::{auth_sessions, room_members, rooms, users, voice_sessions, voice_utterances},
 };
 
-const INITIAL_SCHEMA: &str =
-    include_str!("../../migrations/202608010001_create_voice_history/up.sql");
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
+#[derive(QueryableByName)]
+struct DatabaseExists {
+    #[diesel(sql_type = Bool)]
+    exists: bool,
+}
 
 #[derive(Clone)]
 pub struct Database {
@@ -114,21 +122,28 @@ pub struct RoomSummary {
 
 impl Database {
     pub async fn connect(url: &str) -> Result<Self> {
+        ensure_database_exists(url).await?;
+        let migration_url = url.to_owned();
+        let applied = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let mut connection = PgConnection::establish(&migration_url)
+                .context("failed to connect to PostgreSQL for migrations")?;
+            connection
+                .run_pending_migrations(MIGRATIONS)
+                .map(|versions| versions.len())
+                .map_err(|error| anyhow!("failed to run PostgreSQL migrations: {error}"))
+        })
+        .await
+        .context("PostgreSQL migration task failed")??;
+        if applied > 0 {
+            tracing::info!(applied, "applied PostgreSQL migrations");
+        }
+
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
         let pool = Pool::builder()
             .max_size(8)
             .build(manager)
             .await
             .context("failed to create PostgreSQL connection pool")?;
-        let mut connection = pool
-            .get()
-            .await
-            .context("failed to acquire PostgreSQL connection")?;
-        connection
-            .batch_execute(INITIAL_SCHEMA)
-            .await
-            .context("failed to apply voice history schema")?;
-        drop(connection);
         let database = Self { pool };
         let recovered = database
             .recover_interrupted_utterances()
@@ -478,9 +493,72 @@ impl Database {
         Ok(affected > 0)
     }
 }
+
+async fn ensure_database_exists(database_url: &str) -> Result<()> {
+    let (admin_url, database_name) = database_admin_url(database_url)?;
+    let mut connection = AsyncPgConnection::establish(admin_url.as_str())
+        .await
+        .context("failed to connect to the PostgreSQL maintenance database")?;
+    let exists =
+        diesel::sql_query("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1) AS exists")
+            .bind::<Text, _>(&database_name)
+            .get_result::<DatabaseExists>(&mut connection)
+            .await
+            .context("failed to inspect PostgreSQL databases")?
+            .exists;
+    if exists {
+        return Ok(());
+    }
+
+    let identifier = quote_postgres_identifier(&database_name);
+    connection
+        .batch_execute(&format!("CREATE DATABASE {identifier}"))
+        .await
+        .with_context(|| format!("failed to create PostgreSQL database '{database_name}'"))?;
+    tracing::info!(database = %database_name, "created PostgreSQL database");
+    Ok(())
+}
+
+fn database_admin_url(database_url: &str) -> Result<(Url, String)> {
+    let mut url =
+        Url::parse(database_url).context("DATABASE_URL must be a valid PostgreSQL URL")?;
+    if !matches!(url.scheme(), "postgres" | "postgresql") {
+        anyhow::bail!("DATABASE_URL must use the postgres or postgresql scheme");
+    }
+    let database_name = url.path().trim_matches('/').to_owned();
+    if database_name.is_empty() || database_name.contains('/') {
+        anyhow::bail!("DATABASE_URL must include exactly one database name");
+    }
+    url.set_path("/postgres");
+    Ok((url, database_name))
+}
+
+fn quote_postgres_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod database_setup_tests {
+    use super::{database_admin_url, quote_postgres_identifier};
+
+    #[test]
+    fn derives_maintenance_url_without_losing_connection_options() {
+        let (url, database) =
+            database_admin_url("postgres://user:secret@localhost:5432/voice_elf?sslmode=disable")
+                .unwrap();
+        assert_eq!(database, "voice_elf");
+        assert_eq!(url.path(), "/postgres");
+        assert_eq!(url.query(), Some("sslmode=disable"));
+    }
+
+    #[test]
+    fn quotes_database_identifiers() {
+        assert_eq!(quote_postgres_identifier("voice\"elf"), "\"voice\"\"elf\"");
+    }
+}
 mod history;
 
 pub use history::{
-    BrowserTtsTarget, NewUtteranceAttempt, TranscriptUpdate, TranslationUpdate,
-    UtteranceAudioUpdate, UtteranceHistory,
+    NewUtteranceAttempt, TranscriptUpdate, TranslationUpdate, UtteranceAudioUpdate,
+    UtteranceHistory,
 };

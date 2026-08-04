@@ -9,14 +9,13 @@ mod schema;
 mod storage;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Result;
 use axum::{
     Json, Router,
     body::Body,
     extract::{OriginalUri, Query, State, WebSocketUpgrade, ws::Message},
-    http::StatusCode,
+    http::{HeaderName, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -28,6 +27,7 @@ use tokio::sync::mpsc;
 use tower_cookies::{CookieManagerLayer, Cookies};
 use tower_http::{
     services::{ServeDir, ServeFile},
+    set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
 };
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -90,6 +90,14 @@ async fn main() -> Result<()> {
         .route_service("/rooms/{room_id}", ServeFile::new(&index_file))
         .route_service("/settings", ServeFile::new(&index_file))
         .fallback_service(static_files)
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("cross-origin-embedder-policy"),
+            HeaderValue::from_static("require-corp"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("cross-origin-opener-policy"),
+            HeaderValue::from_static("same-origin"),
+        ))
         .layer(CookieManagerLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -212,7 +220,7 @@ async fn handle_socket(
             }
         }
     });
-    let mut pipeline = tokio::spawn(run_pipeline(
+    let pipeline = tokio::spawn(run_pipeline(
         services, database, media, identity, input_rx, output_tx,
     ));
 
@@ -233,12 +241,6 @@ async fn handle_socket(
     }
 
     drop(input_tx);
-    if tokio::time::timeout(Duration::from_secs(2), &mut pipeline)
-        .await
-        .is_err()
-    {
-        pipeline.abort();
-        let _ = pipeline.await;
-    }
+    let _ = pipeline.await;
     let _ = writer.await;
 }

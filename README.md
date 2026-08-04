@@ -6,33 +6,34 @@ Local-first realtime speech translator with a Rust/Axum WebSocket server and a S
 
 ```text
 Browser AudioWorklet (native-rate mono Float32 capture)
-  -> Web Worker + Lele/Silero Rust WASM (16 kHz PCM16, 32 ms frames, 224 ms pre-roll)
-  -> speech_start / speech PCM / speech_end over WebSocket /ws
+  -> Web Worker + Lele/Silero Rust WASM (16 kHz PCM16, 32 ms frames, 512 ms/1 s pre-roll)
+  -> start(tc_id + languages) / speech PCM / end(tc_id + is_silent_vad) over WebSocket /ws
   -> server boundary, frame, rate, and duration validation
-  -> ASR queue: Qwen ASR CLI
+  -> primary Qwen ASR live stream + post-segment parallel ASR consensus
   -> translation queue: Qwen3 local LLM
   -> translated text returned without waiting for TTS
-  -> Web Worker + official Supertonic 3 ONNX (WebGPU, WASM fallback)
-  -> translated PCM16 upload, WAV persistence, and browser playback
+  -> server sherpa-onnx TTS: Kokoro INT8 for zh, Supertonic 3 INT8 for other languages
+  -> source/translated WAV persistence + PCM16 WebSocket stream + browser playback
 ```
 
 Each utterance reports five timestamps: `t0` speech start, `t1` VAD endpoint, `t2` STT complete, `t3` translation complete, and `t4` TTS complete.
 
-Recording is continuous until the client sends `flush`. The browser's Rust/WASM VAD closes each sentence after its silence endpoint and sends only speech PCM as an independent utterance. The server has no VAD implementation; it treats browser boundaries as untrusted hints and enforces the authenticated room lifecycle, exact frame format, near-realtime ingress rate, and maximum duration. If WASM initialization fails, recording does not start and the UI reports the error. ASR and translation have independent per-connection workers.
+Recording is continuous until the client sends `flush`. The browser's Rust/WASM VAD gives every sentence a UUID `tc_id`, closes it after roughly three seconds of silence or the configured 20-second hard limit, and uploads only speech PCM. Operators can enable enhanced voice filtering in Settings; this mode calibrates the first second, locks out sustained low-frequency hum, and buffers a candidate until six voice frames are confirmed. The primary ASR starts with the accepted segment and streams partial text while the user is speaking. At `end`, the server saves the WAV, runs any additional ASR channels in parallel, selects a consensus result, and queues translation. Silent, sub-200 ms, and segments without enough confirmed human speech are discarded before persistence and ASR. Automatic and manual translated-audio playback temporarily suppress microphone VAD input to prevent speaker feedback from becoming a new utterance. The server treats browser boundaries as untrusted hints and enforces the authenticated room lifecycle, exact frame format, near-realtime ingress rate, and maximum duration.
 
-Qwen ASR remains server-side. Its model is too large and device-sensitive for the default browser path, and keeping it on the server protects model files and preserves authoritative persisted results. Browser TTS follows the official Supertonic Web implementation through `onnxruntime-web`: WebGPU is attempted first and WebAssembly is used as the compatibility fallback. See [the browser VAD architecture](docs/browser-vad-architecture.md) for the deployment and security decisions.
+Qwen ASR remains server-side. Its model is too large and device-sensitive for the default browser path, and keeping it on the server protects model files and preserves authoritative persisted results. See [the browser VAD architecture](docs/browser-vad-architecture.md) for the deployment and security decisions.
 
-Supertonic 3 supports 31 languages but not Chinese. A Chinese target keeps the translated text and reports TTS as unsupported instead of generating misleading audio. Production deployments that require Chinese speech need a separate browser model or a server-side fallback. The model files remain subject to Supertone's OpenRAIL-M license; `npm run build:tts` places a copy of that license beside the deployed assets.
+Server TTS uses two lazy-loaded sherpa-onnx engines. Chinese uses Kokoro v1.1 zh/en INT8; `en/ja/ko/fr/de/es/it/pt/ru` use Supertonic 3 INT8. Translation text is streamed immediately, while TTS runs in the following queue stage and returns both a protected WAV URL and PCM16 WebSocket frames.
 
-Rooms define `max_utterance_seconds` with a default of 20 seconds and an allowed range of 5 through 120 seconds. Continuous speech is force-segmented at that duration and immediately continues in a new utterance record.
+Rooms define `max_utterance_seconds` with a default of 20 seconds and an allowed range of 5 through 20 seconds. Continuous speech is force-segmented at that duration and immediately continues in a new utterance record.
 
-The backend pipeline is organized by runtime responsibility under `server/src/pipeline/`: `session` validates browser speech segments, `transcription` and `translation` own their stage workers, and `jobs`, `events`, `latency`, and `config` contain shared scheduling concerns. PostgreSQL utterance persistence and the authenticated browser-TTS upload target are isolated in `server/src/storage/history.rs`.
+The backend pipeline is organized by runtime responsibility under `server/src/pipeline/`: `session` validates browser speech segments, while `transcription`, `translation`, and `synthesis` own their stage workers. PostgreSQL utterance persistence is isolated in `server/src/storage/history.rs`.
 
 ## Run the demo
 
-The demo backend exercises browser capture and VAD, WebSocket transport, translation events, browser TTS, latency reporting, and audio playback. Speech recognition and translation remain deterministic samples until the local Qwen backends are configured. `npm run build` downloads or reuses the official Supertonic 3 model assets before compiling the frontend.
+Prepare the server TTS models once. The script downloads pinned Kokoro and Supertonic INT8 archives into the ignored `.local` directory:
 
 ```bash
+./scripts/setup-server-tts.sh
 cd web
 npm install
 npm run build
@@ -68,7 +69,7 @@ cp .env.example .env
 cargo run --release --bin voice-elf-server
 ```
 
-The server loads `.env` automatically. The local configuration uses `qwen_asr` for speech recognition and `llama-completion` with Qwen3-0.6B for translation. You can instead configure an OpenAI-compatible translation endpoint with `LOCAL_LLM_BASE_URL` and `LOCAL_LLM_MODEL`. Browser TTS assets are built separately by `npm run build:tts`.
+The server loads `.env` automatically. The default installed configuration uses the open-source Qwen3-ASR-0.6B model through the MIT-licensed `qwen_asr` C runtime for offline streaming recognition, and `llama-completion` with Qwen3-0.6B for offline translation. It covers `zh/en/ja/ko/fr/de/es/it/pt/ru` and emits stable source tokens while audio is still arriving. You can instead configure an OpenAI-compatible translation endpoint with `LOCAL_LLM_BASE_URL` and `LOCAL_LLM_MODEL`. Set `TTS_KOKORO_MODEL_DIR`, `TTS_SUPERTONIC_MODEL_DIR`, and `TTS_THREADS` to override the server TTS defaults.
 
 The ASR adapter starts at the VAD speech-start edge and receives PCM continuously while the speaker is still talking. Its low-latency defaults can be tuned with `QWEN_ASR_STREAM_UNFIXED_CHUNKS`, `QWEN_ASR_STREAM_MAX_NEW_TOKENS`, and `QWEN_ASR_ENCODER_WINDOW_SECONDS`; the adapter invokes:
 
@@ -78,19 +79,19 @@ qwen_asr -d <model-dir> --stdin --stream \
   --enc-window-sec 4 [--language <language>]
 ```
 
-The local backend validates the ASR and translation model paths at startup. Runtime model failures are returned to the client as recoverable errors, so the WebSocket session can keep listening. Browser TTS assets can also be prepared independently with `npm run build:tts`; set `TTS_MODEL_ENDPOINT` only when an alternate Hugging Face-compatible mirror is required.
+The server validates both TTS model directories at startup; local mode also validates ASR and translation paths. Runtime inference failures are returned to the client as record-scoped recoverable errors, so the WebSocket session can keep listening.
 
 Qwen's stable token callback is forwarded immediately as real `transcript_delta` events. After VAD closes the sentence and ASR produces its final text, `llama-completion` stdout is filtered and forwarded token-by-token as real `translation_delta` events. Translation intentionally starts from the finalized sentence rather than repeatedly translating unstable ASR prefixes.
 
-On the tested 2019 Intel Mac, a warm 6.5-second continuous sample produced its first source delta at about 3.9 seconds and completed ASR at about 8.8 seconds. A cold model can add roughly five seconds. CPU inference can therefore still lag behind live capture even though audio transport and event delivery are genuinely streaming. Browser TTS runs in a dedicated Web Worker after translated text is final and cannot block newer source or translated text.
+On the tested 2019 Intel Mac, a warm 6.5-second continuous sample produced its first source delta at about 3.9 seconds and completed ASR at about 8.8 seconds. A cold model can add roughly five seconds. CPU inference can therefore still lag behind live capture even though audio transport and event delivery are genuinely streaming. Server TTS runs in its own queue stage, so later ASR and translation tasks can continue while audio is synthesized.
 
 Qwen streaming uses two-second audio chunks. The configured 12-token decode budget bounds each streaming step while retaining enough capacity for normal Chinese and English speech rates. If live recognition fails or returns no text, the adapter retries the preserved utterance PCM with faster `--silent` batch recognition before reporting an error.
 
 ## PostgreSQL history
 
-Set `DATABASE_URL` to enable asynchronous persistence through Diesel and its bb8 connection pool. The database must already exist; the server applies the idempotent table and index definitions during startup.
+Set `DATABASE_URL` to enable asynchronous persistence through Diesel and its bb8 connection pool. On startup, the server connects to PostgreSQL's `postgres` maintenance database, creates the configured database when it is missing, and then runs all pending embedded Diesel migrations before accepting traffic. The configured PostgreSQL role therefore needs `CREATEDB` only when automatic database creation is required.
 
-Each completed utterance is stored as two mono PCM16 WAV files: the received source audio and the translated TTS audio. The source WAV and processing record are persisted before ASR. Transcript and translation fields are updated as their stages finish. The authenticated room owner uploads browser-generated PCM16; the server validates it, writes the translated WAV, and stores its URL and final TTS latency. A failed synthesis therefore does not discard the source recording or text results.
+Each completed utterance is stored as two mono PCM16 WAV files: the received source audio and the server-generated translated TTS audio. The source WAV and processing record are persisted before ASR. Transcript, translation, translated WAV URL, and final TTS latency are updated as their stages finish. A failed synthesis therefore does not discard the source recording or text results.
 
 Every VAD utterance is now persisted before ASR with its user, room, session, utterance ID, source WAV, and processing status. Empty ASR results become a record-scoped `recognition_failed` event rather than a global pipeline error, so the client keeps the failed row and its playable source audio for diagnosis.
 
@@ -133,20 +134,19 @@ Client text frames:
 
 ```json
 {"type":"configure","source_language":"auto","target_language":"zh","voice":"ryan","max_utterance_seconds":20}
-{"type":"start"}
-{"type":"speech_start"}
-{"type":"speech_end"}
+{"type":"start","tc_id":"550e8400-e29b-41d4-a716-446655440000","vad":{"engine":"silero-v6.2-lele","sample_rate":16000,"frame_samples":512,"pre_roll_samples":8192},"source_language":"auto","target_language":"zh","voice":"ryan","max_utterance_seconds":20}
+{"type":"end","tc_id":"550e8400-e29b-41d4-a716-446655440000","is_silent_vad":false,"vad":{"reason":"silence","sample_count":24576}}
 {"type":"flush"}
 ```
 
-Client binary frames are fixed 512-sample little-endian PCM16 at 16 kHz, mono, and are sent only between `speech_start` and `speech_end`. The server does not accept a continuous non-VAD audio mode. Server text frames carry state, incremental `transcript_delta` and `translation_delta` updates, final text, media URLs, audio metadata, and latency events. Media is returned incrementally: source audio first, translated audio after the browser posts PCM16 to `POST /api/utterances/{utterance_id}/translated-audio`.
+Client binary frames are fixed 512-sample little-endian PCM16 at 16 kHz, mono, and are sent only between matching `start` and `end` messages. `start` declares the VAD engine/frame configuration; `end` carries the VAD boundary reason and sent sample count. The server validates these hints against the received PCM. Server text frames carry state, incremental `transcript_delta` and `translation_delta` updates, final text, media URLs, audio metadata, latency events, and `utterance_discarded` for silent placeholders. Source media is returned after persistence; after asynchronous TTS finishes, a second `media` event updates only the translated URL, followed by `audio_start`, binary PCM16 frames, and `audio_end`.
 
 ```json
 {"type":"media","utterance_id":"...","source_audio_url":"/media/...-source.wav","translated_audio_url":null}
 {"type":"media","utterance_id":"...","source_audio_url":null,"translated_audio_url":"/media/...-translated.wav"}
 ```
 
-Translated PCM is played locally as soon as browser synthesis finishes; the persisted WAV is also available through the protected media URL.
+Translated PCM can be played as soon as the server stream arrives; both persisted WAV files are also available through protected media URLs.
 
 ## Web routes
 

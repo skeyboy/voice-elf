@@ -10,7 +10,8 @@ pub(super) fn normalize_config(
         "auto", "zh", "en", "ja", "ko", "fr", "de", "es", "it", "pt", "ru",
     ];
     const VOICES: &[&str] = &[
-        "serena", "vivian", "unclefu", "ryan", "aiden", "onoanna", "sohee", "eric", "dylan",
+        "f1", "m1", "serena", "vivian", "unclefu", "ryan", "aiden", "onoanna", "sohee", "eric",
+        "dylan",
     ];
     if !LANGUAGES.contains(&config.source_language.as_str()) {
         return Err(format!(
@@ -27,9 +28,9 @@ pub(super) fn normalize_config(
     if !VOICES.contains(&config.voice.as_str()) {
         return Err(format!("Unsupported voice: {}", config.voice));
     }
-    if !(5..=120).contains(&config.max_utterance_seconds) {
+    if !(5..=20).contains(&config.max_utterance_seconds) {
         return Err(format!(
-            "Maximum utterance duration must be between 5 and 120 seconds: {}",
+            "Maximum utterance duration must be between 5 and 20 seconds: {}",
             config.max_utterance_seconds
         ));
     }
@@ -50,6 +51,14 @@ mod tests {
         })
         .unwrap();
         assert_eq!(valid.source_language, "en");
+        assert_eq!(valid.voice, "ryan");
+        assert!(
+            normalize_config(SessionConfig {
+                voice: "M1".to_owned(),
+                ..SessionConfig::default()
+            })
+            .is_ok()
+        );
         assert!(
             normalize_config(SessionConfig {
                 target_language: "auto".to_owned(),

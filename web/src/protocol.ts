@@ -37,8 +37,29 @@ export type ServerEvent =
     }
   | ({ type: 'configured' } & SessionConfig)
   | { type: 'state'; phase: PipelinePhase; utterance_id: string | null }
-  | { type: 'vad'; active: boolean; level: number }
-  | { type: 'utterance_queued'; utterance_id: string }
+  | {
+      type: 'vad';
+      active: boolean;
+      level: number;
+      utterance_id: string | null;
+      reason:
+        | 'silence'
+        | 'max_duration'
+        | 'manual'
+        | 'superseded'
+        | 'silent'
+        | 'server_limit'
+        | 'unknown'
+        | null;
+      sample_count: number;
+    }
+  | { type: 'utterance_queued'; utterance_id: string; tc_id: string }
+  | {
+      type: 'utterance_discarded';
+      utterance_id: string;
+      tc_id: string;
+      reason: string;
+    }
   | { type: 'recognition_failed'; utterance_id: string; message: string }
   | {
       type: 'processing_failed';

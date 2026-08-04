@@ -59,18 +59,21 @@ pub(super) async fn run_transcription_worker(
 
 async fn transcribe(context: &PipelineContext, mut job: UtteranceJob) -> Result<TranslationJob> {
     let utterance_id = job.id.to_string();
-    if job.live.is_none() {
-        send_state(
-            &context.output,
-            PipelinePhase::Transcribing,
-            Some(&utterance_id),
-        )
-        .await?;
-    }
-    prepare_utterance(context, &job).await?;
+    send_state(
+        &context.output,
+        PipelinePhase::Transcribing,
+        Some(&utterance_id),
+    )
+    .await?;
+    prepare_utterance(context, &mut job).await?;
     let transcription = if let Some(live) = job.live.take() {
         match live.finish().await {
-            Ok(transcription) => transcription,
+            Ok(primary) => context
+                .services
+                .transcriber
+                .refine_transcription(&job.audio, &job.config.source_language, primary)
+                .await
+                .context("parallel ASR refinement failed")?,
             Err(error) => {
                 tracing::warn!(%error, %utterance_id, "live ASR failed; retrying completed utterance");
                 transcribe_completed_audio(context, &job, &utterance_id).await?
@@ -170,7 +173,7 @@ async fn transcribe_completed_audio(
     Ok(transcription)
 }
 
-async fn prepare_utterance(context: &PipelineContext, job: &UtteranceJob) -> Result<()> {
+async fn prepare_utterance(context: &PipelineContext, job: &mut UtteranceJob) -> Result<()> {
     let utterance_id = job.id.to_string();
     let source_media = match context
         .media

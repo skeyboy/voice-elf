@@ -1,4 +1,4 @@
-import { MicrophoneCapture, PcmPlayer, Waveform } from '../audio';
+import { MicrophoneCapture, PcmPlayer, Waveform, type VadBoundary } from '../audio';
 import type { ServerEvent, SessionConfig } from '../protocol';
 import type { ConnectionStatus } from '../components/topbar';
 
@@ -7,6 +7,9 @@ interface PlaybackProgress {
   currentSeconds: number;
   durationSeconds: number;
 }
+
+const MIN_VALID_SPEECH_FRAMES = 6;
+const PLAYBACK_TAIL_GUARD_MS = 300;
 
 interface VoiceSessionCallbacks {
   onEvent: (event: ServerEvent) => void;
@@ -30,6 +33,12 @@ export class VoiceSession {
   } | null = null;
   private audioSampleRate = 24_000;
   private recording = false;
+  private activeTcId: string | null = null;
+  private activeSampleCount = 0;
+  private segmentsStarted = 0;
+  private activeEnhancedVoiceFilter = false;
+  private readonly playbackHolds = new Set<'stream' | 'media'>();
+  private readonly playbackReleaseTimers = new Map<'stream' | 'media', number>();
   private destroyed = false;
 
   constructor(
@@ -37,9 +46,11 @@ export class VoiceSession {
     canvas: HTMLCanvasElement,
     private readonly player: PcmPlayer,
     private readonly config: () => SessionConfig,
+    private readonly enhancedVoiceFilter: () => boolean,
     private readonly callbacks: VoiceSessionCallbacks,
   ) {
     this.waveform = new Waveform(canvas);
+    this.player.setPlaybackListener((active) => this.setPlaybackHold('stream', active));
   }
 
   connect() {
@@ -77,9 +88,17 @@ export class VoiceSession {
     if (muted) this.player.stop();
   }
 
+  setExternalPlaybackActive(active: boolean) {
+    this.setPlaybackHold('media', active);
+  }
+
   async destroy() {
     this.destroyed = true;
     if (this.recording) await this.stopRecording();
+    this.player.setPlaybackListener(null);
+    this.playbackReleaseTimers.forEach((timer) => window.clearTimeout(timer));
+    this.playbackReleaseTimers.clear();
+    this.playbackHolds.clear();
     this.disconnect();
     this.waveform.destroy();
   }
@@ -97,17 +116,24 @@ export class VoiceSession {
   private async startRecording() {
     if (this.socket?.readyState !== WebSocket.OPEN) return;
     await this.player.unlock();
+    this.activeEnhancedVoiceFilter = this.enhancedVoiceFilter();
+    this.activeTcId = null;
+    this.activeSampleCount = 0;
+    this.segmentsStarted = 0;
     try {
       await this.microphone.start(
         this.config().max_utterance_seconds,
+        this.activeEnhancedVoiceFilter,
         (pcm) => {
-          if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(pcm);
+          if (this.activeTcId && this.socket?.readyState === WebSocket.OPEN) {
+            this.socket.send(pcm);
+            this.activeSampleCount += pcm.byteLength / Int16Array.BYTES_PER_ELEMENT;
+          }
         },
         (level) => this.waveform.push(level),
-        (boundary) => this.sendJson({ type: boundary }),
+        (boundary) => this.handleVadBoundary(boundary),
         () => {
           this.sendConfig();
-          this.sendJson({ type: 'start' });
         },
         (error) => void this.handleCaptureFailure(error),
       );
@@ -115,21 +141,116 @@ export class VoiceSession {
       throw error;
     }
     this.recording = true;
+    this.syncPlaybackSuppression();
     this.waveform.setActive(true);
     this.callbacks.onRecording(true);
   }
 
   private async stopRecording() {
     this.recording = false;
+    this.syncPlaybackSuppression();
     await this.microphone.stop();
+    if (this.activeTcId) {
+      this.finishVadSegment('manual');
+    }
+    if (this.segmentsStarted === 0) {
+      const tcId = crypto.randomUUID();
+      this.sendJson({
+        type: 'start',
+        tc_id: tcId,
+        vad: this.vadStartMetadata(),
+        ...this.config(),
+      });
+      this.sendJson({
+        type: 'end',
+        tc_id: tcId,
+        is_silent_vad: true,
+        vad: { reason: 'silent', sample_count: 0, speech_frames: 0 },
+      });
+    }
     this.sendJson({ type: 'flush' });
+    this.segmentsStarted = 0;
     this.waveform.setActive(false);
     this.callbacks.onRecording(false);
+  }
+
+  private handleVadBoundary(boundary: VadBoundary) {
+    if (boundary.type === 'speech_start') {
+      if (this.activeTcId) {
+        this.finishVadSegment('superseded');
+      }
+      const tcId = crypto.randomUUID();
+      this.activeTcId = tcId;
+      this.activeSampleCount = 0;
+      this.segmentsStarted += 1;
+      this.sendJson({
+        type: 'start',
+        tc_id: tcId,
+        vad: this.vadStartMetadata(),
+        ...this.config(),
+      });
+      return;
+    }
+    if (!this.activeTcId) return;
+    this.finishVadSegment(boundary.reason, boundary.speechFrames);
+  }
+
+  private finishVadSegment(
+    reason: 'silence' | 'max_duration' | 'manual' | 'superseded',
+    speechFrames?: number,
+  ) {
+    if (!this.activeTcId) return;
+    const vad = {
+      reason,
+      sample_count: this.activeSampleCount,
+      ...(speechFrames === undefined ? {} : { speech_frames: speechFrames }),
+    };
+    this.sendJson({
+      type: 'end',
+      tc_id: this.activeTcId,
+      is_silent_vad:
+        speechFrames !== undefined && speechFrames < MIN_VALID_SPEECH_FRAMES,
+      vad,
+    });
+    this.activeTcId = null;
+    this.activeSampleCount = 0;
+  }
+
+  private vadStartMetadata() {
+    return {
+      engine: this.activeEnhancedVoiceFilter
+        ? 'silero-v6.2-lele-enhanced'
+        : 'silero-v6.2-lele',
+      sample_rate: 16_000,
+      frame_samples: 512,
+      pre_roll_samples: this.activeEnhancedVoiceFilter ? 16_384 : 8_192,
+    };
   }
 
   private async handleCaptureFailure(error: Error) {
     this.callbacks.onCaptureError(error.message);
     if (this.recording) await this.stopRecording();
+  }
+
+  private setPlaybackHold(kind: 'stream' | 'media', active: boolean) {
+    const pendingRelease = this.playbackReleaseTimers.get(kind);
+    if (pendingRelease) window.clearTimeout(pendingRelease);
+    this.playbackReleaseTimers.delete(kind);
+    if (active) {
+      this.playbackHolds.add(kind);
+      this.syncPlaybackSuppression();
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      this.playbackReleaseTimers.delete(kind);
+      this.playbackHolds.delete(kind);
+      this.syncPlaybackSuppression();
+    }, PLAYBACK_TAIL_GUARD_MS);
+    this.playbackReleaseTimers.set(kind, timer);
+  }
+
+  private syncPlaybackSuppression() {
+    this.microphone.setSuppressed(this.recording && this.playbackHolds.size > 0);
   }
 
   private handleMessage(message: MessageEvent) {

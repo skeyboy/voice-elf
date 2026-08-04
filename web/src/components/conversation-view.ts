@@ -27,6 +27,7 @@ export class ConversationView {
   constructor(
     private readonly player: PcmPlayer,
     private readonly onError: (message: string) => void,
+    private readonly onMediaPlaybackChange: (active: boolean) => void = () => {},
   ) {
     this.element = document.createElement('div');
     this.element.className = 'conversation-scroll-region';
@@ -134,6 +135,21 @@ export class ConversationView {
     this.followIfEnabled();
   }
 
+  removeUtterance(id: string) {
+    const article = this.rows.get(id);
+    if (!article) return;
+    article.querySelectorAll<HTMLAudioElement>('audio').forEach((audio) => {
+      audio.pause();
+      this.mediaAudios.delete(audio);
+    });
+    article.remove();
+    this.rows.delete(id);
+    if (this.rows.size === 0) {
+      this.list.replaceChildren(this.emptyState);
+      this.list.classList.add('empty');
+    }
+  }
+
   private ensureTranscriptRow(event: TranscriptEvent) {
     let article = this.rows.get(event.utterance_id);
     if (!article) {
@@ -181,6 +197,10 @@ export class ConversationView {
     } else {
       this.appendStreamingText(content, event.text);
       this.setSourceStreamingState(article, true);
+      const translation = article.querySelector<HTMLElement>('.translation-line.pending .translation-text');
+      if (translation && event.text && !translation.dataset.streamText) {
+        translation.textContent = '正在实时翻译';
+      }
     }
     this.followIfEnabled();
   }
@@ -300,21 +320,18 @@ export class ConversationView {
     this.followIfEnabled();
   }
 
-  updateTtsProgress(id: string, value: number) {
+  markTtsGenerating(id: string) {
     const container = this.rows.get(id)?.querySelector<HTMLElement>('.translated-media');
     if (!container) return;
     let status = container.querySelector<HTMLElement>('.tts-generation');
     if (!status) {
       status = document.createElement('div');
       status.className = 'tts-generation';
-      status.innerHTML = '<i data-lucide="audio-lines"></i><span>浏览器生成译声</span><progress max="100" value="0"></progress><output>0%</output>';
+      status.innerHTML = '<i data-lucide="audio-lines"></i><span>服务端生成译声</span>';
       container.append(status);
       refreshIcons(status);
     }
-    const progress = Math.max(0, Math.min(100, Math.round(value)));
-    status.querySelector<HTMLProgressElement>('progress')!.value = progress;
-    status.querySelector<HTMLOutputElement>('output')!.textContent = `${progress}%`;
-    this.setItemStatus(id, progress < 100 ? '浏览器生成译声' : '译声已保存');
+    this.setItemStatus(id, '服务端生成译声');
     this.followIfEnabled();
   }
 
@@ -432,9 +449,11 @@ export class ConversationView {
             audio.src = objectUrl;
             audio.load();
           }
+          this.onMediaPlaybackChange(true);
           await audio.play();
         } catch (error) {
           this.activeMediaAudio = null;
+          this.onMediaPlaybackChange(false);
           this.onError(
             error instanceof Error ? `无法播放${label}：${error.message}` : `无法播放${label}`,
           );
@@ -447,12 +466,17 @@ export class ConversationView {
       }
     });
     audio.addEventListener('error', () => {
+      this.onMediaPlaybackChange(false);
       const status = audio.error?.code;
       this.onError(`无法加载${label}${status ? `（媒体错误 ${status}）` : ''}`);
     });
     audio.addEventListener('play', () => this.renderMediaButton(button, label, true));
-    audio.addEventListener('pause', () => this.renderMediaButton(button, label, false));
+    audio.addEventListener('pause', () => {
+      this.onMediaPlaybackChange(false);
+      this.renderMediaButton(button, label, false);
+    });
     audio.addEventListener('ended', () => {
+      this.onMediaPlaybackChange(false);
       this.renderMediaButton(button, label, false);
       if (this.activeMediaAudio === audio) this.activeMediaAudio = null;
     });
@@ -463,6 +487,9 @@ export class ConversationView {
     const span = document.createElement('span');
     span.className = 'live-text';
     span.textContent = value;
+    window.setTimeout(() => {
+      if (span.isConnected) span.replaceWith(document.createTextNode(span.textContent ?? ''));
+    }, 220);
     return span;
   }
 
@@ -491,9 +518,6 @@ export class ConversationView {
     const delta = nextText.slice(currentText.length);
     if (!delta) return;
     if (!currentText) container.replaceChildren();
-    container.querySelectorAll('.live-text').forEach((node) => {
-      node.replaceWith(document.createTextNode(node.textContent ?? ''));
-    });
     container.append(this.liveText(delta));
     container.dataset.streamText = nextText;
   }

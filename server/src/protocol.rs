@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 pub const INPUT_SAMPLE_RATE: u32 = 16_000;
 
@@ -6,10 +7,49 @@ pub const INPUT_SAMPLE_RATE: u32 = 16_000;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientEvent {
     Configure(SessionConfig),
-    Start,
-    SpeechStart,
-    SpeechEnd,
+    Start {
+        tc_id: Uuid,
+        #[serde(default)]
+        vad: Option<ClientVadStart>,
+        #[serde(flatten)]
+        config: SessionConfig,
+    },
+    End {
+        tc_id: Uuid,
+        #[serde(default)]
+        is_silent_vad: bool,
+        #[serde(default)]
+        vad: Option<ClientVadEnd>,
+    },
     Flush,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ClientVadStart {
+    pub engine: String,
+    pub sample_rate: u32,
+    pub frame_samples: usize,
+    pub pre_roll_samples: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ClientVadEnd {
+    pub reason: VadEndReason,
+    pub sample_count: usize,
+    #[serde(default)]
+    pub speech_frames: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum VadEndReason {
+    Silence,
+    MaxDuration,
+    Manual,
+    Superseded,
+    Silent,
+    ServerLimit,
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -73,9 +113,18 @@ pub enum ServerEvent {
     Vad {
         active: bool,
         level: f32,
+        utterance_id: Option<String>,
+        reason: Option<VadEndReason>,
+        sample_count: usize,
     },
     UtteranceQueued {
         utterance_id: String,
+        tc_id: String,
+    },
+    UtteranceDiscarded {
+        utterance_id: String,
+        tc_id: String,
+        reason: String,
     },
     RecognitionFailed {
         utterance_id: String,
@@ -165,4 +214,50 @@ pub struct LatencyReport {
     pub t2_unix_ms: u64,
     pub t3_unix_ms: u64,
     pub t4_unix_ms: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_traceable_segment_boundaries() {
+        let tc_id = Uuid::new_v4();
+        let start = serde_json::from_value::<ClientEvent>(serde_json::json!({
+            "type": "start",
+            "tc_id": tc_id,
+            "vad": {
+                "engine": "silero-v6.2-lele",
+                "sample_rate": 16000,
+                "frame_samples": 512,
+                "pre_roll_samples": 3584
+            },
+            "source_language": "en",
+            "target_language": "zh",
+            "voice": "ryan",
+            "max_utterance_seconds": 20
+        }))
+        .unwrap();
+        assert!(matches!(start, ClientEvent::Start { tc_id: id, .. } if id == tc_id));
+
+        let end = serde_json::from_value::<ClientEvent>(serde_json::json!({
+            "type": "end",
+            "tc_id": tc_id,
+            "is_silent_vad": true,
+            "vad": { "reason": "silent", "sample_count": 0 }
+        }))
+        .unwrap();
+        assert!(matches!(
+            end,
+            ClientEvent::End {
+                tc_id: id,
+                is_silent_vad: true,
+                vad: Some(ClientVadEnd {
+                    reason: VadEndReason::Silent,
+                    sample_count: 0,
+                    speech_frames: None,
+                })
+            } if id == tc_id
+        ));
+    }
 }

@@ -27,6 +27,47 @@ impl DemoTranscriber {
 
 #[async_trait]
 impl Transcriber for DemoTranscriber {
+    async fn start_live(
+        &self,
+        source_language: &str,
+        updates: mpsc::UnboundedSender<String>,
+    ) -> Result<Option<LiveTranscription>> {
+        let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<Vec<i16>>();
+        let language = if source_language == "auto" {
+            "en".to_owned()
+        } else {
+            source_language.to_owned()
+        };
+        let task_language = language.clone();
+        let task = tokio::spawn(async move {
+            let mut sample_count = 0_usize;
+            let mut emitted_preview = false;
+            while let Some(chunk) = audio_rx.recv().await {
+                sample_count += chunk.len();
+                if !emitted_preview && sample_count >= INPUT_SAMPLE_RATE as usize / 2 {
+                    emitted_preview = true;
+                    let preview = match task_language.as_str() {
+                        "zh" => "正在接收语音…",
+                        "ja" => "音声を受信中…",
+                        _ => "Receiving speech…",
+                    };
+                    let _ = updates.send(preview.to_owned());
+                }
+            }
+            let seconds = sample_count as f32 / INPUT_SAMPLE_RATE as f32;
+            let text = match task_language.as_str() {
+                "zh" => format!("收到了一段 {seconds:.1} 秒的语音。"),
+                "ja" => format!("{seconds:.1} 秒の音声を受信しました。"),
+                _ => format!("Received a {seconds:.1} second voice sample."),
+            };
+            Ok(Transcription {
+                text,
+                language: task_language,
+            })
+        });
+        Ok(Some(LiveTranscription::new(audio_tx, task)))
+    }
+
     async fn transcribe_streaming(
         &self,
         pcm: &[i16],

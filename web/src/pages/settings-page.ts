@@ -28,17 +28,29 @@ export class SettingsPage implements Page {
             <input class="settings-autoplay" type="checkbox" role="switch">
             <span class="toggle-track" aria-hidden="true"></span>
           </label>
+          <div class="settings-section-heading"><i data-lucide="audio-waveform"></i><div><strong>音频采集</strong><span>控制当前设备的浏览器人声检测方式</span></div></div>
+          <label class="toggle-field">
+            <span><strong>增强人声过滤</strong><small>过滤持续低频嗡声、宽带噪声和短促非人声</small></span>
+            <input class="settings-voice-filter" type="checkbox" role="switch">
+            <span class="toggle-track" aria-hidden="true"></span>
+          </label>
           <div class="settings-saved" role="status" aria-live="polite"></div>
         </section>
       </main>
     `;
     const voice = root.querySelector<HTMLSelectElement>('.settings-voice')!;
     const autoplay = root.querySelector<HTMLInputElement>('.settings-autoplay')!;
+    const enhancedVoiceFilter = root.querySelector<HTMLInputElement>('.settings-voice-filter')!;
     voice.value = preferences.voice;
     autoplay.checked = preferences.autoplay;
+    enhancedVoiceFilter.checked = preferences.enhancedVoiceFilter;
     const persist = () => {
-      savePreferences(this.userId, { voice: voice.value, autoplay: autoplay.checked });
-      root.querySelector('.voice-preview')!.textContent = `${voices[voice.value] ?? voice.value} · Supertonic Web TTS`;
+      savePreferences(this.userId, {
+        voice: voice.value,
+        autoplay: autoplay.checked,
+        enhancedVoiceFilter: enhancedVoiceFilter.checked,
+      });
+      root.querySelector('.voice-preview')!.textContent = `${voices[voice.value] ?? voice.value} · 服务端 TTS`;
       const saved = root.querySelector('.settings-saved')!;
       saved.textContent = '设置已保存';
       window.setTimeout(() => {
@@ -48,6 +60,7 @@ export class SettingsPage implements Page {
     root.querySelector('.settings-back')?.addEventListener('click', this.onRooms);
     voice.addEventListener('change', persist);
     autoplay.addEventListener('change', persist);
+    enhancedVoiceFilter.addEventListener('change', persist);
     persist();
     refreshIcons(root);
   }

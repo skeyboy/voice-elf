@@ -4,7 +4,6 @@
 /web/dist
 /web/.svelte-kit
 /web/static/wasm
-/web/static/models/supertonic3
 /media
 .env
 .DS_Store

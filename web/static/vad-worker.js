@@ -1,16 +1,27 @@
 const FRAME_SAMPLES = 512;
 const FLAG_SPEECH_STARTED = 1 << 0;
 const FLAG_SPEECH_ENDED = 1 << 2;
+const FLAG_FORCED_END = 1 << 4;
 const FLAG_FRAME_READY = 1 << 30;
 const FLAG_INVALID_INPUT = 1 << 31;
+const MIN_CONFIRMED_SPEECH_FRAMES = 6;
 
 let wasm;
 let processor = 0;
 let inputPointer = 0;
 let inputCapacity = 0;
 let outputPointer = 0;
+let segmentActive = false;
+let segmentAccepted = false;
+let pendingFrames = [];
+let suppressed = false;
+let enhancedVoiceFilter = false;
 
-async function loadWasm(maxUtteranceSeconds, inputSampleRate) {
+function segmentSpeechFrames() {
+  return wasm.voice_elf_audio_segment_speech_frames(processor) >>> 0;
+}
+
+async function loadWasm(maxUtteranceSeconds, inputSampleRate, enhancedFilter) {
   const response = await fetch('/wasm/voice_elf_web_vad.wasm', {
     cache: 'no-store',
     credentials: 'same-origin',
@@ -19,7 +30,12 @@ async function loadWasm(maxUtteranceSeconds, inputSampleRate) {
   const bytes = await response.arrayBuffer();
   const module = await WebAssembly.instantiate(bytes, {});
   wasm = module.instance.exports;
-  processor = wasm.voice_elf_audio_create(maxUtteranceSeconds, inputSampleRate);
+  processor = wasm.voice_elf_audio_create(
+    maxUtteranceSeconds,
+    inputSampleRate,
+    enhancedFilter ? 1 : 0,
+  );
+  enhancedVoiceFilter = Boolean(enhancedFilter);
   inputCapacity = wasm.voice_elf_audio_input_capacity();
   inputPointer = wasm.voice_elf_audio_input_ptr(processor);
   outputPointer = wasm.voice_elf_audio_output_ptr(processor);
@@ -35,15 +51,42 @@ function drainFrames() {
     if (!(flags & FLAG_FRAME_READY)) break;
 
     const pcm = new Int16Array(wasm.memory.buffer, outputPointer, FRAME_SAMPLES).slice();
-    const level = wasm.voice_elf_audio_output_level(processor);
-    postMessage({ type: 'level', value: Math.min(1, level * 4) });
-    if (flags & FLAG_SPEECH_STARTED) postMessage({ type: 'speech_start' });
-    postMessage({ type: 'pcm', payload: pcm.buffer }, [pcm.buffer]);
-    if (flags & FLAG_SPEECH_ENDED) postMessage({ type: 'speech_end' });
+    if (flags & FLAG_SPEECH_STARTED) {
+      segmentActive = true;
+      segmentAccepted = !enhancedVoiceFilter;
+      pendingFrames = [];
+      if (segmentAccepted) postMessage({ type: 'speech_start' });
+    }
+    if (!segmentAccepted) {
+      pendingFrames.push(pcm.buffer);
+      if (segmentSpeechFrames() >= MIN_CONFIRMED_SPEECH_FRAMES) {
+        segmentAccepted = true;
+        postMessage({ type: 'speech_start' });
+        for (const pending of pendingFrames) {
+          postMessage({ type: 'pcm', payload: pending }, [pending]);
+        }
+        pendingFrames = [];
+      }
+    } else {
+      postMessage({ type: 'pcm', payload: pcm.buffer }, [pcm.buffer]);
+    }
+    if (flags & FLAG_SPEECH_ENDED) {
+      segmentActive = false;
+      if (segmentAccepted) {
+        postMessage({
+          type: 'speech_end',
+          reason: flags & FLAG_FORCED_END ? 'max_duration' : 'silence',
+          speechFrames: segmentSpeechFrames(),
+        });
+      }
+      segmentAccepted = false;
+      pendingFrames = [];
+    }
   }
 }
 
 function processSamples(payload) {
+  if (suppressed) return;
   if (!(payload instanceof ArrayBuffer) || payload.byteLength % 4 !== 0) {
     throw new Error('Audio VAD expects Float32 microphone samples');
   }
@@ -54,19 +97,48 @@ function processSamples(payload) {
   new Float32Array(wasm.memory.buffer, inputPointer, samples.length).set(samples);
   const result = wasm.voice_elf_audio_process(processor, samples.length) >>> 0;
   if (result & FLAG_INVALID_INPUT) throw new Error('Audio VAD rejected the microphone block');
+  const level = wasm.voice_elf_audio_input_level(processor);
+  postMessage({ type: 'level', value: Math.min(1, level * 8) });
   drainFrames();
 }
 
 self.onmessage = async (event) => {
   try {
     if (event.data.type === 'init') {
-      await loadWasm(event.data.maxUtteranceSeconds, event.data.inputSampleRate);
+      await loadWasm(
+        event.data.maxUtteranceSeconds,
+        event.data.inputSampleRate,
+        event.data.enhancedVoiceFilter,
+      );
       postMessage({ type: 'ready' });
     } else if (event.data.type === 'samples') {
       processSamples(event.data.payload);
     } else if (event.data.type === 'flush') {
+      if (segmentActive && segmentAccepted) {
+        postMessage({
+          type: 'speech_end',
+          reason: 'manual',
+          speechFrames: segmentSpeechFrames(),
+        });
+      }
+      segmentActive = false;
+      segmentAccepted = false;
+      pendingFrames = [];
       wasm.voice_elf_audio_reset(processor);
       postMessage({ type: 'flushed' });
+    } else if (event.data.type === 'suppress') {
+      suppressed = Boolean(event.data.value);
+      if (segmentActive && segmentAccepted) {
+        postMessage({
+          type: 'speech_end',
+          reason: 'manual',
+          speechFrames: segmentSpeechFrames(),
+        });
+      }
+      segmentActive = false;
+      segmentAccepted = false;
+      pendingFrames = [];
+      wasm.voice_elf_audio_reset(processor);
     }
   } catch (error) {
     postMessage({

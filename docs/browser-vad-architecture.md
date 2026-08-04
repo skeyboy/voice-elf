@@ -2,33 +2,44 @@
 
 ## 最终方案
 
-```text
-浏览器
-  getUserMedia
-      |
-      v
-  AudioWorklet: 复制浏览器原生采样率 mono Float32 块
-      |
-      v (Transferable ArrayBuffer)
-  Web Worker + Rust/WASM
-      |-- 重采样 16 kHz、PCM16 转换、512 samples / 32 ms 分帧
-      |-- Lele 0.1.12 AOT 推理 Silero VAD v6.2
-      |-- 浏览器采集降噪 + 动态环境噪声底/SNR 门控
-      |-- 静音: 仅保留约 224 ms pre-roll，不上传
-      `-- 语音: speech_start -> PCM 帧 -> speech_end
-                              |
-                              v
-服务端 Axum WebSocket（账号 + 房间 owner 授权）
-  不执行 VAD，只验证不可信的浏览器分段
-      |-- 会话状态与边界顺序
-      |-- 每帧必须为 512 samples / 1024 bytes
-      |-- 最大 1.5 倍实时发送速率（另允许 pre-roll）
-      `-- 房间配置的 5~120 秒强制断句上限
-                              |
-                              v
-  Qwen ASR（服务端） -> 本地翻译 LLM -> 低优先级 Qwen3 TTS
-      |                    |                    |
-      `-------- PostgreSQL 记录 + WAV 文件 URL -'
+```mermaid
+sequenceDiagram
+    participant Web as "Web 录音组件"
+    participant VAD as "VAD Worker"
+    participant GW as "Axum WebSocket"
+    participant Live as "主 ASR 流"
+    participant Queue as "Tokio 阶段队列"
+    participant ASR as "并行 ASR 通道"
+    participant TTS as "服务端 TTS"
+    participant Push as "WebSocket 事件推送"
+
+    Web->>VAD: Float32 PCM
+    VAD-->>Web: speech_start
+    Web->>GW: start + tc_id + VAD参数 + 语言参数
+    GW->>Live: 启动流式识别
+    loop 32ms 音频帧
+        VAD-->>Web: 16kHz PCM16
+        Web->>GW: 二进制 PCM
+        GW->>Live: 追加 PCM
+        Live-->>Push: transcript_delta
+        Push-->>Web: 更新临时字幕
+    end
+    VAD-->>Web: speech_end / 最长 20s
+    Web->>GW: end + tc_id + 断句原因 + 样本数
+    alt 静音或不足 200ms
+        GW->>Push: utterance_discarded
+        Push-->>Web: 删除占位字幕
+    else 有效语音
+        GW->>Queue: WAV 落盘并排队
+        Queue->>ASR: 并行复核其他 ASR 通道
+        ASR-->>Queue: 合并最终文本并流式翻译
+        Queue->>Push: transcript_delta / translation_delta
+        Push-->>Web: 实时更新原文和译文
+        Queue->>Push: 原声 URL
+        Queue->>TTS: 异步 Kokoro(zh) / Supertonic(其他语言)
+        TTS-->>Push: 译声 URL + PCM 音频流
+        Push-->>Web: 固化字幕并提供播放
+    end
 ```
 
 浏览器 VAD 是唯一分句实现。WASM 或 Worker 初始化失败时，录音不会开始，页面直接显示错误；系统不再静默切换到服务端 VAD，也不会上传连续静音 PCM。
@@ -41,7 +52,9 @@
 | Lele + Silero | 纯 Rust AOT、无 ONNX Runtime 浏览器依赖、单一 WASM、支持 Silero | 约 4.3 MiB，社区和模型算子覆盖仍需持续验证 | 当前实现 |
 | WebRTC VAD | 体积小、语音通话场景成熟 | C 依赖交叉编译复杂，噪声适应性弱于 Silero | 已从服务端和浏览器移除 |
 
-当前实现固定使用 `lele = 0.1.12` 和 Silero VAD v6.2。模型以 512 样本窗口运行，Silero 负责人声开始判定；静音期持续学习环境噪声底，开始和活动保持阈值按信噪比动态抬升，直流偏移不会被当作有效能量。活动段约 448 ms 连续静音后结束，减少换气造成的误切。房间的 `max_utterance_seconds` 会强制形成下一条记录，但会保留短接续窗口，让未停止的发声立即进入下一段而不停止录音会话。
+当前实现固定使用 `lele = 0.1.12` 和 Silero VAD v6.2。模型以 512 样本窗口运行，Silero 概率、音量和动态噪声底共同判定人声开始；静音期持续学习环境噪声底，但噪声底最高限制为 RMS 0.012，避免持续底噪把低声说话门槛抬得过高。默认模式会回放触发前 512 ms 的 PCM。操作人员可在设置中启用“增强人声过滤”：WASM 使用 1 秒校准和 pre-roll 识别持续低频周期噪声，检测到人声频率结构恢复后再候选启动；Worker 累计至少 6 个确认帧才向主线程发布 `speech_start`，随后补发缓存 PCM，既不触发无效 ASR，也不截掉句首。活动段约 3 秒连续静音后结束，能量判定只允许覆盖短暂的模型漏检，不能被背景声无限续段。每段还会统计确认的人声帧，不足约 200 ms 的瞬态噪声会在进入 ASR 前丢弃。每次结束会重建模型运行状态并恢复启动门限，使下一次说话可以独立触发。Rust/WASM 会对每个完整输入帧输出 RMS 音量，即使尚未判定为语音，页面波形也能反映真实麦克风输入。房间的 `max_utterance_seconds` 限定为 5~20 秒，并会强制形成下一条记录，同时保留短接续窗口。
+
+浏览器启用系统回声消除和噪声抑制，并关闭容易抬高底噪的自动增益。自动或手动播放译声时，采集链路进入半双工抑制状态：当前分段先结束，播放期间不再向 VAD 提交扬声器回采样本，播放队列清空后自动重置并恢复聆听。
 
 `audio-processor.js` 仍然必要。AudioWorklet 是浏览器实时音频线程到 Worker 的最小桥接层，但它只复制 Float32 输入；重采样、PCM 转换、音量、分帧、VAD、pre-roll 和断句全部在 Rust/WASM 中完成。
 
@@ -54,13 +67,15 @@ Qwen ASR 不迁移到浏览器：
 3. 服务端需要集中保护模型、调度推理，并产生可信的用户、房间、WAV 和转写记录。
 4. 端侧 VAD 已减少静音带宽和服务端逐帧计算；迁移 ASR 的收益与成本不匹配。
 
+TTS 同样由服务端统一执行。中文使用 Kokoro INT8，其余配置语言使用 Supertonic 3 INT8；译声在服务端落盘并通过 WebSocket PCM 流和受保护媒体 URL 同时交付。
+
 ## 安全边界
 
 WASM 不是可信边界。服务端仍执行以下限制：
 
 - WebSocket 要求登录 cookie，且只有房主能开始实时翻译。
-- 服务端从数据库读取房间断句上限，并限定在 5~120 秒。
-- 只接受 `speech_start` 与 `speech_end` 之间的固定 1024-byte PCM16 帧。
+- 服务端校验每段唯一的 UUID `tc_id`，并将断句上限限定在 5~20 秒。
+- 只接受匹配 `start` 与 `end` 之间的固定 1024-byte PCM16 帧。
 - pre-roll 突发之后只允许有限的实时发送速率，超速帧会被丢弃。
 - 客户端漏发结束边界时，服务端仍按房间上限或 `flush` 收束当前记录。
 - 用户、房间、音频路径和最终转写始终由已授权的服务端会话落库。
@@ -69,6 +84,7 @@ WASM 不是可信边界。服务端仍执行以下限制：
 
 ```bash
 ./scripts/build-web-vad.sh
+./scripts/setup-server-tts.sh
 cd web && npm run build
 ```
 

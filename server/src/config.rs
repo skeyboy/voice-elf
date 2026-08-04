@@ -10,6 +10,7 @@ pub struct AppConfig {
     pub backend_mode: BackendMode,
     pub asr: AsrConfig,
     pub translator: TranslatorConfig,
+    pub tts: TtsConfig,
     pub inference_timeout: Duration,
     pub database_url: Option<String>,
 }
@@ -36,6 +37,13 @@ pub struct TranslatorConfig {
     pub api_key: Option<String>,
     pub binary: PathBuf,
     pub model_path: Option<PathBuf>,
+    pub threads: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct TtsConfig {
+    pub kokoro_model_dir: PathBuf,
+    pub supertonic_model_dir: PathBuf,
     pub threads: usize,
 }
 
@@ -82,7 +90,7 @@ impl AppConfig {
                 stream_max_new_tokens: env::var("QWEN_ASR_STREAM_MAX_NEW_TOKENS")
                     .ok()
                     .and_then(|value| value.parse().ok())
-                    .unwrap_or(12),
+                    .unwrap_or(32),
                 encoder_window_seconds: env::var("QWEN_ASR_ENCODER_WINDOW_SECONDS")
                     .ok()
                     .and_then(|value| value.parse().ok())
@@ -101,6 +109,24 @@ impl AppConfig {
                     .ok()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(8),
+            },
+            tts: TtsConfig {
+                kokoro_model_dir: env::var("TTS_KOKORO_MODEL_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| {
+                        PathBuf::from(".local/models/tts/kokoro-int8-multi-lang-v1_1")
+                    }),
+                supertonic_model_dir: env::var("TTS_SUPERTONIC_MODEL_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| {
+                        PathBuf::from(
+                            ".local/models/tts/sherpa-onnx-supertonic-3-tts-int8-2026-05-11",
+                        )
+                    }),
+                threads: env::var("TTS_THREADS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(2),
             },
             inference_timeout: Duration::from_secs(timeout_seconds),
             database_url: env::var("DATABASE_URL").ok().filter(|url| !url.is_empty()),

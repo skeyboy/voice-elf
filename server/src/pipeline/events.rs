@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use axum::extract::ws::Message;
 use tokio::sync::mpsc;
 
@@ -21,8 +21,8 @@ pub(super) async fn send_state(
 
 pub(super) async fn send_event(output: &mpsc::Sender<Message>, event: ServerEvent) -> Result<()> {
     let json = serde_json::to_string(&event)?;
-    output
-        .send(Message::Text(json.into()))
-        .await
-        .context("WebSocket writer closed")
+    if output.send(Message::Text(json.into())).await.is_err() {
+        tracing::debug!("event subscriber disconnected while background work continued");
+    }
+    Ok(())
 }

@@ -4,17 +4,16 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "predev": "npm run build:vad",
     "dev": "vite --host 0.0.0.0",
     "build:vad": "../scripts/build-web-vad.sh",
-    "build:tts": "../scripts/setup-web-tts.sh",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-    "build": "npm run build:vad && npm run build:tts && npm run check && vite build",
-    "deploy:watch": "npm run build:vad && npm run build:tts && vite build --watch",
+    "build": "npm run build:vad && npm run check && vite build",
+    "deploy:watch": "npm run build:vad && vite build --watch",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
     "lucide": "^0.468.0",
-    "onnxruntime-web": "^1.27.0",
     "svelte": "^5.56.8"
   },
   "devDependencies": {

@@ -20,7 +20,7 @@ export class RoomEditor {
           <label><span>源语言</span><select name="source_language">${languageOptions(true)}</select></label>
           <label><span>目标语言</span><select name="target_language">${languageOptions(false)}</select></label>
         </div>
-        <label><span>最长断句（秒）</span><input name="max_utterance_seconds" type="number" min="5" max="120" step="1" required></label>
+        <label><span>最长断句（秒）</span><input name="max_utterance_seconds" type="number" min="5" max="20" step="1" required></label>
         <p class="form-error" role="alert"></p>
         <button class="primary-command" type="submit">保存房间</button>
       </form>

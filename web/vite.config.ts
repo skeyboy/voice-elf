@@ -2,7 +2,26 @@ import { defineConfig } from 'vite';
 import { sveltekit } from '@sveltejs/kit/vite';
 
 export default defineConfig({
-  plugins: [sveltekit()],
+  plugins: [
+    {
+      name: 'cross-origin-isolation',
+      configureServer(server) {
+        server.middlewares.use((_request, response, next) => {
+          response.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+          response.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+          next();
+        });
+      },
+      configurePreviewServer(server) {
+        server.middlewares.use((_request, response, next) => {
+          response.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+          response.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+          next();
+        });
+      },
+    },
+    sveltekit(),
+  ],
   server: {
     host: '0.0.0.0',
     port: 5173,

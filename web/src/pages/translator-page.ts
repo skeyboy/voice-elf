@@ -7,7 +7,6 @@ import { LatencyMonitor } from '../components/latency-monitor';
 import { RoomEditor } from '../components/room-editor';
 import type { ConnectionStatus } from '../components/topbar';
 import { VoiceSession } from '../controllers/voice-session';
-import { BrowserTts } from '../controllers/browser-tts';
 import type { PipelinePhase, ServerEvent, SessionConfig } from '../protocol';
 import { languageNames } from '../shared/languages';
 import { loadPreferences } from '../shared/preferences';
@@ -22,7 +21,6 @@ export class TranslatorPage implements Page {
   private roomEditor: RoomEditor | null = null;
   private languageDialog: LanguageDialog | null = null;
   private player = new PcmPlayer();
-  private browserTts = new BrowserTts();
   private timer = 0;
   private startedAt = 0;
   private recording = false;
@@ -30,6 +28,7 @@ export class TranslatorPage implements Page {
   private targetLanguage = 'zh';
   private maxUtteranceSeconds = 20;
   private voice = 'F1';
+  private enhancedVoiceFilter = true;
 
   constructor(
     private readonly userId: string,
@@ -56,9 +55,12 @@ export class TranslatorPage implements Page {
     this.maxUtteranceSeconds = detail.room.max_utterance_seconds;
     const preferences = loadPreferences(this.userId);
     this.voice = preferences.voice;
+    this.enhancedVoiceFilter = preferences.enhancedVoiceFilter;
     this.player.muted = !preferences.autoplay;
     root.innerHTML = this.template(detail.room);
-    this.conversation = new ConversationView(this.player, this.onError);
+    this.conversation = new ConversationView(this.player, this.onError, (active) =>
+      this.voiceSession?.setExternalPlaybackActive(active),
+    );
     this.monitor = new LatencyMonitor();
     root.querySelector('.conversation-mount')!.replaceWith(this.conversation.element);
     root.querySelector('.monitor-mount')!.replaceWith(this.monitor.element);
@@ -82,6 +84,7 @@ export class TranslatorPage implements Page {
         root.querySelector<HTMLCanvasElement>('#waveform')!,
         this.player,
         () => this.sessionConfig(),
+        () => this.enhancedVoiceFilter,
         {
           onEvent: (event) => this.handleEvent(event),
           onConnection: (status) => this.setConnection(status),
@@ -116,7 +119,6 @@ export class TranslatorPage implements Page {
     this.languageDialog?.destroy();
     this.languageDialog = null;
     this.player.stop();
-    this.browserTts.destroy();
     this.onConnection('hidden');
     this.root = null;
   }
@@ -225,10 +227,24 @@ export class TranslatorPage implements Page {
             true,
           );
         }
+        if (event.phase === 'synthesizing' && event.utterance_id) {
+          this.conversation?.markTtsGenerating(event.utterance_id);
+        }
         break;
       case 'utterance_queued':
-        // Queued segments do not create empty cards. The transcribing state creates the row
-        // once the ASR worker actually starts processing this utterance.
+        // Create the row before the first ASR token can arrive. This also keeps consecutive
+        // VAD segments independent while earlier segments translate or synthesize.
+        this.conversation?.upsertTranscript(
+          {
+            utterance_id: event.utterance_id,
+            text: '',
+            language: this.sessionConfig().source_language,
+          },
+          true,
+        );
+        break;
+      case 'utterance_discarded':
+        this.conversation?.removeUtterance(event.utterance_id);
         break;
       case 'recognition_failed':
         this.conversation?.markRecognitionFailed(event.utterance_id, event.message);
@@ -247,7 +263,6 @@ export class TranslatorPage implements Page {
         break;
       case 'translation':
         this.conversation?.applyTranslation(event);
-        if (this.room?.is_owner) void this.synthesizeTranslation(event);
         break;
       case 'media':
         this.conversation?.applyMedia(event);
@@ -261,28 +276,6 @@ export class TranslatorPage implements Page {
         break;
       default:
         break;
-    }
-  }
-
-  private async synthesizeTranslation(event: Extract<ServerEvent, { type: 'translation' }>) {
-    try {
-      this.conversation?.updateTtsProgress(event.utterance_id, 0);
-      const audio = await this.browserTts.synthesizeAndSave(
-        event.utterance_id,
-        event.translated_text,
-        event.target_language,
-        this.voice,
-        (progress) => this.conversation?.updateTtsProgress(event.utterance_id, progress),
-      );
-      this.conversation?.applyMedia({ type: 'media', utterance_id: event.utterance_id,
-        source_audio_url: null, translated_audio_url: audio.translated_audio_url });
-      this.monitor?.addLatency(audio.latency, false);
-      this.conversation?.updateItemLatency(event.utterance_id, audio.latency.total_ms);
-      await this.player.enqueue(audio.pcm, audio.sampleRate, () => undefined);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '浏览器译声生成失败';
-      this.conversation?.markProcessingFailed(event.utterance_id, 'tts', message);
-      this.onError(`译声生成失败：${message}`);
     }
   }
 

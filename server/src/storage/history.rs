@@ -1,8 +1,8 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use diesel::{
-    BoolExpressionMethods, ExpressionMethods, Insertable, OptionalExtension,
-    PgTextExpressionMethods, QueryDsl, SelectableHelper,
+    BoolExpressionMethods, ExpressionMethods, Insertable, PgTextExpressionMethods, QueryDsl,
+    SelectableHelper,
 };
 use diesel_async::RunQueryDsl;
 use serde::Serialize;
@@ -46,11 +46,6 @@ pub struct UtteranceAudioUpdate<'a> {
     pub translated_audio_path: &'a str,
     pub translated_audio_url: &'a str,
     pub latency: &'a LatencyReport,
-}
-
-pub struct BrowserTtsTarget {
-    pub session_id: Uuid,
-    pub latency: LatencyReport,
 }
 
 #[derive(Insertable)]
@@ -125,53 +120,6 @@ pub struct UtteranceHistory {
 }
 
 impl Database {
-    pub async fn browser_tts_target(
-        &self,
-        id: Uuid,
-        user_id: Uuid,
-    ) -> Result<Option<BrowserTtsTarget>> {
-        let mut connection = self.pool.get().await?;
-        let row = voice_utterances::table
-            .filter(voice_utterances::id.eq(id))
-            .filter(voice_utterances::user_id.eq(Some(user_id)))
-            .filter(voice_utterances::translated_text.ne(""))
-            .select((
-                voice_utterances::session_id,
-                voice_utterances::audio_ms,
-                voice_utterances::vad_ms,
-                voice_utterances::stt_ms,
-                voice_utterances::translation_ms,
-                voice_utterances::total_ms,
-                voice_utterances::t0_unix_ms,
-                voice_utterances::t1_unix_ms,
-                voice_utterances::t2_unix_ms,
-                voice_utterances::t3_unix_ms,
-            ))
-            .first::<(Uuid, i64, i64, i64, i64, i64, i64, i64, i64, i64)>(&mut connection)
-            .await
-            .optional()?;
-        Ok(row.map(
-            |(session_id, audio_ms, vad_ms, stt_ms, translation_ms, total_ms, t0, t1, t2, t3)| {
-                BrowserTtsTarget {
-                    session_id,
-                    latency: LatencyReport {
-                        audio_ms: to_u64(audio_ms),
-                        vad_ms: to_u64(vad_ms),
-                        stt_ms: to_u64(stt_ms),
-                        translation_ms: to_u64(translation_ms),
-                        tts_ms: 0,
-                        total_ms: to_u64(total_ms),
-                        t0_unix_ms: to_u64(t0),
-                        t1_unix_ms: to_u64(t1),
-                        t2_unix_ms: to_u64(t2),
-                        t3_unix_ms: to_u64(t3),
-                        t4_unix_ms: to_u64(t3),
-                    },
-                }
-            },
-        ))
-    }
-
     pub async fn recover_interrupted_utterances(&self) -> Result<usize> {
         let mut connection = self.pool.get().await?;
         let mut updated = 0;
@@ -192,6 +140,15 @@ impl Database {
             voice_utterances::status.eq("translation_interrupted"),
             voice_utterances::processing_error
                 .eq(Some("Server restarted before translation completed")),
+        ))
+        .execute(&mut connection)
+        .await?;
+        updated += diesel::update(
+            voice_utterances::table.filter(voice_utterances::status.eq("text_ready")),
+        )
+        .set((
+            voice_utterances::status.eq("tts_interrupted"),
+            voice_utterances::processing_error.eq(Some("Server restarted before TTS completed")),
         ))
         .execute(&mut connection)
         .await?;
@@ -227,6 +184,17 @@ impl Database {
         )
         .set((
             voice_utterances::status.eq("translation_interrupted"),
+            voice_utterances::processing_error.eq(Some(reason)),
+        ))
+        .execute(&mut connection)
+        .await?;
+        updated += diesel::update(
+            voice_utterances::table
+                .filter(voice_utterances::session_id.eq(session_id))
+                .filter(voice_utterances::status.eq("text_ready")),
+        )
+        .set((
+            voice_utterances::status.eq("tts_interrupted"),
             voice_utterances::processing_error.eq(Some(reason)),
         ))
         .execute(&mut connection)

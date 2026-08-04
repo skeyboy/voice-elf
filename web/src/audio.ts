@@ -3,13 +3,19 @@ interface CaptureMessage {
   payload?: ArrayBuffer;
 }
 
-type VadBoundary = 'speech_start' | 'speech_end';
+export type VadEndReason = 'silence' | 'max_duration' | 'manual';
+
+export type VadBoundary =
+  | { type: 'speech_start' }
+  | { type: 'speech_end'; reason: VadEndReason; speechFrames: number };
 
 interface VadMessage {
   type: 'ready' | 'pcm' | 'level' | 'speech_start' | 'speech_end' | 'flushed' | 'error';
   payload?: ArrayBuffer;
   message?: string;
   value?: number;
+  reason?: VadEndReason;
+  speechFrames?: number;
 }
 
 export class MicrophoneCapture {
@@ -23,8 +29,13 @@ export class MicrophoneCapture {
   private onBoundary: ((boundary: VadBoundary) => void) | null = null;
   private onFatalError: ((error: Error) => void) | null = null;
   private flushResolver: (() => void) | null = null;
+  private suppressed = false;
 
-  private async prepareVad(maxUtteranceSeconds: number, inputSampleRate: number) {
+  private async prepareVad(
+    maxUtteranceSeconds: number,
+    inputSampleRate: number,
+    enhancedVoiceFilter: boolean,
+  ) {
     this.destroyVad();
     const worker = new Worker('/vad-worker.js', { type: 'module', name: 'voice-elf-vad' });
     this.vadWorker = worker;
@@ -46,7 +57,15 @@ export class MicrophoneCapture {
         } else if (message.type === 'level') {
           this.onLevel?.(message.value ?? 0);
         } else if (message.type === 'speech_start' || message.type === 'speech_end') {
-          this.onBoundary?.(message.type);
+          this.onBoundary?.(
+            message.type === 'speech_start'
+              ? { type: 'speech_start' }
+              : {
+                  type: 'speech_end',
+                  reason: message.reason ?? 'silence',
+                  speechFrames: message.speechFrames ?? 0,
+                },
+          );
         } else if (message.type === 'flushed') {
           this.flushResolver?.();
           this.flushResolver = null;
@@ -66,12 +85,18 @@ export class MicrophoneCapture {
         else reject(error);
       };
     });
-    worker.postMessage({ type: 'init', maxUtteranceSeconds, inputSampleRate });
+    worker.postMessage({
+      type: 'init',
+      maxUtteranceSeconds,
+      inputSampleRate,
+      enhancedVoiceFilter,
+    });
     await ready;
   }
 
   async start(
     maxUtteranceSeconds: number,
+    enhancedVoiceFilter: boolean,
     onPcm: (pcm: ArrayBuffer) => void,
     onLevel: (level: number) => void,
     onBoundary: (boundary: VadBoundary) => void,
@@ -96,7 +121,7 @@ export class MicrophoneCapture {
     try {
       await Promise.all([
         context.audioWorklet.addModule('/audio-processor.js'),
-        this.prepareVad(maxUtteranceSeconds, context.sampleRate),
+        this.prepareVad(maxUtteranceSeconds, context.sampleRate, enhancedVoiceFilter),
       ]);
       await context.resume();
     } catch (error) {
@@ -116,7 +141,13 @@ export class MicrophoneCapture {
     this.onBoundary = onBoundary;
     onReady();
     node.port.onmessage = (event: MessageEvent<CaptureMessage>) => {
-      if (event.data.type === 'samples' && event.data.payload && this.vadReady && this.vadWorker) {
+      if (
+        event.data.type === 'samples' &&
+        event.data.payload &&
+        this.vadReady &&
+        this.vadWorker &&
+        !this.suppressed
+      ) {
         this.vadWorker.postMessage(
           { type: 'samples', payload: event.data.payload },
           [event.data.payload],
@@ -153,10 +184,18 @@ export class MicrophoneCapture {
     this.destroyVad();
   }
 
+  setSuppressed(suppressed: boolean) {
+    if (this.suppressed === suppressed) return;
+    this.suppressed = suppressed;
+    this.vadWorker?.postMessage({ type: 'suppress', value: suppressed });
+    if (suppressed) this.onLevel?.(0);
+  }
+
   private destroyVad() {
     this.vadWorker?.terminate();
     this.vadWorker = null;
     this.vadReady = false;
+    this.suppressed = false;
     this.flushResolver = null;
   }
 }
@@ -166,6 +205,9 @@ export class PcmPlayer {
   private nextStart = 0;
   private generation = 0;
   private sources = new Set<AudioBufferSourceNode>();
+  private pendingEnqueues = 0;
+  private playbackListener: ((active: boolean) => void) | null = null;
+  private playbackActive = false;
   muted = false;
 
   async unlock() {
@@ -175,26 +217,39 @@ export class PcmPlayer {
 
   async enqueue(bytes: ArrayBuffer, sampleRate: number, onEnded?: () => void) {
     if (this.muted) return;
-    await this.unlock();
-    const context = this.context as AudioContext;
-    const samples = new Int16Array(bytes);
-    const buffer = context.createBuffer(1, samples.length, sampleRate);
-    const channel = buffer.getChannelData(0);
-    for (let index = 0; index < samples.length; index += 1) {
-      channel[index] = samples[index] / 32768;
+    this.pendingEnqueues += 1;
+    this.updatePlaybackState();
+    try {
+      await this.unlock();
+      const context = this.context as AudioContext;
+      const samples = new Int16Array(bytes);
+      const buffer = context.createBuffer(1, samples.length, sampleRate);
+      const channel = buffer.getChannelData(0);
+      for (let index = 0; index < samples.length; index += 1) {
+        channel[index] = samples[index] / 32768;
+      }
+      const source = context.createBufferSource();
+      const generation = this.generation;
+      source.buffer = buffer;
+      source.connect(context.destination);
+      this.sources.add(source);
+      source.onended = () => {
+        this.sources.delete(source);
+        if (generation === this.generation) onEnded?.();
+        this.updatePlaybackState();
+      };
+      const startAt = Math.max(context.currentTime + 0.025, this.nextStart);
+      source.start(startAt);
+      this.nextStart = startAt + buffer.duration;
+    } finally {
+      this.pendingEnqueues -= 1;
+      this.updatePlaybackState();
     }
-    const source = context.createBufferSource();
-    const generation = this.generation;
-    source.buffer = buffer;
-    source.connect(context.destination);
-    this.sources.add(source);
-    source.onended = () => {
-      this.sources.delete(source);
-      if (generation === this.generation) onEnded?.();
-    };
-    const startAt = Math.max(context.currentTime + 0.025, this.nextStart);
-    source.start(startAt);
-    this.nextStart = startAt + buffer.duration;
+  }
+
+  setPlaybackListener(listener: ((active: boolean) => void) | null) {
+    this.playbackListener = listener;
+    listener?.(this.playbackActive);
   }
 
   reset() {
@@ -206,6 +261,14 @@ export class PcmPlayer {
     this.sources.forEach((source) => source.stop());
     this.sources.clear();
     this.reset();
+    this.updatePlaybackState();
+  }
+
+  private updatePlaybackState() {
+    const active = this.pendingEnqueues > 0 || this.sources.size > 0;
+    if (active === this.playbackActive) return;
+    this.playbackActive = active;
+    this.playbackListener?.(active);
   }
 }
 
@@ -226,6 +289,7 @@ export class Waveform {
   }
 
   push(level: number) {
+    this.canvas.dataset.audioLevel = level.toFixed(4);
     this.values.shift();
     this.values.push(Math.max(0.035, level));
   }

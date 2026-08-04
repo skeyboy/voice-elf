@@ -1,11 +1,15 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+    time::{Duration, sleep},
+};
 use uuid::Uuid;
 
 use crate::{
-    backends::{LiveTranscription, Transcriber, Transcription},
+    backends::{LiveTranscription, Transcriber, Transcription, Translator},
     protocol::{PipelinePhase, ServerEvent, SessionConfig},
 };
 
@@ -13,11 +17,13 @@ use super::{
     PipelineContext,
     events::{send_event, send_state},
     latency::{LatencyObserver, SpeechStart},
+    synthesis::run_synthesis_worker,
     transcription::run_transcription_worker,
     translation::run_translation_worker,
 };
 
 const TEXT_QUEUE_CAPACITY: usize = 64;
+const LIVE_TRANSLATION_DEBOUNCE: Duration = Duration::from_millis(180);
 
 pub(super) struct UtteranceJob {
     pub id: Uuid,
@@ -37,6 +43,7 @@ pub(super) struct LiveUtterance {
 pub(super) struct LivePreview {
     transcription: Option<LiveTranscription>,
     updates: Option<JoinHandle<String>>,
+    translation: Option<JoinHandle<()>>,
 }
 
 impl LivePreview {
@@ -49,6 +56,10 @@ impl LivePreview {
             .await;
         if let Some(updates) = self.updates.take() {
             let _ = updates.await;
+        }
+        if let Some(translation) = self.translation.take() {
+            translation.abort();
+            let _ = translation.await;
         }
         transcription
     }
@@ -65,6 +76,9 @@ impl Drop for LivePreview {
     fn drop(&mut self) {
         if let Some(updates) = self.updates.take() {
             updates.abort();
+        }
+        if let Some(translation) = self.translation.take() {
+            translation.abort();
         }
     }
 }
@@ -83,17 +97,25 @@ pub(super) struct TranslationJob {
     pub transcription: Transcription,
 }
 
+pub(super) struct SynthesisJob {
+    pub utterance: UtteranceJob,
+    pub translated_text: String,
+}
+
 pub(super) struct PipelineWorkers {
     transcription_tx: mpsc::Sender<UtteranceJob>,
     transcriber: Arc<dyn Transcriber>,
+    translator: Arc<dyn Translator>,
     handles: Vec<JoinHandle<()>>,
 }
 
 impl PipelineWorkers {
     pub(super) fn start(context: PipelineContext) -> Self {
         let transcriber = context.services.transcriber.clone();
+        let translator = context.services.translator.clone();
         let (transcription_tx, transcription_rx) = mpsc::channel(TEXT_QUEUE_CAPACITY);
         let (translation_tx, translation_rx) = mpsc::channel(TEXT_QUEUE_CAPACITY);
+        let (synthesis_tx, synthesis_rx) = mpsc::channel(TEXT_QUEUE_CAPACITY);
 
         let handles = vec![
             tokio::spawn(run_transcription_worker(
@@ -101,23 +123,29 @@ impl PipelineWorkers {
                 transcription_rx,
                 translation_tx,
             )),
-            tokio::spawn(run_translation_worker(context, translation_rx)),
+            tokio::spawn(run_translation_worker(
+                context.clone(),
+                translation_rx,
+                synthesis_tx,
+            )),
+            tokio::spawn(run_synthesis_worker(context, synthesis_rx)),
         ];
 
         Self {
             transcription_tx,
             transcriber,
+            translator,
             handles,
         }
     }
 
     pub(super) async fn begin_live(
         &self,
+        id: Uuid,
         started: SpeechStart,
         config: &SessionConfig,
         output: &mpsc::Sender<axum::extract::ws::Message>,
     ) -> Result<LiveUtterance> {
-        let id = Uuid::new_v4();
         let utterance_id = id.to_string();
         let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
         let preview = match self
@@ -129,20 +157,20 @@ impl PipelineWorkers {
                 let event_output = output.clone();
                 let event_id = utterance_id.clone();
                 let language = config.source_language.clone();
-                let started_at = std::time::Instant::now();
+                let (preview_tx, preview_rx) = watch::channel(String::new());
+                let translation = tokio::spawn(run_live_translation_preview(
+                    self.translator.clone(),
+                    event_output.clone(),
+                    event_id.clone(),
+                    language.clone(),
+                    config.target_language.clone(),
+                    preview_rx,
+                ));
                 let updates = tokio::spawn(async move {
                     let mut text = String::new();
-                    let mut first_delta = true;
                     while let Some(delta) = updates_rx.recv().await {
-                        if first_delta && !delta.trim().is_empty() {
-                            first_delta = false;
-                            tracing::info!(
-                                utterance_id = %event_id,
-                                first_text_ms = started_at.elapsed().as_millis(),
-                                "live ASR emitted its first text"
-                            );
-                        }
                         text.push_str(&delta);
+                        preview_tx.send_replace(text.clone());
                         if send_event(
                             &event_output,
                             ServerEvent::TranscriptDelta {
@@ -164,11 +192,12 @@ impl PipelineWorkers {
                 Some(LivePreview {
                     transcription: Some(transcription),
                     updates: Some(updates),
+                    translation: Some(translation),
                 })
             }
             Ok(None) => None,
             Err(error) => {
-                tracing::warn!(%error, %utterance_id, "failed to start live ASR; using utterance fallback");
+                tracing::warn!(%error, %utterance_id, "failed to start live ASR; using completed utterance fallback");
                 None
             }
         };
@@ -176,6 +205,7 @@ impl PipelineWorkers {
             output,
             ServerEvent::UtteranceQueued {
                 utterance_id: utterance_id.clone(),
+                tc_id: utterance_id.clone(),
             },
         )
         .await?;
@@ -190,8 +220,7 @@ impl PipelineWorkers {
 
     pub(super) async fn finish_live(&self, audio: Vec<i16>, mut live: LiveUtterance) -> Result<()> {
         live.latency.mark_vad_complete();
-        if let Err(error) = self
-            .transcription_tx
+        self.transcription_tx
             .send(UtteranceJob {
                 id: live.id,
                 audio,
@@ -200,47 +229,30 @@ impl PipelineWorkers {
                 live: live.preview.take(),
             })
             .await
-        {
-            return Err(error).context("transcription worker stopped");
-        }
-        Ok(())
-    }
-
-    pub(super) async fn cancel_live(
-        &self,
-        live: LiveUtterance,
-        output: &mpsc::Sender<axum::extract::ws::Message>,
-    ) {
-        let utterance_id = live.id.to_string();
-        drop(live);
-        let _ = send_event(
-            output,
-            ServerEvent::RecognitionFailed {
-                utterance_id,
-                message: "语音时间过短，请重试".to_owned(),
-            },
-        )
-        .await;
+            .context("transcription worker stopped")
     }
 
     #[cfg(test)]
     pub(super) async fn enqueue(
         &self,
+        id: Uuid,
         audio: Vec<i16>,
         started: SpeechStart,
         config: &SessionConfig,
-        output: &tokio::sync::mpsc::Sender<axum::extract::ws::Message>,
+        output: &mpsc::Sender<axum::extract::ws::Message>,
     ) -> Result<()> {
-        let id = Uuid::new_v4();
+        let utterance_id = id.to_string();
         let mut latency = LatencyObserver::new(started);
         latency.mark_vad_complete();
         send_event(
             output,
             ServerEvent::UtteranceQueued {
-                utterance_id: id.to_string(),
+                utterance_id: utterance_id.clone(),
+                tc_id: utterance_id.clone(),
             },
         )
         .await?;
+        send_state(output, PipelinePhase::Transcribing, Some(&utterance_id)).await?;
         if let Err(error) = self
             .transcription_tx
             .send(UtteranceJob {
@@ -257,6 +269,7 @@ impl PipelineWorkers {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) async fn abort(self) {
         drop(self.transcription_tx);
         for handle in &self.handles {
@@ -266,19 +279,149 @@ impl PipelineWorkers {
             let _ = handle.await;
         }
     }
+
+    pub(super) async fn finish(self) {
+        drop(self.transcription_tx);
+        for handle in self.handles {
+            if let Err(error) = handle.await {
+                tracing::warn!(%error, "pipeline worker stopped before its queue drained");
+            }
+        }
+    }
+}
+
+async fn run_live_translation_preview(
+    translator: Arc<dyn Translator>,
+    output: mpsc::Sender<axum::extract::ws::Message>,
+    utterance_id: String,
+    source_language: String,
+    target_language: String,
+    mut source: watch::Receiver<String>,
+) {
+    let mut source_ready = false;
+    'source_updates: loop {
+        if !source_ready {
+            if source.changed().await.is_err() {
+                return;
+            }
+        }
+        source_ready = false;
+        loop {
+            let debounce = sleep(LIVE_TRANSLATION_DEBOUNCE);
+            tokio::pin!(debounce);
+            tokio::select! {
+                _ = &mut debounce => break,
+                changed = source.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        let source_text = source.borrow_and_update().trim().to_owned();
+        if source_text.is_empty() {
+            continue;
+        }
+
+        let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+        let translation = translator.translate_streaming(
+            &source_text,
+            &source_language,
+            &target_language,
+            updates_tx,
+        );
+        tokio::pin!(translation);
+        let mut translated_text = String::new();
+        loop {
+            tokio::select! {
+                changed = source.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    source_ready = true;
+                    continue 'source_updates;
+                }
+                Some(delta) = updates_rx.recv() => {
+                    translated_text.push_str(&delta);
+                    if send_live_translation_delta(
+                        &output,
+                        &utterance_id,
+                        &target_language,
+                        delta,
+                        &translated_text,
+                    ).await.is_err() {
+                        return;
+                    }
+                }
+                result = &mut translation => {
+                    match result {
+                        Ok(final_text) => {
+                            while let Ok(delta) = updates_rx.try_recv() {
+                                translated_text.push_str(&delta);
+                                if send_live_translation_delta(
+                                    &output,
+                                    &utterance_id,
+                                    &target_language,
+                                    delta,
+                                    &translated_text,
+                                ).await.is_err() {
+                                    return;
+                                }
+                            }
+                            if translated_text.is_empty() && !final_text.trim().is_empty()
+                                && send_live_translation_delta(
+                                    &output,
+                                    &utterance_id,
+                                    &target_language,
+                                    final_text.clone(),
+                                    &final_text,
+                                ).await.is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error, %utterance_id, "live translation preview failed");
+                        }
+                    }
+                    continue 'source_updates;
+                }
+            }
+        }
+    }
+}
+
+async fn send_live_translation_delta(
+    output: &mpsc::Sender<axum::extract::ws::Message>,
+    utterance_id: &str,
+    target_language: &str,
+    delta: String,
+    text: &str,
+) -> Result<()> {
+    send_event(
+        output,
+        ServerEvent::TranslationDelta {
+            utterance_id: utterance_id.to_owned(),
+            delta,
+            text: text.to_owned(),
+            target_language: target_language.to_owned(),
+            done: false,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use axum::extract::ws::Message;
     use serde_json::Value;
 
     use crate::{
         backends::{
-            AppServices, DemoTranscriber, DemoTranslator, NoSpeechDetected, Transcriber,
-            Transcription,
+            AppServices, DemoSynthesizer, DemoTranscriber, DemoTranslator, NoSpeechDetected,
+            Transcriber, Transcription,
         },
         media::MediaStore,
         protocol::SessionConfig,
@@ -286,8 +429,64 @@ mod tests {
 
     use super::*;
 
+    struct RestartingTranslator;
+
+    #[async_trait::async_trait]
+    impl Translator for RestartingTranslator {
+        async fn translate_streaming(
+            &self,
+            text: &str,
+            _source_language: &str,
+            _target_language: &str,
+            updates: mpsc::UnboundedSender<String>,
+        ) -> anyhow::Result<String> {
+            if text == "first" {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            let translated = format!("translated:{text}");
+            let _ = updates.send(translated.clone());
+            Ok(translated)
+        }
+    }
+
     #[tokio::test]
-    async fn completes_all_pending_text_without_server_audio() {
+    async fn live_translation_restarts_with_the_latest_source_revision() {
+        let (output, mut events) = mpsc::channel(16);
+        let (source, source_updates) = watch::channel(String::new());
+        let task = tokio::spawn(run_live_translation_preview(
+            Arc::new(RestartingTranslator),
+            output,
+            "utterance-1".to_owned(),
+            "en".to_owned(),
+            "zh".to_owned(),
+            source_updates,
+        ));
+
+        source.send_replace("first".to_owned());
+        tokio::time::sleep(LIVE_TRANSLATION_DEBOUNCE + Duration::from_millis(40)).await;
+        source.send_replace("second".to_owned());
+
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let Some(Message::Text(text)) = events.recv().await else {
+                    continue;
+                };
+                let event: Value = serde_json::from_str(&text).unwrap();
+                if event["type"] == "translation_delta" {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(event["text"], "translated:second");
+
+        drop(source);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completes_all_pending_text_and_server_audio() {
         let directory = tempfile::tempdir().unwrap();
         let media = MediaStore::new(directory.path().join("media"))
             .await
@@ -295,6 +494,7 @@ mod tests {
         let services = Arc::new(AppServices {
             transcriber: Arc::new(DemoTranscriber::new()),
             translator: Arc::new(DemoTranslator::new()),
+            synthesizer: Arc::new(DemoSynthesizer::new()),
             backend_name: "demo",
         });
         let (output, mut events) = mpsc::channel(256);
@@ -311,6 +511,7 @@ mod tests {
         for _ in 0..2 {
             workers
                 .enqueue(
+                    Uuid::new_v4(),
                     vec![1_000; 4_800],
                     SpeechStart::now(),
                     &SessionConfig::default(),
@@ -321,6 +522,7 @@ mod tests {
         }
 
         let mut translations = 0;
+        let mut audio_ends = 0;
         tokio::time::timeout(Duration::from_secs(8), async {
             while let Some(message) = events.recv().await {
                 let Message::Text(text) = message else {
@@ -329,7 +531,12 @@ mod tests {
                 let event: Value = serde_json::from_str(&text).unwrap();
                 match event["type"].as_str() {
                     Some("translation") => translations += 1,
-                    Some("latency") if translations == 2 => break,
+                    Some("audio_end") => {
+                        audio_ends += 1;
+                        if audio_ends == 2 {
+                            break;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -338,6 +545,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(translations, 2);
+        assert_eq!(audio_ends, 2);
         workers.abort().await;
     }
 
@@ -364,6 +572,7 @@ mod tests {
         let services = Arc::new(AppServices {
             transcriber: Arc::new(EmptyTranscriber),
             translator: Arc::new(DemoTranslator::new()),
+            synthesizer: Arc::new(DemoSynthesizer::new()),
             backend_name: "test",
         });
         let (output, mut events) = mpsc::channel(64);
@@ -379,6 +588,7 @@ mod tests {
         let workers = PipelineWorkers::start(context);
         workers
             .enqueue(
+                Uuid::new_v4(),
                 vec![1_000; 4_800],
                 SpeechStart::now(),
                 &SessionConfig::default(),

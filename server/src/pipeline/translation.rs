@@ -10,17 +10,22 @@ use crate::{
 use super::{
     PipelineContext,
     events::{send_event, send_state},
-    jobs::TranslationJob,
+    jobs::{SynthesisJob, TranslationJob},
 };
 
 pub(super) async fn run_translation_worker(
     context: PipelineContext,
     mut input: mpsc::Receiver<TranslationJob>,
+    output: mpsc::Sender<SynthesisJob>,
 ) {
     while let Some(job) = input.recv().await {
         let utterance_id = job.utterance.id;
         match translate(&context, job).await {
-            Ok(()) => {}
+            Ok(job) => {
+                if output.send(job).await.is_err() {
+                    break;
+                }
+            }
             Err(error) => {
                 if let Some(database) = &context.database
                     && let Err(storage_error) = database
@@ -48,7 +53,7 @@ pub(super) async fn run_translation_worker(
     }
 }
 
-async fn translate(context: &PipelineContext, mut job: TranslationJob) -> Result<()> {
+async fn translate(context: &PipelineContext, mut job: TranslationJob) -> Result<SynthesisJob> {
     let utterance_id = job.utterance.id.to_string();
     send_state(
         &context.output,
@@ -138,10 +143,10 @@ async fn translate(context: &PipelineContext, mut job: TranslationJob) -> Result
         &context.output,
         ServerEvent::Translation {
             utterance_id: utterance_id.clone(),
-            source_text: job.transcription.text,
-            translated_text: translated,
-            source_language: job.transcription.language,
-            target_language: job.utterance.config.target_language,
+            source_text: job.transcription.text.clone(),
+            translated_text: translated.clone(),
+            source_language: job.transcription.language.clone(),
+            target_language: job.utterance.config.target_language.clone(),
         },
     )
     .await?;
@@ -153,5 +158,8 @@ async fn translate(context: &PipelineContext, mut job: TranslationJob) -> Result
         },
     )
     .await?;
-    Ok(())
+    Ok(SynthesisJob {
+        utterance: job.utterance,
+        translated_text: translated,
+    })
 }
