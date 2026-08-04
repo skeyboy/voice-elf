@@ -10,6 +10,11 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "build": "npm run build:vad && npm run check && vite build",
     "deploy:watch": "npm run build:vad && vite build --watch",
+    "deploy:public": "../scripts/public-tunnel.sh start production",
+    "deploy:public:dev": "../scripts/public-tunnel.sh start dev",
+    "deploy:public:restart": "../scripts/public-tunnel.sh restart production",
+    "deploy:public:status": "../scripts/public-tunnel.sh status all",
+    "deploy:public:stop": "../scripts/public-tunnel.sh stop all",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {

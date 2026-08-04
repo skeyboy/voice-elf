@@ -17,19 +17,54 @@ let pendingFrames = [];
 let suppressed = false;
 let enhancedVoiceFilter = false;
 
+function reportInitialization(stage) {
+  postMessage({ type: 'initializing', stage });
+}
+
 function segmentSpeechFrames() {
   return wasm.voice_elf_audio_segment_speech_frames(processor) >>> 0;
 }
 
-async function loadWasm(maxUtteranceSeconds, inputSampleRate, enhancedFilter) {
-  const response = await fetch('/wasm/voice_elf_web_vad.wasm', {
-    cache: 'no-store',
+async function instantiateWasm(response) {
+  if (typeof WebAssembly.instantiateStreaming === 'function') {
+    try {
+      return await WebAssembly.instantiateStreaming(response.clone(), {});
+    } catch (error) {
+      if (!(error instanceof TypeError)) throw error;
+    }
+  }
+  return WebAssembly.instantiate(await response.arrayBuffer(), {});
+}
+
+async function loadWasmRuntime() {
+  if (wasm) return;
+  reportInitialization('manifest');
+  const manifestResponse = await fetch('/wasm/manifest.json', {
+    cache: 'no-cache',
+    credentials: 'same-origin',
+  });
+  if (!manifestResponse.ok) {
+    throw new Error(`VAD manifest request failed (${manifestResponse.status})`);
+  }
+  const manifest = await manifestResponse.json();
+  if (!/^voice_elf_web_vad\.[a-f0-9]{16}\.wasm$/.test(manifest.file ?? '')) {
+    throw new Error('VAD manifest is invalid');
+  }
+
+  reportInitialization('download');
+  const response = await fetch(`/wasm/${manifest.file}`, {
+    cache: 'force-cache',
     credentials: 'same-origin',
   });
   if (!response.ok) throw new Error(`VAD WASM request failed (${response.status})`);
-  const bytes = await response.arrayBuffer();
-  const module = await WebAssembly.instantiate(bytes, {});
+  reportInitialization('compile');
+  const module = await instantiateWasm(response);
   wasm = module.instance.exports;
+}
+
+async function configureWasm(maxUtteranceSeconds, inputSampleRate, enhancedFilter) {
+  await loadWasmRuntime();
+  if (processor) wasm.voice_elf_audio_destroy(processor);
   processor = wasm.voice_elf_audio_create(
     maxUtteranceSeconds,
     inputSampleRate,
@@ -42,6 +77,10 @@ async function loadWasm(maxUtteranceSeconds, inputSampleRate, enhancedFilter) {
   if (!processor || !inputPointer || !outputPointer || !inputCapacity) {
     throw new Error('Audio VAD WASM initialization failed');
   }
+  segmentActive = false;
+  segmentAccepted = false;
+  pendingFrames = [];
+  suppressed = false;
 }
 
 function drainFrames() {
@@ -105,7 +144,7 @@ function processSamples(payload) {
 self.onmessage = async (event) => {
   try {
     if (event.data.type === 'init') {
-      await loadWasm(
+      await configureWasm(
         event.data.maxUtteranceSeconds,
         event.data.inputSampleRate,
         event.data.enhancedVoiceFilter,

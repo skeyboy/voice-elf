@@ -50,6 +50,14 @@ For frontend development, run `npm run dev` from `web/`; Vite listens on all int
 For temporary Internet testing over trusted HTTPS, install `cloudflared` and use the local tunnel manager. It starts the tunnel in the background, waits for the public health check, and prints the resulting address:
 
 ```bash
+cd web
+npm run deploy:public          # Axum production site
+npm run deploy:public:dev      # Vite/HMR site
+npm run deploy:public:status
+npm run deploy:public:stop
+
+# The underlying commands can also be run from the repository root:
+cd ..
 ./scripts/public-tunnel.sh start production  # Axum production site
 ./scripts/public-tunnel.sh start dev         # Vite/HMR site
 ./scripts/public-tunnel.sh status all

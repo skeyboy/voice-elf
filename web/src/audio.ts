@@ -10,13 +10,30 @@ export type VadBoundary =
   | { type: 'speech_end'; reason: VadEndReason; speechFrames: number };
 
 interface VadMessage {
-  type: 'ready' | 'pcm' | 'level' | 'speech_start' | 'speech_end' | 'flushed' | 'error';
+  type:
+    | 'initializing'
+    | 'ready'
+    | 'pcm'
+    | 'level'
+    | 'speech_start'
+    | 'speech_end'
+    | 'flushed'
+    | 'error';
   payload?: ArrayBuffer;
   message?: string;
   value?: number;
   reason?: VadEndReason;
   speechFrames?: number;
+  stage?: 'manifest' | 'download' | 'compile';
 }
+
+const VAD_INITIALIZATION_TIMEOUT_MS = 30_000;
+const VAD_STAGE_LABELS = {
+  worker: '启动 Worker',
+  manifest: '读取资源清单',
+  download: '下载 WASM',
+  compile: '编译 WASM',
+} as const;
 
 export class MicrophoneCapture {
   private context: AudioContext | null = null;
@@ -36,18 +53,23 @@ export class MicrophoneCapture {
     inputSampleRate: number,
     enhancedVoiceFilter: boolean,
   ) {
-    this.destroyVad();
-    const worker = new Worker('/vad-worker.js', { type: 'module', name: 'voice-elf-vad' });
+    const worker =
+      this.vadWorker ??
+      new Worker('/vad-worker.js', { type: 'module', name: 'voice-elf-vad' });
     this.vadWorker = worker;
+    this.vadReady = false;
     const ready = new Promise<void>((resolve, reject) => {
       let initialized = false;
+      let stage: keyof typeof VAD_STAGE_LABELS = 'worker';
       const timeout = window.setTimeout(
-        () => reject(new Error('浏览器音频 VAD 初始化超时')),
-        5_000,
+        () => reject(new Error(`浏览器音频 VAD 初始化超时（${VAD_STAGE_LABELS[stage]}）`)),
+        VAD_INITIALIZATION_TIMEOUT_MS,
       );
       worker.onmessage = (event: MessageEvent<VadMessage>) => {
         const message = event.data;
-        if (message.type === 'ready') {
+        if (message.type === 'initializing' && message.stage) {
+          stage = message.stage;
+        } else if (message.type === 'ready') {
           window.clearTimeout(timeout);
           initialized = true;
           this.vadReady = true;
@@ -73,16 +95,24 @@ export class MicrophoneCapture {
           const error = new Error(message.message || '浏览器音频 VAD 运行失败');
           this.vadReady = false;
           window.clearTimeout(timeout);
-          if (initialized) this.onFatalError?.(error);
-          else reject(error);
+          if (initialized) {
+            this.destroyVad();
+            this.onFatalError?.(error);
+          } else {
+            reject(error);
+          }
         }
       };
       worker.onerror = () => {
         const error = new Error('浏览器音频 VAD Worker 运行失败');
         this.vadReady = false;
         window.clearTimeout(timeout);
-        if (initialized) this.onFatalError?.(error);
-        else reject(error);
+        if (initialized) {
+          this.destroyVad();
+          this.onFatalError?.(error);
+        } else {
+          reject(error);
+        }
       };
     });
     worker.postMessage({
@@ -181,7 +211,7 @@ export class MicrophoneCapture {
     this.onLevel = null;
     this.onBoundary = null;
     this.onFatalError = null;
-    this.destroyVad();
+    this.vadReady = false;
   }
 
   setSuppressed(suppressed: boolean) {
@@ -189,6 +219,10 @@ export class MicrophoneCapture {
     this.suppressed = suppressed;
     this.vadWorker?.postMessage({ type: 'suppress', value: suppressed });
     if (suppressed) this.onLevel?.(0);
+  }
+
+  dispose() {
+    this.destroyVad();
   }
 
   private destroyVad() {

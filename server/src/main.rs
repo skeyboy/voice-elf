@@ -15,7 +15,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{OriginalUri, Query, State, WebSocketUpgrade, ws::Message},
-    http::{HeaderName, HeaderValue, StatusCode},
+    http::{HeaderName, HeaderValue, StatusCode, header::CACHE_CONTROL},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -26,6 +26,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tower_cookies::{CookieManagerLayer, Cookies};
 use tower_http::{
+    compression::CompressionLayer,
     services::{ServeDir, ServeFile},
     set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
@@ -90,6 +91,8 @@ async fn main() -> Result<()> {
         .route_service("/rooms/{room_id}", ServeFile::new(&index_file))
         .route_service("/settings", ServeFile::new(&index_file))
         .fallback_service(static_files)
+        .layer(middleware::from_fn(cache_vad_assets))
+        .layer(CompressionLayer::new())
         .layer(SetResponseHeaderLayer::overriding(
             HeaderName::from_static("cross-origin-embedder-policy"),
             HeaderValue::from_static("require-corp"),
@@ -113,6 +116,26 @@ async fn main() -> Result<()> {
     );
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn cache_vad_assets(request: axum::http::Request<Body>, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    let mut response = next.run(request).await;
+    if response.status().is_success() {
+        let value = if path == "/wasm/manifest.json" {
+            Some(HeaderValue::from_static("no-cache"))
+        } else if path.starts_with("/wasm/voice_elf_web_vad.") && path.ends_with(".wasm") {
+            Some(HeaderValue::from_static(
+                "public, max-age=31536000, immutable",
+            ))
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            response.headers_mut().insert(CACHE_CONTROL, value);
+        }
+    }
+    response
 }
 
 async fn authorize_media(

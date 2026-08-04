@@ -100,6 +100,7 @@ export class VoiceSession {
     this.playbackReleaseTimers.clear();
     this.playbackHolds.clear();
     this.disconnect();
+    this.microphone.dispose();
     this.waveform.destroy();
   }
 

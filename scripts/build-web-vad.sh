@@ -16,7 +16,14 @@ cargo build \
   --release
 
 mkdir -p "${OUTPUT}"
-cp "${ROOT}/target/${TARGET}/release/voice_elf_web_vad.wasm" \
-  "${OUTPUT}/voice_elf_web_vad.wasm"
+SOURCE="${ROOT}/target/${TARGET}/release/voice_elf_web_vad.wasm"
+HASH="$(shasum -a 256 "${SOURCE}" | awk '{print substr($1, 1, 16)}')"
+FILENAME="voice_elf_web_vad.${HASH}.wasm"
 
-echo "Web VAD ready: ${OUTPUT}/voice_elf_web_vad.wasm"
+find "${OUTPUT}" -maxdepth 1 -type f \
+  \( -name 'voice_elf_web_vad.wasm' -o -name 'voice_elf_web_vad.*.wasm' \) \
+  -delete
+cp "${SOURCE}" "${OUTPUT}/${FILENAME}"
+printf '{"file":"%s"}\n' "${FILENAME}" > "${OUTPUT}/manifest.json"
+
+echo "Web VAD ready: ${OUTPUT}/${FILENAME}"
