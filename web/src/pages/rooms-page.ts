@@ -72,14 +72,14 @@ export class RoomsPage implements Page {
         <div class="room-card-heading">
           <span class="room-list-icon"><i data-lucide="${room.is_owner ? 'crown' : 'door-open'}"></i></span>
           <div><strong>${escapeHtml(room.name)}</strong><small>房主 ${escapeHtml(room.owner_username)}</small></div>
-          <span class="room-list-role">${room.is_owner ? '房主' : room.is_member ? '已加入' : '可预览'}</span>
+          <span class="room-list-role">${room.is_owner ? '房主' : room.is_member ? '已加入' : '可加入'}</span>
         </div>
         <p>${escapeHtml(room.preview_text ?? '暂无翻译记录')}</p>
         <div class="room-card-meta">
           <span><i data-lucide="users"></i>${room.member_count} 人</span>
           <span><i data-lucide="languages"></i>${room.utterance_count} 条记录</span>
         </div>
-        <button class="room-enter" type="button">${room.is_member || room.is_owner ? '进入房间' : '加入并预览'}</button>
+        <button class="room-enter" type="button">${room.is_member || room.is_owner ? '进入房间' : '加入房间'}</button>
       `;
       item.querySelector('.room-enter')?.addEventListener('click', () => void this.enter(room));
       grid.append(item);

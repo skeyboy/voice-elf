@@ -43,6 +43,7 @@ export class VoiceSession {
 
   constructor(
     private readonly roomId: string,
+    private readonly canPublish: boolean,
     canvas: HTMLCanvasElement,
     private readonly player: PcmPlayer,
     private readonly config: () => SessionConfig,
@@ -68,6 +69,8 @@ export class VoiceSession {
     this.socket.onerror = () => this.callbacks.onConnection('offline');
     this.socket.onclose = () => {
       if (version !== this.socketVersion || this.destroyed) return;
+      this.receivingAudio = null;
+      this.player.stop();
       this.callbacks.onConnection('offline');
       if (this.recording) void this.stopRecording();
       this.reconnectTimer = window.setTimeout(() => this.connect(), 1800);
@@ -75,10 +78,12 @@ export class VoiceSession {
   }
 
   sendConfig() {
+    if (!this.canPublish) return;
     this.sendJson({ type: 'configure', ...this.config() });
   }
 
   async toggleRecording() {
+    if (!this.canPublish) return;
     if (this.recording) await this.stopRecording();
     else await this.startRecording();
   }
@@ -115,6 +120,7 @@ export class VoiceSession {
   }
 
   private async startRecording() {
+    if (!this.canPublish) return;
     if (this.socket?.readyState !== WebSocket.OPEN) return;
     await this.player.unlock();
     this.activeEnhancedVoiceFilter = this.enhancedVoiceFilter();
@@ -257,6 +263,7 @@ export class VoiceSession {
   private handleMessage(message: MessageEvent) {
     if (message.data instanceof ArrayBuffer) {
       const playback = this.receivingAudio;
+      if (!playback) return;
       const chunkSamples = message.data.byteLength / Int16Array.BYTES_PER_ELEMENT;
       void this.player.enqueue(message.data, this.audioSampleRate, () => {
         if (!playback) return;
@@ -270,7 +277,7 @@ export class VoiceSession {
       return;
     }
     const event = JSON.parse(message.data as string) as ServerEvent;
-    if (event.type === 'ready') this.sendConfig();
+    if (event.type === 'ready' && this.canPublish) this.sendConfig();
     if (event.type === 'audio_start') {
       this.audioSampleRate = event.sample_rate;
       this.receivingAudio = {

@@ -352,12 +352,6 @@ pub async fn run_pipeline(
             PipelineInput::Invalid(message) => {
                 send_event(&output, ServerEvent::Warning { message }).await?;
             }
-            PipelineInput::Ping(payload) => {
-                output
-                    .send(Message::Pong(payload.into()))
-                    .await
-                    .context("WebSocket writer closed")?;
-            }
         }
     }
 

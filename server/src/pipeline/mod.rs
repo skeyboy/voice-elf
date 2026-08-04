@@ -22,7 +22,6 @@ pub enum PipelineInput {
     Event(crate::protocol::ClientEvent),
     Audio(Vec<u8>),
     Invalid(String),
-    Ping(Vec<u8>),
 }
 
 #[derive(Clone, Copy, Debug)]

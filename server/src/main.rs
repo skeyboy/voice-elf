@@ -5,6 +5,7 @@ mod config;
 mod media;
 mod pipeline;
 mod protocol;
+mod room_hub;
 mod schema;
 mod storage;
 
@@ -23,7 +24,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tower_cookies::{CookieManagerLayer, Cookies};
 use tower_http::{
     compression::CompressionLayer,
@@ -38,7 +39,8 @@ use crate::{
     config::AppConfig,
     media::MediaStore,
     pipeline::{PipelineIdentity, PipelineInput, run_pipeline},
-    protocol::ClientEvent,
+    protocol::{ClientEvent, ServerEvent},
+    room_hub::RoomHub,
     storage::Database,
 };
 
@@ -47,6 +49,7 @@ pub(crate) struct AppState {
     pub(crate) services: Arc<AppServices>,
     pub(crate) database: Option<Database>,
     pub(crate) media: MediaStore,
+    pub(crate) rooms: RoomHub,
 }
 
 #[tokio::main]
@@ -72,6 +75,7 @@ async fn main() -> Result<()> {
         services: services.clone(),
         database,
         media: media.clone(),
+        rooms: RoomHub::default(),
     };
     let static_files = ServeDir::new(&config.web_dist).append_index_html_on_directories(true);
     let index_file = config.web_dist.join("index.html");
@@ -203,13 +207,19 @@ async fn websocket(
         .await
         .map_err(api::ApiError::internal)?
         .ok_or_else(|| api::ApiError::not_found("房间不存在"))?;
-    if room.owner_id != user.id {
-        return Err(api::ApiError::forbidden("只有房主可以控制实时翻译"));
+    let can_publish = room.owner_id == user.id;
+    if !can_publish
+        && !database
+            .can_view_room(room.id, user.id)
+            .await
+            .map_err(api::ApiError::internal)?
+    {
+        return Err(api::ApiError::forbidden("请先加入房间"));
     }
-    let identity = PipelineIdentity {
+    let identity = can_publish.then_some(PipelineIdentity {
         user_id: user.id,
         room_id: room.id,
-    };
+    });
     Ok(ws
         .max_message_size(256 * 1024)
         .max_frame_size(256 * 1024)
@@ -219,6 +229,8 @@ async fn websocket(
                 state.services,
                 state.database,
                 state.media,
+                state.rooms,
+                room.id,
                 identity,
             )
         })
@@ -230,40 +242,129 @@ async fn handle_socket(
     services: Arc<AppServices>,
     database: Option<Database>,
     media: MediaStore,
-    identity: PipelineIdentity,
+    rooms: RoomHub,
+    room_id: uuid::Uuid,
+    identity: Option<PipelineIdentity>,
 ) {
+    let can_publish = identity.is_some();
+    let mut room_events = rooms.subscribe(room_id);
     let (mut socket_writer, mut socket_reader) = socket.split();
-    let (output_tx, mut output_rx) = mpsc::channel::<Message>(256);
-    let (input_tx, input_rx) = mpsc::channel::<PipelineInput>(192);
+    let subscribed = ServerEvent::RoomSubscribed {
+        room_id: room_id.to_string(),
+        can_publish,
+        backend: services.backend_name.to_owned(),
+    };
+    let Ok(subscribed) = serde_json::to_string(&subscribed) else {
+        return;
+    };
+    if socket_writer
+        .send(Message::Text(subscribed.into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
 
-    let writer = tokio::spawn(async move {
-        while let Some(message) = output_rx.recv().await {
-            if socket_writer.send(message).await.is_err() {
+    let (input_tx, mut pipeline, forwarder) = if let Some(identity) = identity {
+        let (output_tx, mut output_rx) = mpsc::channel::<Message>(256);
+        let (input_tx, input_rx) = mpsc::channel::<PipelineInput>(192);
+        let room_publisher = rooms.publisher(room_id);
+        let forwarder = tokio::spawn(async move {
+            while let Some(message) = output_rx.recv().await {
+                if matches!(message, Message::Text(_) | Message::Binary(_)) {
+                    let _ = room_publisher.send(message);
+                }
+            }
+        });
+        let pipeline = tokio::spawn(run_pipeline(
+            services, database, media, identity, input_rx, output_tx,
+        ));
+        (Some(input_tx), Some(pipeline), Some(forwarder))
+    } else {
+        (None, None, None)
+    };
+
+    loop {
+        tokio::select! {
+            event = room_events.recv() => match event {
+                Ok(message) => {
+                    if socket_writer.send(message).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(%room_id, skipped, "disconnecting lagged room subscriber");
+                    let warning = ServerEvent::Warning {
+                        message: "实时消息积压，正在重新同步房间。".to_owned(),
+                    };
+                    if let Ok(warning) = serde_json::to_string(&warning) {
+                        let _ = socket_writer.send(Message::Text(warning.into())).await;
+                    }
+                    break;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            incoming = socket_reader.next() => {
+                let Some(result) = incoming else {
+                    break;
+                };
+                let input = match result {
+                    Ok(Message::Binary(bytes)) if can_publish => {
+                        Some(PipelineInput::Audio(bytes.to_vec()))
+                    }
+                    Ok(Message::Text(text)) if can_publish => Some(
+                        match serde_json::from_str::<ClientEvent>(&text) {
+                            Ok(event) => PipelineInput::Event(event),
+                            Err(error) => PipelineInput::Invalid(
+                                format!("Invalid client message: {error}"),
+                            ),
+                        },
+                    ),
+                    Ok(Message::Binary(_) | Message::Text(_)) => {
+                        tracing::warn!(%room_id, "ignoring realtime input from read-only room member");
+                        None
+                    }
+                    Ok(Message::Ping(_) | Message::Pong(_)) => None,
+                    Ok(Message::Close(_)) | Err(_) => break,
+                };
+                if let Some(input) = input {
+                    let Some(sender) = input_tx.as_ref() else {
+                        break;
+                    };
+                    if sender.send(input).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            result = async {
+                pipeline
+                    .as_mut()
+                    .expect("publisher pipeline must exist while this branch is enabled")
+                    .await
+            }, if pipeline.is_some() => {
+                match result {
+                    Ok(Ok(())) => tracing::warn!(%room_id, "room pipeline stopped unexpectedly"),
+                    Ok(Err(error)) => tracing::warn!(%error, %room_id, "room pipeline failed"),
+                    Err(error) => tracing::warn!(%error, %room_id, "room pipeline task stopped"),
+                }
+                pipeline = None;
                 break;
             }
         }
-    });
-    let pipeline = tokio::spawn(run_pipeline(
-        services, database, media, identity, input_rx, output_tx,
-    ));
-
-    while let Some(result) = socket_reader.next().await {
-        let input = match result {
-            Ok(Message::Binary(bytes)) => PipelineInput::Audio(bytes.to_vec()),
-            Ok(Message::Text(text)) => match serde_json::from_str::<ClientEvent>(&text) {
-                Ok(event) => PipelineInput::Event(event),
-                Err(error) => PipelineInput::Invalid(format!("Invalid client message: {error}")),
-            },
-            Ok(Message::Ping(payload)) => PipelineInput::Ping(payload.to_vec()),
-            Ok(Message::Pong(_)) => continue,
-            Ok(Message::Close(_)) | Err(_) => break,
-        };
-        if input_tx.send(input).await.is_err() {
-            break;
-        }
     }
 
+    drop(room_events);
     drop(input_tx);
-    let _ = pipeline.await;
-    let _ = writer.await;
+    if let Some(pipeline) = pipeline {
+        match pipeline.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, %room_id, "room pipeline failed"),
+            Err(error) => tracing::warn!(%error, %room_id, "room pipeline task stopped"),
+        }
+    }
+    if let Some(forwarder) = forwarder
+        && let Err(error) = forwarder.await
+    {
+        tracing::warn!(%error, %room_id, "room broadcast task stopped");
+    }
 }

@@ -13,7 +13,8 @@ Browser AudioWorklet (native-rate mono Float32 capture)
   -> translation queue: Qwen3 local LLM
   -> translated text returned without waiting for TTS
   -> server sherpa-onnx TTS: Kokoro INT8 for zh, Supertonic 3 INT8 for other languages
-  -> source/translated WAV persistence + PCM16 WebSocket stream + browser playback
+  -> room broadcast: transcript/translation events + source/translated media URLs + translated PCM16
+  -> every connected room member receives the same ordered realtime stream
 ```
 
 Each utterance reports five timestamps: `t0` speech start, `t1` VAD endpoint, `t2` STT complete, `t3` translation complete, and `t4` TTS complete.
@@ -26,7 +27,7 @@ Server TTS uses two lazy-loaded sherpa-onnx engines. Chinese uses Kokoro v1.1 zh
 
 Rooms define `max_utterance_seconds` with a default of 20 seconds and an allowed range of 5 through 20 seconds. Continuous speech is force-segmented at that duration and immediately continues in a new utterance record.
 
-The backend pipeline is organized by runtime responsibility under `server/src/pipeline/`: `session` validates browser speech segments, while `transcription`, `translation`, and `synthesis` own their stage workers. PostgreSQL utterance persistence is isolated in `server/src/storage/history.rs`.
+The backend pipeline is organized by runtime responsibility under `server/src/pipeline/`: `session` validates browser speech segments, while `transcription`, `translation`, and `synthesis` own their stage workers. PostgreSQL utterance persistence is isolated in `server/src/storage/history.rs`. The room owner is the only WebSocket publisher; authenticated room members are read-only realtime subscribers. The in-process room hub fans out ordered text events, protected source/translated media URLs, and translated PCM chunks. Clients reconcile persisted history after each subscription or reconnect to close the connection gap.
 
 ## Run the demo
 
@@ -108,9 +109,9 @@ createdb voice_elf
 echo 'DATABASE_URL=postgres://localhost/voice_elf' >> .env
 ```
 
-Accounts use Argon2 password hashes and seven-day HTTP-only session cookies. A user can create and control rooms; other registered users can search for a room, join it, and browse its read-only record preview. `users`, `auth_sessions`, `rooms`, and `room_members` hold this authorization state.
+Accounts use Argon2 password hashes and seven-day HTTP-only session cookies. A user can create and control rooms; other registered users can search for a room, join it, browse its records, and subscribe to live transcripts, translations, protected source/translated audio URLs, and translated audio playback. `users`, `auth_sessions`, `rooms`, and `room_members` hold this authorization state.
 
-Each authorized WebSocket connection creates a row in `voice_sessions`. Completed utterances are stored in `voice_utterances` with their account/room ownership, source and translated text, language pair, audio duration, all `t0` through `t4` latency measurements, and the two audio file paths and URLs. Audio samples remain in WAV files rather than PostgreSQL binary columns. Media URLs require a logged-in owner or room member.
+Each room-owner publisher connection creates a row in `voice_sessions`; read-only member subscriptions do not create inference sessions. Completed utterances are stored in `voice_utterances` with their account/room ownership, source and translated text, language pair, audio duration, all `t0` through `t4` latency measurements, and the two audio file paths and URLs. Audio samples remain in WAV files rather than PostgreSQL binary columns. Media URLs require a logged-in owner or room member.
 
 ```sql
 SELECT created_at, source_text, translated_text, total_ms
@@ -136,7 +137,11 @@ DELETE /api/rooms/{room_id}
 POST   /api/rooms/{room_id}/join
 ```
 
-Room update/delete and realtime translation are owner-only. Joined members can read room details and protected audio files. The WebSocket endpoint requires the session cookie and the owner room ID: `ws://localhost:3000/ws?room_id={room_id}`.
+Room update/delete and realtime audio publication are owner-only. Joined members can read room details and protected audio files, and subscribe to the same room WebSocket for realtime events. The endpoint requires the session cookie and an authorized room ID: `ws://localhost:3000/ws?room_id={room_id}`. The first server event confirms whether the connection can publish:
+
+```json
+{"type":"room_subscribed","room_id":"...","can_publish":false,"backend":"local"}
+```
 
 Client text frames:
 
@@ -147,7 +152,7 @@ Client text frames:
 {"type":"flush"}
 ```
 
-Client binary frames are fixed 512-sample little-endian PCM16 at 16 kHz, mono, and are sent only between matching `start` and `end` messages. `start` declares the VAD engine/frame configuration; `end` carries the VAD boundary reason and sent sample count. The server validates these hints against the received PCM. Server text frames carry state, incremental `transcript_delta` and `translation_delta` updates, final text, media URLs, audio metadata, latency events, and `utterance_discarded` for silent placeholders. Source media is returned after persistence; after asynchronous TTS finishes, a second `media` event updates only the translated URL, followed by `audio_start`, binary PCM16 frames, and `audio_end`.
+Owner client binary frames are fixed 512-sample little-endian PCM16 at 16 kHz, mono, and are sent only between matching `start` and `end` messages. Member client data frames are ignored. `start` declares the VAD engine/frame configuration; `end` carries the VAD boundary reason and sent sample count. The server validates these hints against the received PCM. Server text frames carry state, incremental `transcript_delta` and `translation_delta` updates, final text, media URLs, audio metadata, latency events, and `utterance_discarded` for silent placeholders. Source media is returned after persistence; after asynchronous TTS finishes, a second `media` event updates only the translated URL, followed by `audio_start`, binary PCM16 frames, and `audio_end`. These server frames are broadcast in order to every online member of the room.
 
 ```json
 {"type":"media","utterance_id":"...","source_audio_url":"/media/...-source.wav","translated_audio_url":null}

@@ -40,7 +40,7 @@ export class TopBar {
     this.connection.classList.toggle('viewer', status === 'viewer');
     const content =
       status === 'viewer'
-        ? ['eye', '只读预览']
+        ? ['radio', '房间实时同步']
         : status === 'connected'
           ? ['wifi', '房主控制已连接']
           : ['wifi-off', status === 'connecting' ? '正在连接' : '连接中断'];

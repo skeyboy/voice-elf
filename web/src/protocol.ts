@@ -29,6 +29,12 @@ export interface LatencyReport {
 
 export type ServerEvent =
   | {
+      type: 'room_subscribed';
+      room_id: string;
+      can_publish: boolean;
+      backend: string;
+    }
+  | {
       type: 'ready';
       session_id: string;
       room_id: string;

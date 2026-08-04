@@ -71,20 +71,27 @@ export class ConversationView {
 
   renderHistory(detail: RoomDetail) {
     this.reset();
+    this.mergeHistory(detail);
+    requestAnimationFrame(() => this.scrollToBottom(true));
+  }
+
+  mergeHistory(detail: RoomDetail) {
     detail.utterances
       .slice()
       .reverse()
       .forEach((utterance) => {
         const recognizing = utterance.status === 'recognizing';
-        this.upsertTranscript(
-          {
-            utterance_id: utterance.id,
-            text: utterance.source_text,
-            language: utterance.source_language,
-            created_at: utterance.created_at,
-          },
-          recognizing,
-        );
+        if (utterance.source_text || !this.rows.has(utterance.id)) {
+          this.upsertTranscript(
+            {
+              utterance_id: utterance.id,
+              text: utterance.source_text,
+              language: utterance.source_language,
+              created_at: utterance.created_at,
+            },
+            recognizing,
+          );
+        }
         if (utterance.status === 'recognition_failed') {
           this.markRecognitionFailed(utterance.id, '未识别到清晰语音，已保留原声');
         } else if (utterance.status === 'recognition_interrupted') {
@@ -120,7 +127,6 @@ export class ConversationView {
           this.updateItemLatency(utterance.id, utterance.latency.total_ms);
         }
       });
-    requestAnimationFrame(() => this.scrollToBottom(true));
   }
 
   upsertTranscript(event: TranscriptEvent, streaming: boolean) {

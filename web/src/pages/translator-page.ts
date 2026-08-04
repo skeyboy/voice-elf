@@ -29,6 +29,8 @@ export class TranslatorPage implements Page {
   private maxUtteranceSeconds = 20;
   private voice = 'F1';
   private enhancedVoiceFilter = true;
+  private readonly latencyIds = new Set<string>();
+  private historySync: Promise<void> | null = null;
 
   constructor(
     private readonly userId: string,
@@ -65,11 +67,7 @@ export class TranslatorPage implements Page {
     root.querySelector('.conversation-mount')!.replaceWith(this.conversation.element);
     root.querySelector('.monitor-mount')!.replaceWith(this.monitor.element);
     this.conversation.renderHistory(detail);
-    this.monitor.reset();
-    detail.utterances
-      .slice()
-      .reverse()
-      .forEach((utterance) => this.monitor?.addLatency(utterance.latency));
+    this.resetLatency(detail);
     this.bindEvents();
     this.roomEditor = new RoomEditor((saved) => this.applyRoom(saved));
     this.languageDialog = new LanguageDialog(
@@ -78,31 +76,30 @@ export class TranslatorPage implements Page {
     );
     refreshIcons(root);
 
-    if (detail.room.is_owner) {
-      this.voiceSession = new VoiceSession(
-        detail.room.id,
-        root.querySelector<HTMLCanvasElement>('#waveform')!,
-        this.player,
-        () => this.sessionConfig(),
-        () => this.enhancedVoiceFilter,
-        {
-          onEvent: (event) => this.handleEvent(event),
-          onConnection: (status) => this.setConnection(status),
-          onRecording: (recording) => this.setRecording(recording),
-          onCaptureError: this.onError,
-          onPlaybackProgress: (progress) =>
-            this.conversation?.updateTranslatedProgress(
-              progress.utteranceId,
-              progress.currentSeconds,
-              progress.durationSeconds,
-            ),
-        },
-      );
-      this.voiceSession.connect();
-    } else {
-      this.onConnection('viewer');
+    this.voiceSession = new VoiceSession(
+      detail.room.id,
+      detail.room.is_owner,
+      root.querySelector<HTMLCanvasElement>('#waveform')!,
+      this.player,
+      () => this.sessionConfig(),
+      () => this.enhancedVoiceFilter,
+      {
+        onEvent: (event) => this.handleEvent(event),
+        onConnection: (status) => this.setConnection(status),
+        onRecording: (recording) => this.setRecording(recording),
+        onCaptureError: this.onError,
+        onPlaybackProgress: (progress) =>
+          this.conversation?.updateTranslatedProgress(
+            progress.utteranceId,
+            progress.currentSeconds,
+            progress.durationSeconds,
+          ),
+      },
+    );
+    this.voiceSession.connect();
+    if (!detail.room.is_owner) {
       root.querySelector<HTMLButtonElement>('.record-button')!.disabled = true;
-      root.querySelector('.capture-state')!.textContent = '只读预览';
+      root.querySelector('.capture-state')!.textContent = '连接实时同步';
     }
   }
 
@@ -144,7 +141,7 @@ export class TranslatorPage implements Page {
           <div class="room-identity-static">
             <span class="room-status-icon"><i data-lucide="door-open"></i></span>
             <span><small>当前房间</small><strong class="room-name">${escapeHtml(room.name)}</strong></span>
-            <span class="room-role${room.is_owner ? ' owner' : ''}">${room.is_owner ? '房主控制' : '成员预览'}</span>
+            <span class="room-role${room.is_owner ? ' owner' : ''}">${room.is_owner ? '房主控制' : '成员同步'}</span>
           </div>
           <form class="record-search">
             <i data-lucide="search"></i><input type="search" placeholder="检索转写或翻译记录" aria-label="检索房间记录"><button type="submit">检索</button>
@@ -160,7 +157,7 @@ export class TranslatorPage implements Page {
             <div class="panel-heading">
               <div><span class="section-kicker"><i data-lucide="radio"></i> LIVE SESSION</span><h1>实时对话</h1></div>
               <div class="panel-actions">
-                <span class="capture-session-badge"><span class="session-dot"></span><span class="session-badge-text">${room.is_owner ? '等待录音' : '只读预览'}</span></span>
+                <span class="capture-session-badge"><span class="session-dot"></span><span class="session-badge-text">${room.is_owner ? '等待录音' : '连接同步中'}</span></span>
                 <div class="monitor-mount"></div>
                 <button class="icon-button refresh-history" type="button" title="刷新记录" aria-label="刷新记录"><i data-lucide="refresh-cw"></i></button>
               </div>
@@ -174,7 +171,7 @@ export class TranslatorPage implements Page {
                 <span class="language-target-label">${escapeHtml(languageNames[room.target_language] ?? room.target_language)}</span>
               </button>
               <button class="record-button" type="button" aria-label="开始录音" title="开始录音" disabled><i data-lucide="mic"></i></button>
-              <div class="capture-readout"><strong class="capture-state">${room.is_owner ? '连接中' : '只读预览'}</strong><span class="capture-time">00:00</span></div>
+              <div class="capture-readout"><strong class="capture-state">连接中</strong><span class="capture-time">00:00</span></div>
             </div>
           </section>
         </div>
@@ -216,8 +213,22 @@ export class TranslatorPage implements Page {
   private handleEvent(event: ServerEvent) {
     if (!this.root) return;
     switch (event.type) {
+      case 'room_subscribed':
+        this.monitor?.setBackend(event.backend);
+        if (!event.can_publish) {
+          this.root.querySelector('.session-badge-text')!.textContent = '实时同步中';
+          this.root.querySelector('.capture-state')!.textContent = '等待发言';
+        }
+        void this.reconcileHistory();
+        break;
       case 'ready':
         this.monitor?.setBackend(event.backend);
+        break;
+      case 'configured':
+        this.sourceLanguage = event.source_language;
+        this.targetLanguage = event.target_language;
+        this.maxUtteranceSeconds = event.max_utterance_seconds;
+        this.updateLanguageButton();
         break;
       case 'state':
         this.setPhase(event.phase);
@@ -268,7 +279,7 @@ export class TranslatorPage implements Page {
         this.conversation?.applyMedia(event);
         break;
       case 'latency':
-        this.monitor?.addLatency(event.latency);
+        this.addLatency(event.utterance_id, event.latency);
         this.conversation?.updateItemLatency(event.utterance_id, event.latency.total_ms);
         break;
       case 'warning':
@@ -296,10 +307,17 @@ export class TranslatorPage implements Page {
   }
 
   private setConnection(status: ConnectionStatus) {
-    this.onConnection(status);
+    const isOwner = Boolean(this.room?.is_owner);
+    this.onConnection(!isOwner && status === 'connected' ? 'viewer' : status);
     if (!this.root) return;
-    this.root.querySelector<HTMLButtonElement>('.record-button')!.disabled = status !== 'connected';
-    if (status === 'connected') this.root.querySelector('.capture-state')!.textContent = '就绪';
+    this.root.querySelector<HTMLButtonElement>('.record-button')!.disabled =
+      !isOwner || status !== 'connected';
+    if (status === 'connected') {
+      this.root.querySelector('.capture-state')!.textContent = isOwner ? '就绪' : '等待发言';
+    } else if (!isOwner) {
+      this.root.querySelector('.capture-state')!.textContent =
+        status === 'connecting' ? '连接实时同步' : '同步已中断';
+    }
   }
 
   private setRecording(recording: boolean) {
@@ -355,14 +373,44 @@ export class TranslatorPage implements Page {
     try {
       const detail = await this.getDetail(search);
       this.conversation?.renderHistory(detail);
-      this.monitor?.reset();
-      detail.utterances
-        .slice()
-        .reverse()
-        .forEach((utterance) => this.monitor?.addLatency(utterance.latency));
+      this.resetLatency(detail);
     } catch (error) {
       this.onError(error instanceof Error ? error.message : '无法加载记录');
     }
+  }
+
+  private reconcileHistory() {
+    if (this.historySync) return this.historySync;
+    this.historySync = this.getDetail()
+      .then((detail) => {
+        this.conversation?.mergeHistory(detail);
+        detail.utterances
+          .slice()
+          .reverse()
+          .forEach((utterance) => this.addLatency(utterance.id, utterance.latency));
+      })
+      .catch((error) => {
+        this.onError(error instanceof Error ? error.message : '无法同步房间记录');
+      })
+      .finally(() => {
+        this.historySync = null;
+      });
+    return this.historySync;
+  }
+
+  private resetLatency(detail: RoomDetail) {
+    this.monitor?.reset();
+    this.latencyIds.clear();
+    detail.utterances
+      .slice()
+      .reverse()
+      .forEach((utterance) => this.addLatency(utterance.id, utterance.latency));
+  }
+
+  private addLatency(utteranceId: string, latency: RoomDetail['utterances'][number]['latency']) {
+    if (this.latencyIds.has(utteranceId)) return;
+    this.latencyIds.add(utteranceId);
+    this.monitor?.addLatency(latency);
   }
 
   private applyRoom(room: RoomSummary) {

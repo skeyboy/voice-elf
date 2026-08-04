@@ -11,7 +11,8 @@ sequenceDiagram
     participant Queue as "Tokio 阶段队列"
     participant ASR as "并行 ASR 通道"
     participant TTS as "服务端 TTS"
-    participant Push as "WebSocket 事件推送"
+    participant Push as "房间广播"
+    participant Members as "在线房间成员"
 
     Web->>VAD: Float32 PCM
     VAD-->>Web: speech_start
@@ -22,7 +23,8 @@ sequenceDiagram
         Web->>GW: 二进制 PCM
         GW->>Live: 追加 PCM
         Live-->>Push: transcript_delta
-        Push-->>Web: 更新临时字幕
+        Push-->>Web: 更新房主临时字幕
+        Push-->>Members: 同步临时字幕
     end
     VAD-->>Web: speech_end / 最长 20s
     Web->>GW: end + tc_id + 断句原因 + 样本数
@@ -35,10 +37,12 @@ sequenceDiagram
         ASR-->>Queue: 合并最终文本并流式翻译
         Queue->>Push: transcript_delta / translation_delta
         Push-->>Web: 实时更新原文和译文
+        Push-->>Members: 同步原文和译文
         Queue->>Push: 原声 URL
         Queue->>TTS: 异步 Kokoro(zh) / Supertonic(其他语言)
         TTS-->>Push: 译声 URL + PCM 音频流
         Push-->>Web: 固化字幕并提供播放
+        Push-->>Members: 同步媒体 URL 与译声流
     end
 ```
 
@@ -69,11 +73,17 @@ Qwen ASR 不迁移到浏览器：
 
 TTS 同样由服务端统一执行。中文使用 Kokoro INT8，其余配置语言使用 Supertonic 3 INT8；译声在服务端落盘并通过 WebSocket PCM 流和受保护媒体 URL 同时交付。
 
+## 房间实时同步
+
+房主仍是唯一实时音频发布者：只有房主连接可以发送配置、VAD 边界和 PCM。已加入房间的成员建立只读 WebSocket 订阅，服务端按 `room_id` 将转写增量、译文增量、处理状态、原声/译声 URL、延迟数据和译声 PCM 有序广播给所有在线连接。成员不能通过该连接启动第二条识别流水线。
+
+房间广播使用单进程内存通道，不复制推理任务或 TTS 任务。新成员先加载持久化历史，再建立订阅，并在订阅确认或自动重连后执行一次增量历史对账，以覆盖 HTTP 响应与 WebSocket 建连之间的短窗口。中途加入译声 PCM 的客户端若未收到对应 `audio_start`，会丢弃无法定界的二进制片段，随后仍可通过受保护的译声 URL 完整播放。多实例部署需要将房间广播替换为 Redis、NATS 等跨实例消息总线。
+
 ## 安全边界
 
 WASM 不是可信边界。服务端仍执行以下限制：
 
-- WebSocket 要求登录 cookie，且只有房主能开始实时翻译。
+- WebSocket 要求登录 cookie；房主可以发布实时音频，已加入房间的成员只能订阅房间事件。
 - 服务端校验每段唯一的 UUID `tc_id`，并将断句上限限定在 5~20 秒。
 - 只接受匹配 `start` 与 `end` 之间的固定 1024-byte PCM16 帧。
 - pre-roll 突发之后只允许有限的实时发送速率，超速帧会被丢弃。

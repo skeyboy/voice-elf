@@ -94,6 +94,11 @@ fn default_max_utterance_seconds() -> u32 {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
+    RoomSubscribed {
+        room_id: String,
+        can_publish: bool,
+        backend: String,
+    },
     Ready {
         session_id: String,
         room_id: String,
@@ -259,5 +264,19 @@ mod tests {
                 })
             } if id == tc_id
         ));
+    }
+
+    #[test]
+    fn serializes_room_subscription_role() {
+        let value = serde_json::to_value(ServerEvent::RoomSubscribed {
+            room_id: "room-1".to_owned(),
+            can_publish: false,
+            backend: "local".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(value["type"], "room_subscribed");
+        assert_eq!(value["room_id"], "room-1");
+        assert_eq!(value["can_publish"], false);
+        assert_eq!(value["backend"], "local");
     }
 }
