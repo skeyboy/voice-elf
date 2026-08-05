@@ -55,12 +55,38 @@ diesel::table! {
 }
 
 diesel::table! {
+    voice_references (id) {
+        id -> Uuid,
+        user_id -> Uuid,
+        name -> Varchar,
+        audio_path -> Text,
+        duration_ms -> Int8,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     voice_utterance_speakers (id) {
         id -> Uuid,
         utterance_id -> Uuid,
         user_id -> Nullable<Uuid>,
         username -> Varchar,
         created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    voice_utterance_refinements (id) {
+        id -> Uuid,
+        utterance_id -> Uuid,
+        engine -> Varchar,
+        text -> Text,
+        language -> Varchar,
+        segments_json -> Text,
+        status -> Varchar,
+        processing_error -> Nullable<Text>,
+        created_at -> Timestamptz,
+        completed_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -101,7 +127,9 @@ diesel::joinable!(room_members -> users (user_id));
 diesel::joinable!(rooms -> users (owner_id));
 diesel::joinable!(voice_sessions -> rooms (room_id));
 diesel::joinable!(voice_sessions -> users (user_id));
+diesel::joinable!(voice_references -> users (user_id));
 diesel::joinable!(voice_utterance_speakers -> voice_utterances (utterance_id));
+diesel::joinable!(voice_utterance_refinements -> voice_utterances (utterance_id));
 diesel::joinable!(voice_utterances -> rooms (room_id));
 diesel::joinable!(voice_utterances -> voice_sessions (session_id));
 diesel::allow_tables_to_appear_in_same_query!(
@@ -109,7 +137,9 @@ diesel::allow_tables_to_appear_in_same_query!(
     room_members,
     rooms,
     users,
+    voice_references,
     voice_sessions,
+    voice_utterance_refinements,
     voice_utterance_speakers,
     voice_utterances,
 );

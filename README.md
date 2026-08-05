@@ -12,8 +12,8 @@ Browser AudioWorklet (native-rate mono Float32 capture)
   -> primary Qwen ASR live stream + post-segment parallel ASR consensus
   -> translation queue: Qwen3 local LLM
   -> translated text returned without waiting for TTS
-  -> server sherpa-onnx TTS: Kokoro INT8 for zh, Supertonic 3 INT8 for other languages
-  -> room broadcast: transcript/translation events + source/translated media URLs + translated PCM16
+  -> pluggable server TTS: MOSS-TTS-Nano ONNX stream, then Kokoro/Supertonic fallback
+  -> room broadcast: transcript/translation events + source/translated media URLs + typed PCM16 audio chunks
   -> every connected room member receives the same ordered realtime stream
 ```
 
@@ -23,7 +23,9 @@ Recording is continuous until the client sends `flush`. The browser's Rust/WASM 
 
 Qwen ASR remains server-side. Its model is too large and device-sensitive for the default browser path, and keeping it on the server protects model files and preserves authoritative persisted results. See [the browser VAD architecture](docs/browser-vad-architecture.md) for the deployment and security decisions.
 
-Server TTS uses two lazy-loaded sherpa-onnx engines. Chinese uses Kokoro v1.1 zh/en INT8; `en/ja/ko/fr/de/es/it/pt/ru` use Supertonic 3 INT8. Translation text is streamed immediately, while TTS runs in the following queue stage and returns both a protected WAV URL and PCM16 WebSocket frames.
+Server TTS is a chain of `TtsEngine` implementations. MOSS-TTS-Nano ONNX is attempted first for every supported target language and forwards its 48 kHz stereo PCM chunks while synthesis is still running. If it fails before emitting audio, Chinese falls back to lazy-loaded Kokoro v1.1 INT8 and `en/ja/ko/fr/de/es/it/pt/ru` fall back to Supertonic 3 INT8. Once an engine emits its first chunk, the chain is committed to that engine so a later failure cannot replay the sentence from the beginning. Translation text remains independent of TTS and is sent immediately.
+
+The synthesis pipeline depends only on the business-level `TtsEngine` trait. Provider implementations live under `server/src/backends/tts/`; `FallbackTtsEngine` owns routing and failure policy, while persistence and WebSocket delivery remain in the pipeline. The audio events declare engine, codec, sample rate, and channel count, so future MOSS Realtime/v1.5 and Opus delivery adapters can be added without changing translation or storage ownership.
 
 Rooms define `max_utterance_seconds` with a default of 20 seconds and an allowed range of 5 through 20 seconds. Continuous speech is force-segmented at that duration and immediately continues in a new utterance record.
 
@@ -35,11 +37,29 @@ Prepare the server TTS models once. The script downloads pinned Kokoro and Super
 
 ```bash
 ./scripts/setup-server-tts.sh
+./scripts/moss-nano-tts.sh setup
+./scripts/moss-nano-tts.sh start
+./scripts/moss-nano-tts.sh doctor
 cd web
 npm install
 npm run build
 cd ..
 cargo run --bin voice-elf-server
+```
+
+After the initial model setup, the complete development stack can be managed from one terminal. `make dev` verifies PostgreSQL, the project-local Python/MOSS environment, Web dependencies, Rust VAD, and the server build before starting MOSS-TTS-Nano, the Rust server, and Vite. The processes run in project-specific detached sessions, so they remain available after the command exits without requiring a global service installation. Stop only removes processes owned by this stack and waits for ports `18083`, `3001`, and `5173` to be released; an unrelated process occupying one of those ports is reported and left untouched.
+
+```bash
+make dev             # start everything
+make dev-status      # inspect processes and dependency health
+make dev-logs        # print recent component logs
+make dev-restart     # stop and start again
+make dev-stop        # stop managed services and release their ports
+
+# The same controls are available from web/:
+npm run stack:start
+npm run stack:status
+npm run stack:stop
 ```
 
 Open <http://127.0.0.1:3001>. Microphone access works on localhost in current browsers.
@@ -78,7 +98,9 @@ cp .env.example .env
 cargo run --release --bin voice-elf-server
 ```
 
-The server loads `.env` automatically. Relative filesystem paths in the server configuration are resolved from the workspace root, so the server can be launched from the root or `server/` directory without changing model paths. The default installed configuration uses the open-source Qwen3-ASR-0.6B model through the MIT-licensed `qwen_asr` C runtime for offline streaming recognition, and `llama-completion` with Qwen3-0.6B for offline translation. It covers `zh/en/ja/ko/fr/de/es/it/pt/ru` and emits stable source tokens while audio is still arriving. You can instead configure an OpenAI-compatible translation endpoint with `LOCAL_LLM_BASE_URL` and `LOCAL_LLM_MODEL`. Set `TTS_KOKORO_MODEL_DIR`, `TTS_SUPERTONIC_MODEL_DIR`, and `TTS_THREADS` to override the server TTS defaults.
+The server loads `.env` automatically. Relative filesystem paths in the server configuration are resolved from the workspace root, so the server can be launched from the root or `server/` directory without changing model paths. The default installed configuration uses the open-source Qwen3-ASR-0.6B model through the MIT-licensed `qwen_asr` C runtime for offline streaming recognition, and `llama-completion` with Qwen3-0.6B for offline translation. It covers `zh/en/ja/ko/fr/de/es/it/pt/ru` and emits stable source tokens while audio is still arriving. You can instead configure an OpenAI-compatible translation endpoint with `LOCAL_LLM_BASE_URL` and `LOCAL_LLM_MODEL`.
+
+MOSS-TTS-Nano runs as its official Python 3.12 ONNX service on `127.0.0.1:18083`; `scripts/moss-nano-tts.sh` pins the tested upstream revision and manages setup and runtime state. Setup bootstraps pinned `uv 0.11.32`, managed CPython 3.12.13, the locked Python dependencies, virtual environment, source, dependency cache, and model cache below the ignored project `.local/` directory. On macOS ARM, it also builds the OpenFST dependency for WeTextProcessing inside `.local/openfst/`; it does not install a global Homebrew package. No system Python or shell profile is modified, so a new checkout can recreate the same isolated runtime with `setup`; use `doctor` to verify it. Configure its URL, CPU threads, timeout, and the application voice-to-demo mapping with `TTS_MOSS_NANO_*`. Set `TTS_MOSS_NANO_ENABLED=false` to use only the stable Kokoro/Supertonic engines. `TTS_KOKORO_MODEL_DIR`, `TTS_SUPERTONIC_MODEL_DIR`, and `TTS_THREADS` override fallback defaults.
 
 The ASR adapter starts at the VAD speech-start edge and receives PCM continuously while the speaker is still talking. Its low-latency defaults can be tuned with `QWEN_ASR_STREAM_UNFIXED_CHUNKS`, `QWEN_ASR_STREAM_MAX_NEW_TOKENS`, and `QWEN_ASR_ENCODER_WINDOW_SECONDS`; the adapter invokes:
 
@@ -88,7 +110,7 @@ qwen_asr -d <model-dir> --stdin --stream \
   --enc-window-sec 4 [--language <language>]
 ```
 
-The server validates both TTS model directories at startup; local mode also validates ASR and translation paths. Runtime inference failures are returned to the client as record-scoped recoverable errors, so the WebSocket session can keep listening.
+The server validates both fallback TTS model directories at startup; MOSS availability is checked per request so an unavailable optional service cannot prevent startup. Local mode also validates ASR and translation paths. Runtime inference failures are returned to the client as record-scoped recoverable errors, so the WebSocket session can keep listening.
 
 Qwen's stable token callback is forwarded immediately as real `transcript_delta` events. After VAD closes the sentence and ASR produces its final text, `llama-completion` stdout is filtered and forwarded token-by-token as real `translation_delta` events. Translation intentionally starts from the finalized sentence rather than repeatedly translating unstable ASR prefixes.
 
@@ -96,11 +118,35 @@ On the tested 2019 Intel Mac, a warm 6.5-second continuous sample produced its f
 
 Qwen streaming uses two-second audio chunks. The configured 12-token decode budget bounds each streaming step while retaining enough capacity for normal Chinese and English speech rates. If live recognition fails or returns no text, the adapter retries the preserved utterance PCM with faster `--silent` batch recognition before reporting an error.
 
+### Optional accurate transcription
+
+[MOSS-Transcribe-Diarize](https://github.com/OpenMOSS/MOSS-Transcribe-Diarize) can run beside Qwen as an optional accurate-transcription engine. Qwen remains the realtime source for translation and TTS; after each VAD utterance is saved, the server submits its WAV to MOSS on a separate bounded queue. MOSS failures therefore never replace or delay the realtime transcript. Completed text, timestamps, and speaker segments are stored as a separate refinement version and published through `transcript_refinement` WebSocket events.
+
+Start an OpenAI-compatible MOSS service, for example with SGLang Omni:
+
+```bash
+sgl-omni serve \
+  --model-path OpenMOSS-Team/MOSS-Transcribe-Diarize \
+  --port 8000
+```
+
+Then enable the component in `.env`:
+
+```dotenv
+MOSS_TRANSCRIBE_ENABLED=true
+MOSS_TRANSCRIBE_BASE_URL=http://127.0.0.1:8000/v1
+MOSS_TRANSCRIBE_MODEL=OpenMOSS-Team/MOSS-Transcribe-Diarize
+MOSS_TRANSCRIBE_TIMEOUT_SECONDS=300
+MOSS_TRANSCRIBE_MAX_NEW_TOKENS=5120
+```
+
+The current scheduler refines each stored utterance independently. Room-member identities from the WebSocket session remain authoritative; MOSS speaker labels are retained as model metadata and do not overwrite known users.
+
 ## PostgreSQL history
 
 Set `DATABASE_URL` to enable asynchronous persistence through Diesel and its bb8 connection pool. On startup, the server connects to PostgreSQL's `postgres` maintenance database, creates the configured database when it is missing, and then runs all pending embedded Diesel migrations before accepting traffic. The configured PostgreSQL role therefore needs `CREATEDB` only when automatic database creation is required.
 
-Each completed utterance is stored as two mono PCM16 WAV files: the received source audio and the server-generated translated TTS audio. The source WAV and processing record are persisted before ASR. Transcript, translation, translated WAV URL, and final TTS latency are updated as their stages finish. A failed synthesis therefore does not discard the source recording or text results.
+Each completed utterance stores a mono PCM16 source WAV and a translated PCM16 WAV with the channel count produced by its TTS engine. The source WAV and processing record are persisted before ASR. Transcript, translation, translated WAV URL, and final TTS latency are updated as their stages finish. A failed synthesis therefore does not discard the source recording or text results.
 
 Every VAD utterance is now persisted before ASR with its user, room, session, utterance ID, source WAV, and processing status. Empty ASR results become a record-scoped `recognition_failed` event rather than a global pipeline error, so the client keeps the failed row and its playable source audio for diagnosis.
 
@@ -170,16 +216,24 @@ The frontend uses SvelteKit file routing and is split into route pages, reusable
 /login             account login and registration
 /rooms             searchable room directory
 /rooms/{room_id}   translation, participant controls, live room state, and history
-/settings          voice and automatic playback preferences
+/rooms/{room_id}/subtitles
+                   read-only realtime source/translated subtitle display
+/settings          voice, automatic playback, and subtitle display preferences
 ```
 
 Refreshing any of these paths is handled by the Axum SPA fallback. SvelteKit route modules are in `web/src/routes/`, existing feature pages are in `pages/`, reusable UI is in `components/`, and WebSocket/microphone ownership is in `controllers/voice-session.ts`. The static adapter writes the deployable SPA to `web/dist`.
+
+The subtitle display can show source text, translated text, or both. Its color preset, custom colors, source and translation font sizes, line height, caption spacing, and screen padding are stored per user. Changes made in Settings are broadcast to open subtitle tabs and application windows immediately. The display keeps the latest three utterances available, prioritizes the current utterance when space is constrained, and recalculates text sizing whenever its window is resized.
+
+The complete product flow, setting matrix, resize behavior, failure states, and acceptance checklist are documented in [`docs/subtitle-display.md`](docs/subtitle-display.md).
 
 ## Tauri applications
 
 The Web client can also be packaged for macOS, Windows, Android, and iOS with Tauri 2. The application shell embeds `web/dist` in its Rust library and starts an Axum server on a random loopback port before creating the WebView. The WebView loads that Axum origin, so SPA fallback, workers, AudioWorklet, and the VAD WASM use normal HTTP paths on every platform.
 
 The embedded Axum service owns only the application delivery layer. It serves static assets and proxies `/api`, `/media`, and `/ws` to the existing Voice Elf server. This keeps the Web client same-origin while avoiding an unsupported mobile link of PostgreSQL, sherpa-onnx, and external model binaries. In the packaged app, the API address can be changed from the login screen or Settings page and is persisted in the platform application-config directory for later launches. The current packaged default upstream is `http://192.168.0.63:3001`; set `VOICE_ELF_APP_SERVER_URL` while running or building the shell when the backend is on another host:
+
+On desktop, the room toolbar opens the subtitle display in a reusable, always-on-top native window with a normal draggable title bar and resizable edges. In a browser, the same action opens the dedicated subtitle route in a reusable popup window. Opening subtitle settings from the desktop display uses a separate settings window so the active meeting page and microphone session remain intact.
 
 ```bash
 # macOS development against a local backend
@@ -194,6 +248,14 @@ VOICE_ELF_APP_SERVER_URL=https://voice.example.com npm run app:ios:build
 ```
 
 Run Windows packaging on Windows, macOS/iOS packaging on macOS, and Android packaging on a host with the Android SDK, NDK 28+, and JDK 17+. Apple device builds also require `APPLE_DEVELOPMENT_TEAM` or the corresponding Tauri iOS config. Android API 24 and iOS 14 are the configured minimums. See [the Tauri platform architecture](docs/tauri-platform-architecture.md) for the packaging flow, platform permissions, validation matrix, and design constraints.
+
+## Continuous integration and releases
+
+GitHub Actions runs the Rust and Web validations independently on `macos-15-intel`. After both validations pass, Android and Intel macOS packaging run in parallel. Separate downstream jobs verify checksums, Android archive structure and ABIs, and the macOS disk image, `x86_64` executable, and 11.0 deployment target. This dependency graph keeps validation, packaging, and artifact failures isolated in the Actions history.
+
+Every pull request, push to `main`, and manual run produces 14-day workflow artifacts. Pushing a version tag matching the Tauri version, such as `v0.1.0`, additionally creates or updates the matching GitHub Release with the verified APK, AAB, Intel DMG, checksums, and build manifests.
+
+Android validation packages are unsigned unless all three repository Actions secrets are configured: `ANDROID_KEY_BASE64`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`. `ANDROID_KEY_BASE64` must contain the base64-encoded Java keystore. Unsigned artifact names include `-unsigned`; signed artifacts are verified with `apksigner` and `jarsigner` before publication. The macOS application uses an ad-hoc signature so CI can verify bundle integrity, but it is not notarized and macOS may still require manual approval in Privacy & Security.
 
 ## Checks
 

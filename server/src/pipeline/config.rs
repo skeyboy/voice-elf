@@ -10,7 +10,28 @@ pub(super) fn normalize_config(
         "auto", "zh", "en", "ja", "ko", "fr", "de", "es", "it", "pt", "ru",
     ];
     const VOICES: &[&str] = &[
-        "f1", "m1", "serena", "vivian", "unclefu", "ryan", "aiden", "onoanna", "sohee", "eric",
+        "f1",
+        "zh_gentle",
+        "zh_taiwan",
+        "m1",
+        "zh_lecture",
+        "zh_monologue",
+        "en_moss",
+        "en_lecture",
+        "en_news",
+        "en_gentle",
+        "en_expressive",
+        "en_narration",
+        "ja_news",
+        // Accepted for clients created before the MOSS reference-voice migration.
+        "serena",
+        "vivian",
+        "unclefu",
+        "ryan",
+        "aiden",
+        "onoanna",
+        "sohee",
+        "eric",
         "dylan",
     ];
     if !LANGUAGES.contains(&config.source_language.as_str()) {
@@ -25,7 +46,11 @@ pub(super) fn normalize_config(
             config.target_language
         ));
     }
-    if !VOICES.contains(&config.voice.as_str()) {
+    let custom_voice = config
+        .voice
+        .strip_prefix("custom:")
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
+    if !custom_voice && !VOICES.contains(&config.voice.as_str()) {
         return Err(format!("Unsupported voice: {}", config.voice));
     }
     if !(5..=20).contains(&config.max_utterance_seconds) {
@@ -59,9 +84,47 @@ mod tests {
             })
             .is_ok()
         );
+        for voice in [
+            "F1",
+            "ZH_GENTLE",
+            "ZH_TAIWAN",
+            "M1",
+            "ZH_LECTURE",
+            "ZH_MONOLOGUE",
+            "EN_MOSS",
+            "EN_LECTURE",
+            "EN_NEWS",
+            "EN_GENTLE",
+            "EN_EXPRESSIVE",
+            "EN_NARRATION",
+            "JA_NEWS",
+        ] {
+            assert!(
+                normalize_config(SessionConfig {
+                    voice: voice.to_owned(),
+                    ..SessionConfig::default()
+                })
+                .is_ok(),
+                "voice {voice} should be supported",
+            );
+        }
         assert!(
             normalize_config(SessionConfig {
                 target_language: "auto".to_owned(),
+                ..SessionConfig::default()
+            })
+            .is_err()
+        );
+        assert!(
+            normalize_config(SessionConfig {
+                voice: format!("custom:{}", uuid::Uuid::new_v4()),
+                ..SessionConfig::default()
+            })
+            .is_ok()
+        );
+        assert!(
+            normalize_config(SessionConfig {
+                voice: "custom:not-a-uuid".to_owned(),
                 ..SessionConfig::default()
             })
             .is_err()

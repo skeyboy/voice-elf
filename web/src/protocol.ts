@@ -32,6 +32,13 @@ export interface SpeakerIdentity {
   username: string;
 }
 
+export interface TranscriptionSegment {
+  start: number;
+  end: number;
+  speaker: string | null;
+  text: string;
+}
+
 export interface RoomMemberState {
   user_id: string;
   username: string;
@@ -105,6 +112,16 @@ export type ServerEvent =
       done: boolean;
     }
   | {
+      type: 'transcript_refinement';
+      utterance_id: string;
+      engine: string;
+      status: 'processing' | 'completed' | 'failed';
+      text: string | null;
+      language: string | null;
+      segments: TranscriptionSegment[];
+      message: string | null;
+    }
+  | {
       type: 'translation';
       utterance_id: string;
       source_text: string;
@@ -129,9 +146,12 @@ export type ServerEvent =
   | {
       type: 'audio_start';
       utterance_id: string;
+      engine: string;
+      codec: 'pcm_s16le';
       sample_rate: number;
-      sample_count: number;
+      channels: number;
+      sample_count?: number | null;
     }
-  | { type: 'audio_end'; utterance_id: string }
+  | { type: 'audio_end'; utterance_id: string; sample_count: number }
   | { type: 'latency'; utterance_id: string; latency: LatencyReport }
   | { type: 'warning'; message: string };

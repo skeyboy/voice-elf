@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -7,6 +8,22 @@ use std::{
 
 use anyhow::{Context, Result};
 
+const DEFAULT_MOSS_NANO_VOICE_MAP: &str = concat!(
+    "F1=demo-1,",
+    "ZH_GENTLE=demo-2,",
+    "ZH_TAIWAN=demo-3,",
+    "M1=demo-4,",
+    "ZH_LECTURE=demo-5,",
+    "ZH_MONOLOGUE=demo-6,",
+    "EN_MOSS=demo-7,",
+    "EN_LECTURE=demo-8,",
+    "EN_NEWS=demo-9,",
+    "EN_GENTLE=demo-10,",
+    "EN_EXPRESSIVE=demo-11,",
+    "EN_NARRATION=demo-12,",
+    "JA_NEWS=demo-13",
+);
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub bind: SocketAddr,
@@ -14,6 +31,7 @@ pub struct AppConfig {
     pub media_dir: PathBuf,
     pub backend_mode: BackendMode,
     pub asr: AsrConfig,
+    pub moss_transcribe: MossTranscribeConfig,
     pub translator: TranslatorConfig,
     pub tts: TtsConfig,
     pub inference_timeout: Duration,
@@ -36,6 +54,16 @@ pub struct AsrConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct MossTranscribeConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    pub timeout: Duration,
+    pub max_new_tokens: usize,
+}
+
+#[derive(Clone, Debug)]
 pub struct TranslatorConfig {
     pub base_url: String,
     pub model: String,
@@ -50,6 +78,20 @@ pub struct TtsConfig {
     pub kokoro_model_dir: PathBuf,
     pub supertonic_model_dir: PathBuf,
     pub threads: usize,
+    pub moss_nano: MossNanoTtsConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct MossNanoTtsConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub default_demo_id: String,
+    pub voice_map: HashMap<String, String>,
+    pub cpu_threads: usize,
+    pub connect_timeout: Duration,
+    pub timeout: Duration,
+    pub retry_backoff: Duration,
 }
 
 impl AppConfig {
@@ -103,6 +145,26 @@ impl AppConfig {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(4),
             },
+            moss_transcribe: MossTranscribeConfig {
+                enabled: env_flag("MOSS_TRANSCRIBE_ENABLED"),
+                base_url: env::var("MOSS_TRANSCRIBE_BASE_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:8000/v1".to_owned()),
+                model: env::var("MOSS_TRANSCRIBE_MODEL")
+                    .unwrap_or_else(|_| "OpenMOSS-Team/MOSS-Transcribe-Diarize".to_owned()),
+                api_key: env::var("MOSS_TRANSCRIBE_API_KEY")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty()),
+                timeout: Duration::from_secs(
+                    env::var("MOSS_TRANSCRIBE_TIMEOUT_SECONDS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(300),
+                ),
+                max_new_tokens: env::var("MOSS_TRANSCRIBE_MAX_NEW_TOKENS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(5_120),
+            },
             translator: TranslatorConfig {
                 base_url: env::var("LOCAL_LLM_BASE_URL")
                     .unwrap_or_else(|_| "http://127.0.0.1:11434/v1".to_owned()),
@@ -136,6 +198,42 @@ impl AppConfig {
                     .ok()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(2),
+                moss_nano: MossNanoTtsConfig {
+                    enabled: env_flag_default("TTS_MOSS_NANO_ENABLED", true),
+                    base_url: env::var("TTS_MOSS_NANO_BASE_URL")
+                        .unwrap_or_else(|_| "http://127.0.0.1:18083/".to_owned()),
+                    api_key: env::var("TTS_MOSS_NANO_API_KEY")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty()),
+                    default_demo_id: env::var("TTS_MOSS_NANO_DEFAULT_DEMO_ID")
+                        .unwrap_or_else(|_| "demo-1".to_owned()),
+                    voice_map: parse_key_value_map(
+                        &env::var("TTS_MOSS_NANO_VOICE_MAP")
+                            .unwrap_or_else(|_| DEFAULT_MOSS_NANO_VOICE_MAP.to_owned()),
+                    ),
+                    cpu_threads: env::var("TTS_MOSS_NANO_CPU_THREADS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(4),
+                    connect_timeout: Duration::from_secs(
+                        env::var("TTS_MOSS_NANO_CONNECT_TIMEOUT_SECONDS")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(2),
+                    ),
+                    timeout: Duration::from_secs(
+                        env::var("TTS_MOSS_NANO_TIMEOUT_SECONDS")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(180),
+                    ),
+                    retry_backoff: Duration::from_secs(
+                        env::var("TTS_MOSS_NANO_RETRY_BACKOFF_SECONDS")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(30),
+                    ),
+                },
             },
             inference_timeout: Duration::from_secs(timeout_seconds),
             database_url: env::var("DATABASE_URL").ok().filter(|url| !url.is_empty()),
@@ -164,6 +262,28 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+fn env_flag(name: &str) -> bool {
+    env_flag_default(name, false)
+}
+
+fn env_flag_default(name: &str, default: bool) -> bool {
+    env::var(name).map_or(default, |value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn parse_key_value_map(value: &str) -> HashMap<String, String> {
+    value
+        .split(',')
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(key, value)| (key.trim().to_ascii_uppercase(), value.trim().to_owned()))
+        .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+        .collect()
 }
 
 fn workspace_root() -> &'static Path {
@@ -214,5 +334,14 @@ mod tests {
             resolve_workspace_executable("qwen_asr"),
             PathBuf::from("qwen_asr")
         );
+    }
+
+    #[test]
+    fn default_moss_voice_map_contains_each_unique_reference_voice() {
+        let voices = parse_key_value_map(DEFAULT_MOSS_NANO_VOICE_MAP);
+        assert_eq!(voices.len(), 13);
+        assert_eq!(voices.get("F1").map(String::as_str), Some("demo-1"));
+        assert_eq!(voices.get("M1").map(String::as_str), Some("demo-4"));
+        assert_eq!(voices.get("JA_NEWS").map(String::as_str), Some("demo-13"));
     }
 }

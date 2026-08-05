@@ -4,7 +4,8 @@ import type { ConnectionStatus } from '../components/topbar';
 
 export const currentUser = writable<User | null | undefined>(undefined);
 export const connectionStatus = writable<ConnectionStatus>('hidden');
-export const toastMessages = writable<Array<{ id: number; message: string }>>([]);
+export type ToastKind = 'info' | 'warning' | 'error';
+export const toastMessages = writable<Array<{ id: number; message: string; kind: ToastKind }>>([]);
 
 let sessionRequest: Promise<User | null> | null = null;
 let nextToastId = 1;
@@ -32,9 +33,13 @@ export function resetSession(user: User | null) {
 }
 
 export function showError(message: string) {
+  showToast(message, 5200, 'error');
+}
+
+export function showToast(message: string, duration = 2400, kind: ToastKind = 'info') {
   const id = nextToastId++;
-  toastMessages.update((messages) => [...messages, { id, message }]);
+  toastMessages.update((messages) => [...messages, { id, message, kind }]);
   window.setTimeout(() => {
     toastMessages.update((messages) => messages.filter((item) => item.id !== id));
-  }, 5200);
+  }, duration);
 }

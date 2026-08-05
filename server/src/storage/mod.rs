@@ -16,7 +16,10 @@ use uuid::Uuid;
 
 use crate::{
     protocol::SessionConfig,
-    schema::{auth_sessions, room_members, rooms, users, voice_sessions, voice_utterances},
+    schema::{
+        auth_sessions, room_members, rooms, users, voice_references, voice_sessions,
+        voice_utterances,
+    },
 };
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
@@ -69,6 +72,27 @@ struct NewAuthSession<'a> {
     user_id: Uuid,
     token_hash: &'a str,
     expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, diesel::Queryable, diesel::Selectable)]
+#[diesel(table_name = voice_references)]
+pub struct VoiceReferenceRecord {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub name: String,
+    pub audio_path: String,
+    pub duration_ms: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = voice_references)]
+struct NewVoiceReference<'a> {
+    id: Uuid,
+    user_id: Uuid,
+    name: &'a str,
+    audio_path: &'a str,
+    duration_ms: i64,
 }
 
 #[derive(Clone, Debug, diesel::Queryable, diesel::Selectable)]
@@ -279,6 +303,75 @@ impl Database {
             .execute(&mut connection)
             .await?;
         Ok(())
+    }
+
+    pub async fn list_voice_references(&self, user_id: Uuid) -> Result<Vec<VoiceReferenceRecord>> {
+        let mut connection = self.pool.get().await?;
+        voice_references::table
+            .filter(voice_references::user_id.eq(user_id))
+            .order(voice_references::created_at.desc())
+            .select(VoiceReferenceRecord::as_select())
+            .load(&mut connection)
+            .await
+            .context("failed to list voice references")
+    }
+
+    pub async fn get_voice_reference(
+        &self,
+        id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<VoiceReferenceRecord>> {
+        let mut connection = self.pool.get().await?;
+        voice_references::table
+            .filter(voice_references::id.eq(id))
+            .filter(voice_references::user_id.eq(user_id))
+            .select(VoiceReferenceRecord::as_select())
+            .first(&mut connection)
+            .await
+            .optional()
+            .context("failed to find voice reference")
+    }
+
+    pub async fn create_voice_reference(
+        &self,
+        id: Uuid,
+        user_id: Uuid,
+        name: &str,
+        audio_path: &str,
+        duration_ms: i64,
+    ) -> Result<VoiceReferenceRecord> {
+        let row = NewVoiceReference {
+            id,
+            user_id,
+            name,
+            audio_path,
+            duration_ms,
+        };
+        let mut connection = self.pool.get().await?;
+        diesel::insert_into(voice_references::table)
+            .values(row)
+            .returning(VoiceReferenceRecord::as_returning())
+            .get_result(&mut connection)
+            .await
+            .context("failed to create voice reference")
+    }
+
+    pub async fn delete_voice_reference(
+        &self,
+        id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<VoiceReferenceRecord>> {
+        let mut connection = self.pool.get().await?;
+        diesel::delete(
+            voice_references::table
+                .filter(voice_references::id.eq(id))
+                .filter(voice_references::user_id.eq(user_id)),
+        )
+        .returning(VoiceReferenceRecord::as_returning())
+        .get_result(&mut connection)
+        .await
+        .optional()
+        .context("failed to delete voice reference")
     }
 
     pub async fn create_room(
@@ -633,6 +726,6 @@ mod database_setup_tests {
 mod history;
 
 pub use history::{
-    NewUtteranceAttempt, TranscriptUpdate, TranslationUpdate, UtteranceAudioUpdate,
-    UtteranceHistory,
+    NewUtteranceAttempt, RefinementUpdate, TranscriptUpdate, TranslationUpdate,
+    UtteranceAudioUpdate, UtteranceHistory,
 };

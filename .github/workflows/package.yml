@@ -1,0 +1,390 @@
+name: Validate and package
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+concurrency:
+  group: package-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  validate-rust:
+    name: Validate / Rust
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          targets: wasm32-unknown-unknown
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+  validate-web:
+    name: Validate / Web
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: web
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build web client
+        working-directory: web
+        run: npm run build
+
+      - name: Check tag matches application version
+        if: github.ref_type == 'tag'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          expected_tag="v$(node -p "require('./web/src-tauri/tauri.conf.json').version")"
+          if [[ "$RELEASE_TAG" != "$expected_tag" ]]; then
+            echo "Release tag $RELEASE_TAG does not match $expected_tag" >&2
+            exit 1
+          fi
+
+  package-android:
+    name: Package / Android
+    needs:
+      - validate-rust
+      - validate-web
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Install Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: android
+
+      - name: Use the latest installed Android NDK
+        run: |
+          echo "ANDROID_NDK=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Configure Android signing
+        env:
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -n "$ANDROID_KEY_BASE64" && -n "$ANDROID_KEY_ALIAS" && -n "$ANDROID_KEY_PASSWORD" ]]; then
+            printf '%s' "$ANDROID_KEY_BASE64" | /usr/bin/base64 -D > "$RUNNER_TEMP/voice-elf-upload.jks"
+            {
+              printf 'keyAlias=%s\n' "$ANDROID_KEY_ALIAS"
+              printf 'password=%s\n' "$ANDROID_KEY_PASSWORD"
+              printf 'storeFile=%s\n' "$RUNNER_TEMP/voice-elf-upload.jks"
+            } > web/src-tauri/gen/android/keystore.properties
+            echo "ANDROID_ASSET_SUFFIX=" >> "$GITHUB_ENV"
+            echo "ANDROID_SIGNING_STATUS=signed" >> "$GITHUB_ENV"
+          else
+            echo "Android signing secrets are incomplete; packaging unsigned validation assets."
+            echo "ANDROID_ASSET_SUFFIX=-unsigned" >> "$GITHUB_ENV"
+            echo "ANDROID_SIGNING_STATUS=unsigned" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build Android APK and AAB
+        working-directory: web
+        run: npm run tauri -- android build --ci --apk --aab --target aarch64 armv7 x86_64
+
+      - name: Collect Android assets
+        run: |
+          version="$(node -p "require('./web/src-tauri/tauri.conf.json').version")"
+          apk="$(find web/src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -print -quit)"
+          aab="$(find web/src-tauri/gen/android/app/build/outputs/bundle -type f -name '*.aab' -print -quit)"
+          test -n "$apk"
+          test -n "$aab"
+
+          mkdir -p release-assets
+          apk_name="Voice-Elf_${version}_Android_universal${ANDROID_ASSET_SUFFIX}.apk"
+          aab_name="Voice-Elf_${version}_Android_universal${ANDROID_ASSET_SUFFIX}.aab"
+          cp "$apk" "release-assets/$apk_name"
+          cp "$aab" "release-assets/$aab_name"
+          (
+            cd release-assets
+            shasum -a 256 "$apk_name" > "$apk_name.sha256"
+            shasum -a 256 "$aab_name" > "$aab_name.sha256"
+            {
+              printf 'commit=%s\n' "$GITHUB_SHA"
+              printf 'platform=android\n'
+              printf 'architectures=arm64-v8a,armeabi-v7a,x86_64\n'
+              printf 'signing=%s\n' "$ANDROID_SIGNING_STATUS"
+            } > "Voice-Elf_${version}_Android_build.txt"
+          )
+
+      - name: Upload Android package
+        uses: actions/upload-artifact@v7
+        with:
+          name: voice-elf-android
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 14
+
+  package-macos-intel:
+    name: Package / macOS Intel
+    needs:
+      - validate-rust
+      - validate-web
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,x86_64-apple-darwin
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: macos-x86_64
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build ad-hoc signed macOS Intel bundle
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+        working-directory: web
+        run: npm run tauri -- build --ci --target x86_64-apple-darwin --bundles app,dmg
+
+      - name: Collect macOS asset
+        run: |
+          version="$(node -p "require('./web/src-tauri/tauri.conf.json').version")"
+          dmg="$(find target/x86_64-apple-darwin/release/bundle/dmg -type f -name '*.dmg' -print -quit)"
+          test -n "$dmg"
+
+          mkdir -p release-assets
+          dmg_name="Voice-Elf_${version}_macOS_x86_64.dmg"
+          cp "$dmg" "release-assets/$dmg_name"
+          (
+            cd release-assets
+            shasum -a 256 "$dmg_name" > "$dmg_name.sha256"
+            {
+              printf 'commit=%s\n' "$GITHUB_SHA"
+              printf 'platform=macos\n'
+              printf 'architecture=x86_64\n'
+              printf 'minimum_system_version=11.0\n'
+              printf 'signing=ad-hoc\n'
+            } > "Voice-Elf_${version}_macOS_x86_64_build.txt"
+          )
+
+      - name: Upload macOS package
+        uses: actions/upload-artifact@v7
+        with:
+          name: voice-elf-macos-x86_64
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 14
+
+  verify-android:
+    name: Verify / Android package
+    needs: package-android
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    steps:
+      - name: Install Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download Android package
+        uses: actions/download-artifact@v8
+        with:
+          name: voice-elf-android
+          path: release-assets
+
+      - name: Verify checksums, archives, ABIs, and signatures
+        run: |
+          cd release-assets
+          shasum -a 256 -c ./*.sha256
+
+          apk="$(find . -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          aab="$(find . -maxdepth 1 -type f -name '*.aab' -print -quit)"
+          test -n "$apk"
+          test -n "$aab"
+          unzip -tq "$apk"
+          unzip -tq "$aab"
+          apk_entries="$(unzip -Z1 "$apk")"
+          aab_entries="$(unzip -Z1 "$aab")"
+
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            grep -Fx "lib/$abi/libvoice_elf_app_lib.so" <<< "$apk_entries" >/dev/null
+            grep -Fx "base/lib/$abi/libvoice_elf_app_lib.so" <<< "$aab_entries" >/dev/null
+          done
+
+          if [[ "$apk" != *-unsigned.apk ]]; then
+            apksigner="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort | tail -1)"
+            test -n "$apksigner"
+            "$apksigner" verify --verbose "$apk"
+            jarsigner -verify "$aab"
+          fi
+
+  verify-macos-intel:
+    name: Verify / macOS Intel package
+    needs: package-macos-intel
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    steps:
+      - name: Download macOS package
+        uses: actions/download-artifact@v8
+        with:
+          name: voice-elf-macos-x86_64
+          path: release-assets
+
+      - name: Verify checksum, disk image, architecture, and deployment target
+        run: |
+          cd release-assets
+          shasum -a 256 -c ./*.sha256
+          dmg="$(find . -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -n "$dmg"
+          hdiutil verify "$dmg"
+
+          mount_point="$RUNNER_TEMP/voice-elf-dmg"
+          mkdir -p "$mount_point"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount_point"
+          trap 'hdiutil detach "$mount_point"' EXIT
+
+          executable="$(find "$mount_point" -path '*/Contents/MacOS/voice-elf-app' -type f -print -quit)"
+          test -n "$executable"
+          lipo "$executable" -verify_arch x86_64
+          executable_description="$(file "$executable")"
+          grep -F 'x86_64' <<< "$executable_description" >/dev/null
+
+          app_bundle="$(dirname "$(dirname "$(dirname "$executable")")")"
+          codesign --verify --deep --strict "$app_bundle"
+          minimum_version="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app_bundle/Contents/Info.plist")"
+          test "$minimum_version" = "11.0"
+
+  release:
+    name: Release / Publish assets
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs:
+      - verify-android
+      - verify-macos-intel
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: voice-elf-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Recheck release checksums
+        run: |
+          cd release-assets
+          shasum -a 256 -c ./*.sha256
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          assets=()
+          while IFS= read -r -d '' asset; do
+            assets+=("$asset")
+          done < <(find release-assets -maxdepth 1 -type f -print0)
+          test "${#assets[@]}" -gt 0
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --verify-tag \
+              --generate-notes \
+              --title "Voice Elf $RELEASE_TAG"
+          fi

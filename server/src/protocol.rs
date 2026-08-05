@@ -9,6 +9,14 @@ pub struct SpeakerIdentity {
     pub username: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TranscriptionSegment {
+    pub start: f64,
+    pub end: f64,
+    pub speaker: Option<String>,
+    pub text: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RoomMemberState {
     pub user_id: Uuid,
@@ -100,7 +108,7 @@ fn default_target_language() -> String {
 }
 
 fn default_voice() -> String {
-    "ryan".to_owned()
+    "F1".to_owned()
 }
 
 fn default_max_utterance_seconds() -> u32 {
@@ -176,6 +184,15 @@ pub enum ServerEvent {
         language: String,
         done: bool,
     },
+    TranscriptRefinement {
+        utterance_id: String,
+        engine: String,
+        status: RefinementStatus,
+        text: Option<String>,
+        language: Option<String>,
+        segments: Vec<TranscriptionSegment>,
+        message: Option<String>,
+    },
     Translation {
         utterance_id: String,
         source_text: String,
@@ -197,11 +214,15 @@ pub enum ServerEvent {
     },
     AudioStart {
         utterance_id: String,
+        engine: String,
+        codec: AudioCodec,
         sample_rate: u32,
-        sample_count: usize,
+        channels: u16,
+        sample_count: Option<usize>,
     },
     AudioEnd {
         utterance_id: String,
+        sample_count: usize,
     },
     Latency {
         utterance_id: String,
@@ -210,6 +231,12 @@ pub enum ServerEvent {
     Warning {
         message: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioCodec {
+    PcmS16le,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -230,6 +257,14 @@ pub enum ProcessingStage {
     Tts,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefinementStatus {
+    Processing,
+    Completed,
+    Failed,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct LatencyReport {
     pub vad_ms: u64,
@@ -248,6 +283,11 @@ pub struct LatencyReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defaults_to_the_primary_voice_profile() {
+        assert_eq!(SessionConfig::default().voice, "F1");
+    }
 
     #[test]
     fn parses_traceable_segment_boundaries() {

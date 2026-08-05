@@ -2,6 +2,7 @@ mod config;
 mod events;
 mod jobs;
 mod latency;
+mod refinement;
 mod session;
 mod synthesis;
 mod transcription;

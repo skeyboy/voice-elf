@@ -8,7 +8,7 @@ interface PlaybackProgress {
   durationSeconds: number;
 }
 
-const MIN_VALID_SPEECH_FRAMES = 6;
+const MIN_VALID_SPEECH_FRAMES = 10;
 const PLAYBACK_TAIL_GUARD_MS = 300;
 
 interface VoiceSessionCallbacks {
@@ -28,6 +28,7 @@ export class VoiceSession {
   private receivingAudio: {
     utteranceId: string;
     sampleRate: number;
+    channels: number;
     sampleCount: number;
     playedSamples: number;
   } | null = null;
@@ -270,14 +271,17 @@ export class VoiceSession {
     if (message.data instanceof ArrayBuffer) {
       const playback = this.receivingAudio;
       if (!playback) return;
-      const chunkSamples = message.data.byteLength / Int16Array.BYTES_PER_ELEMENT;
-      void this.player.enqueue(message.data, this.audioSampleRate, () => {
+      const chunkSamples =
+        message.data.byteLength /
+        (Int16Array.BYTES_PER_ELEMENT * playback.channels);
+      void this.player.enqueue(message.data, this.audioSampleRate, playback.channels, () => {
         if (!playback) return;
         playback.playedSamples += chunkSamples;
         this.callbacks.onPlaybackProgress({
           utteranceId: playback.utteranceId,
           currentSeconds: playback.playedSamples / playback.sampleRate,
-          durationSeconds: playback.sampleCount / playback.sampleRate,
+          durationSeconds:
+            Math.max(playback.sampleCount, playback.playedSamples) / playback.sampleRate,
         });
       });
       return;
@@ -295,20 +299,31 @@ export class VoiceSession {
     }
     if (event.type === 'ready' && this.canPublish) this.sendConfig();
     if (event.type === 'audio_start') {
+      if (event.codec !== 'pcm_s16le') {
+        this.callbacks.onCaptureError(`浏览器暂不支持实时播放 ${event.codec} 音频`);
+        this.receivingAudio = null;
+        return;
+      }
       this.audioSampleRate = event.sample_rate;
       this.receivingAudio = {
         utteranceId: event.utterance_id,
         sampleRate: event.sample_rate,
-        sampleCount: event.sample_count,
+        channels: event.channels,
+        sampleCount: event.sample_count ?? 0,
         playedSamples: 0,
       };
       this.callbacks.onPlaybackProgress({
         utteranceId: event.utterance_id,
         currentSeconds: 0,
-        durationSeconds: event.sample_count / event.sample_rate,
+        durationSeconds: (event.sample_count ?? 0) / event.sample_rate,
       });
     }
-    if (event.type === 'audio_end') this.receivingAudio = null;
+    if (event.type === 'audio_end') {
+      if (this.receivingAudio?.utteranceId === event.utterance_id) {
+        this.receivingAudio.sampleCount = event.sample_count;
+      }
+      this.receivingAudio = null;
+    }
     this.callbacks.onEvent(event);
   }
 

@@ -1,4 +1,4 @@
-import type { LatencyReport } from './protocol';
+import type { LatencyReport, TranscriptionSegment } from './protocol';
 
 export interface User {
   id: string;
@@ -36,6 +36,18 @@ export interface UtteranceHistory {
   created_at: string;
   latency: LatencyReport;
   speakers: SpeakerIdentity[];
+  refinements: UtteranceRefinement[];
+}
+
+export interface UtteranceRefinement {
+  engine: string;
+  text: string;
+  language: string;
+  segments: TranscriptionSegment[];
+  status: 'processing' | 'completed' | 'failed' | 'interrupted';
+  processing_error: string | null;
+  created_at: string;
+  completed_at: string | null;
 }
 
 export interface SpeakerIdentity {
@@ -65,6 +77,14 @@ export interface RoomInput {
   max_utterance_seconds: number;
 }
 
+export interface VoiceReference {
+  id: string;
+  name: string;
+  duration_ms: number;
+  created_at: string;
+  audio_url: string;
+}
+
 export class ApiRequestError extends Error {
   constructor(
     message: string,
@@ -76,7 +96,7 @@ export class ApiRequestError extends Error {
 
 export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
-  if (init.body) headers.set('content-type', 'application/json');
+  if (init.body && !(init.body instanceof FormData)) headers.set('content-type', 'application/json');
   const response = await fetch(path, { ...init, headers });
   if (!response.ok) {
     const payload = (await response.json().catch(() => null)) as { error?: string } | null;
@@ -84,4 +104,19 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
   }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
+}
+
+export function listVoiceReferences() {
+  return apiRequest<VoiceReference[]>('/api/voice-references');
+}
+
+export function createVoiceReference(name: string, audio: Blob) {
+  const body = new FormData();
+  body.append('name', name);
+  body.append('audio', audio, 'reference.wav');
+  return apiRequest<VoiceReference>('/api/voice-references', { method: 'POST', body });
+}
+
+export function deleteVoiceReference(id: string) {
+  return apiRequest<void>(`/api/voice-references/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }

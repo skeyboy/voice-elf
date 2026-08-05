@@ -1,7 +1,21 @@
-.PHONY: dev server web web-deploy-watch web-public web-dev-public web-public-status web-public-stop app-dev app-build app-android-dev app-android-build app-ios-dev app-ios-build setup-models build test
+.PHONY: dev dev-start dev-stop dev-restart dev-status dev-logs server web web-deploy-watch web-public web-dev-public web-public-status web-public-stop app-dev app-build app-android-dev app-android-build app-ios-dev app-ios-build setup-models build test
 
-dev:
-	@echo "Run 'make server' and 'make web' in separate terminals"
+dev: dev-start
+
+dev-start:
+	./scripts/dev-stack.sh start
+
+dev-stop:
+	./scripts/dev-stack.sh stop
+
+dev-restart:
+	./scripts/dev-stack.sh restart
+
+dev-status:
+	./scripts/dev-stack.sh status
+
+dev-logs:
+	./scripts/dev-stack.sh logs
 
 server:
 	cargo run --bin voice-elf-server

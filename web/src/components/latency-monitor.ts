@@ -37,7 +37,7 @@ export class LatencyMonitor {
         <li data-stage="vad"><span class="stage-icon"><i data-lucide="activity"></i></span><div><strong>VAD</strong><small>语音端点</small></div><output>--</output></li>
         <li data-stage="stt"><span class="stage-icon"><i data-lucide="mic"></i></span><div><strong>STT</strong><small>Qwen ASR</small></div><output>--</output></li>
         <li data-stage="translation"><span class="stage-icon"><i data-lucide="sparkles"></i></span><div><strong>翻译</strong><small>Local LLM</small></div><output>--</output></li>
-        <li data-stage="tts"><span class="stage-icon"><i data-lucide="volume-2"></i></span><div><strong>TTS</strong><small>Kokoro / Supertonic</small></div><output>--</output></li>
+        <li data-stage="tts"><span class="stage-icon"><i data-lucide="volume-2"></i></span><div><strong>TTS</strong><small>MOSS Nano / fallback</small></div><output>--</output></li>
       </ol>
       <div class="session-stats">
         <div><i data-lucide="clock-3"></i><span>音频时长</span><strong class="audio-duration">0.0s</strong></div>

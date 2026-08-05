@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
+    audio::{SpeechQuality, VoiceAudioProcessor},
     backends::AppServices,
     media::MediaStore,
     protocol::{
@@ -26,14 +27,17 @@ use super::{
 const CLIENT_FRAME_SAMPLES: usize = 512;
 const CLIENT_PRE_ROLL_SAMPLES: usize = CLIENT_FRAME_SAMPLES * 32;
 const MIN_CLIENT_UTTERANCE_SAMPLES: usize = INPUT_SAMPLE_RATE as usize / 5;
-const MIN_CLIENT_SPEECH_FRAMES: usize = 6;
+const MIN_CLIENT_SPEECH_FRAMES: usize = 10;
 
 struct ActiveSegment {
     tc_id: Uuid,
     config: SessionConfig,
-    live: LiveUtterance,
+    started: SpeechStart,
+    live: Option<LiveUtterance>,
     wall_started: Instant,
     audio: Vec<i16>,
+    audio_processor: VoiceAudioProcessor,
+    quality: SpeechQuality,
     speakers: Vec<SpeakerIdentity>,
 }
 
@@ -161,16 +165,15 @@ pub async fn run_pipeline(
                         .await
                         .context("failed to update persisted segment config")?;
                 }
-                let started = SpeechStart::now();
-                let live = workers
-                    .begin_live(tc_id, started, &segment_config, &output)
-                    .await?;
                 active_segment = Some(ActiveSegment {
                     tc_id,
                     config: segment_config,
-                    live,
+                    started: SpeechStart::now(),
+                    live: None,
                     wall_started: Instant::now(),
                     audio: Vec::new(),
+                    audio_processor: VoiceAudioProcessor::new(INPUT_SAMPLE_RATE),
+                    quality: SpeechQuality::default(),
                     speakers: Vec::new(),
                 });
                 send_event(
@@ -313,10 +316,22 @@ pub async fn run_pipeline(
                     + CLIENT_PRE_ROLL_SAMPLES
                     + CLIENT_FRAME_SAMPLES;
                 let remaining = hard_limit.saturating_sub(segment.audio.len());
-                let accepted = &frame[..frame.len().min(remaining)];
-                segment.audio.extend_from_slice(accepted);
-                if let Err(error) = segment.live.push(accepted) {
-                    tracing::warn!(%error, tc_id = %segment.tc_id, "live ASR stopped while receiving audio");
+                let mut accepted = frame[..frame.len().min(remaining)].to_vec();
+                segment.audio_processor.process(&mut accepted);
+                segment.audio.extend_from_slice(&accepted);
+                segment.quality.observe(&accepted);
+                if let Some(live) = &segment.live {
+                    if let Err(error) = live.push(&accepted) {
+                        tracing::warn!(%error, tc_id = %segment.tc_id, "live ASR stopped while receiving audio");
+                    }
+                } else if segment.quality.accepts_asr() {
+                    let live = workers
+                        .begin_live(segment.tc_id, segment.started, &segment.config, &output)
+                        .await?;
+                    if let Err(error) = live.push(&segment.audio) {
+                        tracing::warn!(%error, tc_id = %segment.tc_id, "live ASR stopped while releasing validated audio");
+                    }
+                    segment.live = Some(live);
                 }
 
                 if segment.audio.len() >= hard_limit {
@@ -398,17 +413,37 @@ async fn finish_segment(
     segment: ActiveSegment,
     is_silent_vad: bool,
 ) -> Result<bool> {
-    if is_silent_vad || segment.audio.len() < MIN_CLIENT_UTTERANCE_SAMPLES {
+    if is_silent_vad
+        || segment.audio.len() < MIN_CLIENT_UTTERANCE_SAMPLES
+        || !segment.quality.accepts_asr()
+    {
         let reason = if is_silent_vad {
             "VAD 判定为静音，分段未进入识别"
-        } else {
+        } else if segment.audio.len() < MIN_CLIENT_UTTERANCE_SAMPLES {
             "有效语音不足 200ms，分段未进入识别"
+        } else {
+            tracing::info!(
+                tc_id = %segment.tc_id,
+                quality = %segment.quality.summary(),
+                "discarding inaudible or noise-only utterance"
+            );
+            "声音过小或疑似噪音，分段未进入识别"
         };
         discard_segment(output, segment.tc_id, reason).await?;
         return Ok(false);
     }
+    let live = match segment.live {
+        Some(live) => live,
+        None => {
+            let live = workers
+                .begin_live(segment.tc_id, segment.started, &segment.config, output)
+                .await?;
+            live.push(&segment.audio)?;
+            live
+        }
+    };
     workers
-        .finish_live(segment.audio, segment.live, segment.speakers)
+        .finish_live(segment.audio, live, segment.speakers)
         .await?;
     Ok(true)
 }
@@ -478,6 +513,19 @@ mod tests {
 
     use super::*;
 
+    fn audible_frame_bytes(frame_index: usize) -> Vec<u8> {
+        (0..CLIENT_FRAME_SAMPLES)
+            .flat_map(|sample_index| {
+                let phase = (frame_index * CLIENT_FRAME_SAMPLES + sample_index) as f32
+                    * 2.0
+                    * std::f32::consts::PI
+                    * 220.0
+                    / INPUT_SAMPLE_RATE as f32;
+                ((phase.sin() * 1_200.0) as i16).to_le_bytes()
+            })
+            .collect()
+    }
+
     #[test]
     fn web_vad_frames_must_be_exactly_thirty_two_milliseconds() {
         assert_eq!(decode_web_vad_frame(&vec![0; 1_024]).unwrap().len(), 512);
@@ -510,6 +558,7 @@ mod tests {
             .unwrap();
         let services = Arc::new(AppServices {
             transcriber: Arc::new(DemoTranscriber::new()),
+            refinement_engines: Vec::new(),
             translator: Arc::new(DemoTranslator::new()),
             synthesizer: Arc::new(DemoSynthesizer::new()),
             backend_name: "demo",
@@ -542,11 +591,9 @@ mod tests {
             }))
             .await
             .unwrap();
-        for _ in 0..20 {
+        for frame_index in 0..20 {
             input_tx
-                .send(PipelineInput::Audio(
-                    vec![0xe8, 0x03].repeat(CLIENT_FRAME_SAMPLES),
-                ))
+                .send(PipelineInput::Audio(audible_frame_bytes(frame_index)))
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -645,6 +692,7 @@ mod tests {
             .unwrap();
         let services = Arc::new(AppServices {
             transcriber: Arc::new(DemoTranscriber::new()),
+            refinement_engines: Vec::new(),
             translator: Arc::new(DemoTranslator::new()),
             synthesizer: Arc::new(DemoSynthesizer::new()),
             backend_name: "demo",
@@ -678,11 +726,9 @@ mod tests {
                 }))
                 .await
                 .unwrap();
-            for _ in 0..20 {
+            for frame_index in 0..20 {
                 input_tx
-                    .send(PipelineInput::Audio(
-                        vec![0xe8, 0x03].repeat(CLIENT_FRAME_SAMPLES),
-                    ))
+                    .send(PipelineInput::Audio(audible_frame_bytes(frame_index)))
                     .await
                     .unwrap();
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -763,6 +809,7 @@ mod tests {
             .unwrap();
         let services = Arc::new(AppServices {
             transcriber: Arc::new(DemoTranscriber::new()),
+            refinement_engines: Vec::new(),
             translator: Arc::new(DemoTranslator::new()),
             synthesizer: Arc::new(DemoSynthesizer::new()),
             backend_name: "demo",
@@ -815,5 +862,95 @@ mod tests {
         );
         assert!(!event_types.iter().any(|event| event == "media"));
         assert!(!event_types.iter().any(|event| event == "transcript"));
+    }
+
+    #[tokio::test]
+    async fn discards_inaudible_audio_even_when_the_client_marks_it_as_speech() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = MediaStore::new(directory.path().join("media"))
+            .await
+            .unwrap();
+        let services = Arc::new(AppServices {
+            transcriber: Arc::new(DemoTranscriber::new()),
+            refinement_engines: Vec::new(),
+            translator: Arc::new(DemoTranslator::new()),
+            synthesizer: Arc::new(DemoSynthesizer::new()),
+            backend_name: "demo",
+        });
+        let (input_tx, input_rx) = mpsc::channel(64);
+        let (output_tx, mut output_rx) = mpsc::channel(128);
+        let tc_id = Uuid::new_v4();
+        let pipeline = tokio::spawn(run_pipeline(
+            services,
+            None,
+            media,
+            PipelineIdentity {
+                user_id: Uuid::new_v4(),
+                room_id: Uuid::new_v4(),
+            },
+            input_rx,
+            output_tx,
+        ));
+
+        input_tx
+            .send(PipelineInput::Event(ClientEvent::Start {
+                tc_id,
+                vad: None,
+                config: SessionConfig::default(),
+            }))
+            .await
+            .unwrap();
+        for frame_index in 0..20 {
+            let bytes = (0..CLIENT_FRAME_SAMPLES)
+                .flat_map(|sample_index| {
+                    let phase = (frame_index * CLIENT_FRAME_SAMPLES + sample_index) as f32
+                        * 2.0
+                        * std::f32::consts::PI
+                        * 220.0
+                        / INPUT_SAMPLE_RATE as f32;
+                    ((phase.sin() * 250.0) as i16).to_le_bytes()
+                })
+                .collect();
+            input_tx.send(PipelineInput::Audio(bytes)).await.unwrap();
+        }
+        input_tx
+            .send(PipelineInput::Event(ClientEvent::End {
+                tc_id,
+                is_silent_vad: false,
+                vad: Some(ClientVadEnd {
+                    reason: VadEndReason::Silence,
+                    sample_count: 20 * CLIENT_FRAME_SAMPLES,
+                    speech_frames: Some(20),
+                }),
+            }))
+            .await
+            .unwrap();
+        drop(input_tx);
+        pipeline.await.unwrap().unwrap();
+
+        let mut event_types = Vec::new();
+        let mut discard_reason = None;
+        while let Some(Message::Text(text)) = output_rx.recv().await {
+            let event: Value = serde_json::from_str(&text).unwrap();
+            if event["type"] == "utterance_discarded" {
+                discard_reason = event["reason"].as_str().map(str::to_owned);
+            }
+            if let Some(event_type) = event["type"].as_str() {
+                event_types.push(event_type.to_owned());
+            }
+        }
+        assert_eq!(
+            discard_reason.as_deref(),
+            Some("声音过小或疑似噪音，分段未进入识别")
+        );
+        for rejected_event in [
+            "utterance_queued",
+            "transcript_delta",
+            "transcript",
+            "translation",
+            "media",
+        ] {
+            assert!(!event_types.iter().any(|event| event == rejected_event));
+        }
     }
 }

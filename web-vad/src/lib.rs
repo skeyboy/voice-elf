@@ -35,11 +35,12 @@ const ENERGY_HANGOVER_FRAMES: u16 = 6;
 // for the same input, so this threshold is calibrated against the final WASM.
 const SPEECH_THRESHOLD: f32 = 0.03;
 const START_LEVEL_THRESHOLD: f32 = 0.005;
-const ENHANCED_START_LEVEL_THRESHOLD: f32 = 0.008;
+const ENHANCED_START_LEVEL_THRESHOLD: f32 = 0.012;
 const ACTIVE_LEVEL_THRESHOLD: f32 = 0.008;
 const INITIAL_NOISE_FLOOR: f32 = 0.002;
 const MAX_NOISE_FLOOR: f32 = 0.012;
 const START_SIGNAL_TO_NOISE: f32 = 1.35;
+const ENHANCED_START_SIGNAL_TO_NOISE: f32 = 1.8;
 const ACTIVE_SIGNAL_TO_NOISE: f32 = 1.2;
 // Broadband noise crosses zero far more often than conversational speech. Keep
 // this deliberately loose so fricatives still pass when Silero confirms them.
@@ -298,7 +299,12 @@ impl BrowserAudioVad {
         } else {
             START_LEVEL_THRESHOLD
         };
-        let start_level = configured_start_level.max(self.noise_floor * START_SIGNAL_TO_NOISE);
+        let signal_to_noise = if self.enhanced_voice_filter {
+            ENHANCED_START_SIGNAL_TO_NOISE
+        } else {
+            START_SIGNAL_TO_NOISE
+        };
+        let start_level = configured_start_level.max(self.noise_floor * signal_to_noise);
         let active_level = ACTIVE_LEVEL_THRESHOLD.max(self.noise_floor * ACTIVE_SIGNAL_TO_NOISE);
         let model_voiced = (probability >= SPEECH_THRESHOLD || acoustic_override)
             && level >= start_level
@@ -830,8 +836,7 @@ mod tests {
     #[test]
     fn enhanced_filter_ignores_quiet_false_starts() {
         let mut vad = BrowserAudioVad::new(20, 16_000, true).unwrap();
-        let (voiced, model_voiced) =
-            vad.classify_voiced(SPEECH_THRESHOLD + 0.5, 0.006, true, false);
+        let (voiced, model_voiced) = vad.classify_voiced(SPEECH_THRESHOLD + 0.5, 0.01, true, false);
         assert!(!voiced);
         assert!(!model_voiced);
     }

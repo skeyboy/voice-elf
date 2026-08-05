@@ -39,8 +39,9 @@ sequenceDiagram
         Push-->>Web: 实时更新原文和译文
         Push-->>Members: 同步原文和译文
         Queue->>Push: 原声 URL
-        Queue->>TTS: 异步 Kokoro(zh) / Supertonic(其他语言)
-        TTS-->>Push: 译声 URL + PCM 音频流
+        Queue->>TTS: 可插拔 TtsEngine 链
+        TTS->>TTS: MOSS Nano ONNX 流式生成，失败时回退
+        TTS-->>Push: 译声 URL + 带格式元数据的 PCM 音频流
         Push-->>Web: 固化字幕并提供播放
         Push-->>Members: 同步媒体 URL 与译声流
     end
@@ -71,7 +72,7 @@ Qwen ASR 不迁移到浏览器：
 3. 服务端需要集中保护模型、调度推理，并产生可信的用户、房间、WAV 和转写记录。
 4. 端侧 VAD 已减少静音带宽和服务端逐帧计算；迁移 ASR 的收益与成本不匹配。
 
-TTS 同样由服务端统一执行。中文使用 Kokoro INT8，其余配置语言使用 Supertonic 3 INT8；译声在服务端落盘并通过 WebSocket PCM 流和受保护媒体 URL 同时交付。
+TTS 同样由服务端统一执行。业务流水线只依赖 `TtsEngine` trait：默认尝试 MOSS-TTS-Nano ONNX，首个音频块产生前失败时，中文回退到 Kokoro INT8，其余配置语言回退到 Supertonic 3 INT8。音频块产生后立即通过 WebSocket 交付；完成后按引擎实际采样率和声道数落盘，并发布受保护媒体 URL。
 
 ## 房间实时同步
 

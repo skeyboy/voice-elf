@@ -1,4 +1,5 @@
 mod asr;
+mod moss;
 mod translator;
 mod tts;
 
@@ -12,15 +13,29 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use crate::config::{AppConfig, BackendMode};
 
 pub use asr::{DemoTranscriber, NoSpeechDetected, QwenAsrTranscriber};
+pub use moss::MossTranscribeEngine;
 pub use translator::{DemoTranslator, LlamaCppTranslator, LocalLlmTranslator};
 #[cfg(test)]
 pub use tts::DemoSynthesizer;
-pub use tts::{SherpaOnnxSynthesizer, Synthesizer};
+pub use tts::{TtsChunkSink, TtsEngine, TtsRequest, build_tts_engine};
+
+pub use crate::protocol::TranscriptionSegment;
 
 #[derive(Clone, Debug)]
 pub struct Transcription {
     pub text: String,
     pub language: String,
+    pub segments: Vec<TranscriptionSegment>,
+}
+
+impl Transcription {
+    pub fn plain(text: impl Into<String>, language: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            language: language.into(),
+            segments: Vec::new(),
+        }
+    }
 }
 
 pub struct LiveTranscription {
@@ -66,7 +81,18 @@ impl Drop for LiveTranscription {
 }
 
 #[async_trait]
-pub trait Transcriber: Send + Sync {
+pub trait CompletedTranscriptionEngine: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    async fn transcribe_completed(
+        &self,
+        pcm: &[i16],
+        source_language: &str,
+    ) -> Result<Transcription>;
+}
+
+#[async_trait]
+pub trait Transcriber: CompletedTranscriptionEngine {
     async fn start_live(
         &self,
         _source_language: &str,
@@ -81,15 +107,6 @@ pub trait Transcriber: Send + Sync {
         source_language: &str,
         updates: mpsc::UnboundedSender<String>,
     ) -> Result<Transcription>;
-
-    async fn refine_transcription(
-        &self,
-        _pcm: &[i16],
-        _source_language: &str,
-        primary: Transcription,
-    ) -> Result<Transcription> {
-        Ok(primary)
-    }
 }
 
 pub struct MultiChannelTranscriber {
@@ -102,6 +119,43 @@ impl MultiChannelTranscriber {
             bail!("at least one ASR channel is required");
         }
         Ok(Self { channels })
+    }
+}
+
+#[async_trait]
+impl CompletedTranscriptionEngine for MultiChannelTranscriber {
+    fn name(&self) -> &'static str {
+        "multi-channel"
+    }
+
+    async fn transcribe_completed(
+        &self,
+        pcm: &[i16],
+        source_language: &str,
+    ) -> Result<Transcription> {
+        let calls = self.channels.iter().map(|(name, transcriber)| async move {
+            (
+                *name,
+                transcriber.transcribe_completed(pcm, source_language).await,
+            )
+        });
+        let mut candidates = Vec::new();
+        let mut failures = Vec::new();
+        for (name, result) in join_all(calls).await {
+            match result {
+                Ok(transcription) if !transcription.text.trim().is_empty() => {
+                    candidates.push(transcription);
+                }
+                Ok(_) => failures.push(format!("{name}: empty transcript")),
+                Err(error) => {
+                    tracing::warn!(channel = name, %error, "ASR channel failed");
+                    failures.push(format!("{name}: {error}"));
+                }
+            }
+        }
+        select_consensus(&candidates)
+            .cloned()
+            .ok_or_else(|| anyhow!("all ASR channels failed: {}", failures.join("; ")))
     }
 }
 
@@ -124,77 +178,9 @@ impl Transcriber for MultiChannelTranscriber {
         source_language: &str,
         updates: mpsc::UnboundedSender<String>,
     ) -> Result<Transcription> {
-        let calls = self
-            .channels
-            .iter()
-            .enumerate()
-            .map(|(index, (name, transcriber))| {
-                let channel_updates = if index == 0 {
-                    updates.clone()
-                } else {
-                    mpsc::unbounded_channel().0
-                };
-                async move {
-                    (
-                        *name,
-                        transcriber
-                            .transcribe_streaming(pcm, source_language, channel_updates)
-                            .await,
-                    )
-                }
-            });
-        let mut candidates = Vec::new();
-        let mut failures = Vec::new();
-        for (name, result) in join_all(calls).await {
-            match result {
-                Ok(transcription) if !transcription.text.trim().is_empty() => {
-                    candidates.push(transcription);
-                }
-                Ok(_) => failures.push(format!("{name}: empty transcript")),
-                Err(error) => {
-                    tracing::warn!(channel = name, %error, "ASR channel failed");
-                    failures.push(format!("{name}: {error}"));
-                }
-            }
-        }
-        select_consensus(&candidates)
-            .cloned()
-            .ok_or_else(|| anyhow!("all ASR channels failed: {}", failures.join("; ")))
-    }
-
-    async fn refine_transcription(
-        &self,
-        pcm: &[i16],
-        source_language: &str,
-        primary: Transcription,
-    ) -> Result<Transcription> {
-        if self.channels.len() == 1 {
-            return Ok(primary);
-        }
-        let calls = self.channels.iter().skip(1).map(|(name, transcriber)| {
-            let updates = mpsc::unbounded_channel().0;
-            async move {
-                (
-                    *name,
-                    transcriber
-                        .transcribe_streaming(pcm, source_language, updates)
-                        .await,
-                )
-            }
-        });
-        let mut candidates = vec![primary];
-        for (name, result) in join_all(calls).await {
-            match result {
-                Ok(transcription) if !transcription.text.trim().is_empty() => {
-                    candidates.push(transcription);
-                }
-                Ok(_) => tracing::warn!(channel = name, "ASR refinement returned empty text"),
-                Err(error) => tracing::warn!(channel = name, %error, "ASR refinement failed"),
-            }
-        }
-        Ok(select_consensus(&candidates)
-            .cloned()
-            .expect("the primary ASR result is always present"))
+        let transcription = self.transcribe_completed(pcm, source_language).await?;
+        let _ = updates.send(transcription.text.clone());
+        Ok(transcription)
     }
 }
 
@@ -230,22 +216,31 @@ pub trait Translator: Send + Sync {
 #[derive(Clone)]
 pub struct AppServices {
     pub transcriber: Arc<dyn Transcriber>,
+    pub refinement_engines: Vec<Arc<dyn CompletedTranscriptionEngine>>,
     pub translator: Arc<dyn Translator>,
-    pub synthesizer: Arc<dyn Synthesizer>,
+    pub synthesizer: Arc<dyn TtsEngine>,
     pub backend_name: &'static str,
 }
 
 impl AppServices {
     pub fn from_config(config: &AppConfig) -> Result<Self> {
         config.validate_local()?;
-        let synthesizer: Arc<dyn Synthesizer> =
-            Arc::new(SherpaOnnxSynthesizer::new(config.tts.clone())?);
+        let refinement_engines: Vec<Arc<dyn CompletedTranscriptionEngine>> =
+            if config.moss_transcribe.enabled {
+                vec![Arc::new(MossTranscribeEngine::new(
+                    config.moss_transcribe.clone(),
+                )?)]
+            } else {
+                Vec::new()
+            };
+        let synthesizer = build_tts_engine(&config.tts)?;
         match config.backend_mode {
             BackendMode::Demo => Ok(Self {
                 transcriber: Arc::new(MultiChannelTranscriber::new(vec![(
                     "demo",
                     Arc::new(DemoTranscriber::new()),
                 )])?),
+                refinement_engines,
                 translator: Arc::new(DemoTranslator::new()),
                 synthesizer,
                 backend_name: "demo",
@@ -270,6 +265,7 @@ impl AppServices {
                             config.inference_timeout,
                         )?),
                     )])?),
+                    refinement_engines,
                     translator,
                     synthesizer,
                     backend_name: "local",
@@ -286,18 +282,9 @@ mod tests {
     #[test]
     fn consensus_prefers_matching_channels_over_a_longer_outlier() {
         let candidates = vec![
-            Transcription {
-                text: "hello world".to_owned(),
-                language: "en".to_owned(),
-            },
-            Transcription {
-                text: "Hello, world!".to_owned(),
-                language: "en".to_owned(),
-            },
-            Transcription {
-                text: "hello wonderful world".to_owned(),
-                language: "en".to_owned(),
-            },
+            Transcription::plain("hello world", "en"),
+            Transcription::plain("Hello, world!", "en"),
+            Transcription::plain("hello wonderful world", "en"),
         ];
         assert_eq!(select_consensus(&candidates).unwrap().text, "Hello, world!");
     }

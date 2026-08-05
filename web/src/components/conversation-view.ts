@@ -143,6 +143,18 @@ export class ConversationView {
         if (utterance.status === 'completed') {
           this.updateItemLatency(utterance.id, utterance.latency.total_ms);
         }
+        (utterance.refinements ?? []).forEach((refinement) => {
+          this.applyRefinement({
+            type: 'transcript_refinement',
+            utterance_id: utterance.id,
+            engine: refinement.engine,
+            status: refinement.status === 'interrupted' ? 'failed' : refinement.status,
+            text: refinement.text || null,
+            language: refinement.language || null,
+            segments: refinement.segments,
+            message: refinement.processing_error,
+          });
+        });
       });
   }
 
@@ -194,6 +206,7 @@ export class ConversationView {
             <span class="source-content"></span>
             <span class="recognition-status" role="status" hidden><i data-lucide="loader-circle"></i><span>识别中</span></span>
           </p>
+          <div class="refinement-slot" aria-live="polite"></div>
           <div class="source-media media-slot" aria-label="原声音频"></div>
         </div>
         <div class="translation-line pending">
@@ -277,6 +290,38 @@ export class ConversationView {
         translation.textContent = '正在实时翻译';
       }
     }
+    this.followIfEnabled();
+  }
+
+  applyRefinement(event: Extract<ServerEvent, { type: 'transcript_refinement' }>) {
+    const article = this.rows.get(event.utterance_id);
+    const slot = article?.querySelector<HTMLElement>('.refinement-slot');
+    if (!article || !slot) return;
+    let item = Array.from(slot.querySelectorAll<HTMLElement>('.refinement-result')).find(
+      (candidate) => candidate.dataset.engine === event.engine,
+    );
+    if (!item) {
+      item = document.createElement('div');
+      item.className = 'refinement-result';
+      item.dataset.engine = event.engine;
+      item.innerHTML = `
+        <span class="refinement-icon"><i data-lucide="scan-text"></i></span>
+        <div><small></small><p></p></div>
+      `;
+      slot.append(item);
+    }
+    item.classList.toggle('processing', event.status === 'processing');
+    item.classList.toggle('failed', event.status === 'failed');
+    item.querySelector('small')!.textContent = `会后精识别 · ${refinementEngineLabel(event.engine)}`;
+    item.querySelector('p')!.textContent =
+      event.status === 'processing'
+        ? '处理中'
+        : event.status === 'failed'
+          ? event.message || '精识别未完成，已保留实时识别结果'
+          : event.text || '未返回文字';
+    const icon = item.querySelector<HTMLElement>('.refinement-icon')!;
+    icon.innerHTML = `<i data-lucide="${event.status === 'processing' ? 'loader-circle' : event.status === 'failed' ? 'circle-alert' : 'badge-check'}"></i>`;
+    refreshIcons(item);
     this.followIfEnabled();
   }
 
@@ -617,4 +662,8 @@ function formatTimestamp(value?: string) {
 function formatMediaTime(seconds: number) {
   const safe = Math.max(0, Math.floor(Number.isFinite(seconds) ? seconds : 0));
   return `${Math.floor(safe / 60)}:${String(safe % 60).padStart(2, '0')}`;
+}
+
+function refinementEngineLabel(engine: string) {
+  return engine === 'moss-transcribe-diarize' ? 'MOSS' : engine;
 }

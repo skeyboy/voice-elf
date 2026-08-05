@@ -6,6 +6,7 @@ import {
   type RoomMemberState,
   type RoomSummary,
 } from '../api';
+import { loadAppConfig } from '../app-config';
 import { PcmPlayer } from '../audio';
 import { ConversationView } from '../components/conversation-view';
 import { LanguageDialog } from '../components/language-dialog';
@@ -16,7 +17,7 @@ import type { ConnectionStatus } from '../components/topbar';
 import { VoiceSession } from '../controllers/voice-session';
 import type { PipelinePhase, ServerEvent, SessionConfig } from '../protocol';
 import { languageNames } from '../shared/languages';
-import { loadPreferences } from '../shared/preferences';
+import { loadPreferences, subscribePreferences } from '../shared/preferences';
 import type { Page } from './page';
 
 export class TranslatorPage implements Page {
@@ -41,6 +42,8 @@ export class TranslatorPage implements Page {
   private members: RoomMemberState[] = [];
   private canPublish = false;
   private connectionStatus: ConnectionStatus = 'offline';
+  private isAppShell = false;
+  private unsubscribePreferences = () => {};
 
   constructor(
     private readonly userId: string,
@@ -62,6 +65,9 @@ export class TranslatorPage implements Page {
       return;
     }
     this.room = detail.room;
+    void loadAppConfig().then((config) => {
+      this.isAppShell = Boolean(config);
+    });
     this.members = detail.members;
     const currentMember = detail.members.find((member) => member.user_id === this.userId);
     this.canPublish = detail.room.is_owner || Boolean(currentMember && !currentMember.is_muted);
@@ -110,11 +116,19 @@ export class TranslatorPage implements Page {
           ),
       },
     );
+    this.unsubscribePreferences = subscribePreferences(this.userId, (next) => {
+      this.voice = next.voice;
+      this.enhancedVoiceFilter = next.enhancedVoiceFilter;
+      this.player.muted = !next.autoplay;
+      this.voiceSession?.sendConfig();
+    });
     this.voiceSession.connect();
   }
 
   async destroy() {
     window.clearInterval(this.timer);
+    this.unsubscribePreferences();
+    this.unsubscribePreferences = () => {};
     await this.voiceSession?.destroy();
     this.voiceSession = null;
     this.conversation?.destroy();
@@ -156,9 +170,12 @@ export class TranslatorPage implements Page {
           <form class="record-search">
             <i data-lucide="search"></i><input type="search" placeholder="检索转写或翻译记录" aria-label="检索房间记录"><button type="submit">检索</button>
           </form>
-          <div class="room-owner-actions" ${room.is_owner ? '' : 'hidden'}>
-            <button class="icon-button edit-room" type="button" title="编辑房间" aria-label="编辑房间"><i data-lucide="settings"></i></button>
-            <button class="icon-button danger delete-room" type="button" title="删除房间" aria-label="删除房间"><i data-lucide="trash-2"></i></button>
+          <div class="room-display-actions">
+            <button class="icon-button open-subtitles" type="button" title="打开字幕大屏" aria-label="打开字幕大屏"><i data-lucide="captions"></i></button>
+            <div class="room-owner-actions" ${room.is_owner ? '' : 'hidden'}>
+              <button class="icon-button edit-room" type="button" title="编辑房间" aria-label="编辑房间"><i data-lucide="settings"></i></button>
+              <button class="icon-button danger delete-room" type="button" title="删除房间" aria-label="删除房间"><i data-lucide="trash-2"></i></button>
+            </div>
           </div>
         </section>
 
@@ -205,6 +222,9 @@ export class TranslatorPage implements Page {
       this.languageDialog?.open(this.sourceLanguage, this.targetLanguage),
     );
     this.root.querySelector('.refresh-history')?.addEventListener('click', () => void this.loadHistory());
+    this.root.querySelector('.open-subtitles')?.addEventListener('click', () =>
+      void this.openSubtitleDisplay(),
+    );
     this.root.querySelector<HTMLFormElement>('.record-search')?.addEventListener('submit', (event) => {
       event.preventDefault();
       void this.loadHistory(this.root?.querySelector<HTMLInputElement>('.record-search input')?.value ?? '');
@@ -293,6 +313,9 @@ export class TranslatorPage implements Page {
         break;
       case 'transcript_delta':
         this.conversation?.applyTranscriptDelta(event);
+        break;
+      case 'transcript_refinement':
+        this.conversation?.applyRefinement(event);
         break;
       case 'translation_delta':
         this.conversation?.applyTranslationDelta(event);
@@ -400,6 +423,33 @@ export class TranslatorPage implements Page {
     this.maxUtteranceSeconds = this.room.max_utterance_seconds;
     this.updateLanguageButton();
     this.voiceSession?.sendConfig();
+  }
+
+  private async openSubtitleDisplay() {
+    const path = `/rooms/${this.roomId}/subtitles`;
+    if (!this.isAppShell) {
+      const display = window.open(
+        path,
+        `voice-elf-subtitles-${this.roomId}`,
+        'popup,width=1100,height=460,resizable=yes',
+      );
+      if (!display) this.onError('浏览器阻止了字幕窗口，请允许本站打开弹窗');
+      else display.focus();
+      return;
+    }
+    try {
+      const response = await fetch('/__voice_elf/subtitle-window', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ room_id: this.roomId }),
+      });
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(payload?.error ?? '无法创建字幕悬浮窗');
+      }
+    } catch (error) {
+      this.onError(error instanceof Error ? error.message : '无法创建字幕悬浮窗');
+    }
   }
 
   private async loadHistory(search = '') {

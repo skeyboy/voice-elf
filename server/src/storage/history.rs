@@ -11,8 +11,11 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
-    protocol::{LatencyReport, SpeakerIdentity},
-    schema::{rooms, voice_sessions, voice_utterance_speakers, voice_utterances},
+    protocol::{LatencyReport, SpeakerIdentity, TranscriptionSegment},
+    schema::{
+        rooms, voice_sessions, voice_utterance_refinements, voice_utterance_speakers,
+        voice_utterances,
+    },
 };
 
 use super::Database;
@@ -49,6 +52,14 @@ pub struct UtteranceAudioUpdate<'a> {
     pub translated_audio_path: &'a str,
     pub translated_audio_url: &'a str,
     pub latency: &'a LatencyReport,
+}
+
+pub struct RefinementUpdate<'a> {
+    pub utterance_id: Uuid,
+    pub engine: &'a str,
+    pub text: &'a str,
+    pub language: &'a str,
+    pub segments: &'a [TranscriptionSegment],
 }
 
 #[derive(Insertable)]
@@ -90,12 +101,39 @@ struct UtteranceSpeakerRow<'a> {
     username: &'a str,
 }
 
+#[derive(Insertable)]
+#[diesel(table_name = voice_utterance_refinements)]
+struct RefinementRow<'a> {
+    id: Uuid,
+    utterance_id: Uuid,
+    engine: &'a str,
+    text: &'a str,
+    language: &'a str,
+    segments_json: &'a str,
+    status: &'a str,
+    processing_error: Option<&'a str>,
+}
+
 #[derive(diesel::Queryable, diesel::Selectable)]
 #[diesel(table_name = voice_utterance_speakers)]
 struct UtteranceSpeakerHistoryRow {
     utterance_id: Uuid,
     user_id: Option<Uuid>,
     username: String,
+}
+
+#[derive(diesel::Queryable, diesel::Selectable)]
+#[diesel(table_name = voice_utterance_refinements)]
+struct RefinementHistoryRow {
+    utterance_id: Uuid,
+    engine: String,
+    text: String,
+    language: String,
+    segments_json: String,
+    status: String,
+    processing_error: Option<String>,
+    created_at: DateTime<Utc>,
+    completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(diesel::Queryable, diesel::Selectable)]
@@ -138,6 +176,19 @@ pub struct UtteranceHistory {
     pub created_at: DateTime<Utc>,
     pub latency: LatencyReport,
     pub speakers: Vec<SpeakerIdentity>,
+    pub refinements: Vec<UtteranceRefinement>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UtteranceRefinement {
+    pub engine: String,
+    pub text: String,
+    pub language: String,
+    pub segments: Vec<TranscriptionSegment>,
+    pub status: String,
+    pub processing_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 impl Database {
@@ -177,6 +228,17 @@ impl Database {
             .set(voice_sessions::ended_at.eq(diesel::dsl::now))
             .execute(&mut connection)
             .await?;
+        diesel::update(
+            voice_utterance_refinements::table
+                .filter(voice_utterance_refinements::status.eq("processing")),
+        )
+        .set((
+            voice_utterance_refinements::status.eq("interrupted"),
+            voice_utterance_refinements::processing_error
+                .eq(Some("Server restarted before refinement completed")),
+        ))
+        .execute(&mut connection)
+        .await?;
         Ok(updated)
     }
 
@@ -354,6 +416,81 @@ impl Database {
         Ok(())
     }
 
+    pub async fn start_utterance_refinement(&self, utterance_id: Uuid, engine: &str) -> Result<()> {
+        let row = RefinementRow {
+            id: Uuid::new_v4(),
+            utterance_id,
+            engine,
+            text: "",
+            language: "auto",
+            segments_json: "[]",
+            status: "processing",
+            processing_error: None,
+        };
+        let mut connection = self.pool.get().await?;
+        diesel::insert_into(voice_utterance_refinements::table)
+            .values(row)
+            .on_conflict((
+                voice_utterance_refinements::utterance_id,
+                voice_utterance_refinements::engine,
+            ))
+            .do_update()
+            .set((
+                voice_utterance_refinements::text.eq(""),
+                voice_utterance_refinements::language.eq("auto"),
+                voice_utterance_refinements::segments_json.eq("[]"),
+                voice_utterance_refinements::status.eq("processing"),
+                voice_utterance_refinements::processing_error.eq(None::<String>),
+                voice_utterance_refinements::completed_at.eq(None::<DateTime<Utc>>),
+            ))
+            .execute(&mut connection)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn save_utterance_refinement(&self, update: RefinementUpdate<'_>) -> Result<()> {
+        let segments_json = serde_json::to_string(update.segments)?;
+        let mut connection = self.pool.get().await?;
+        diesel::update(
+            voice_utterance_refinements::table
+                .filter(voice_utterance_refinements::utterance_id.eq(update.utterance_id))
+                .filter(voice_utterance_refinements::engine.eq(update.engine)),
+        )
+        .set((
+            voice_utterance_refinements::text.eq(update.text),
+            voice_utterance_refinements::language.eq(update.language),
+            voice_utterance_refinements::segments_json.eq(segments_json),
+            voice_utterance_refinements::status.eq("completed"),
+            voice_utterance_refinements::processing_error.eq(None::<String>),
+            voice_utterance_refinements::completed_at.eq(diesel::dsl::now),
+        ))
+        .execute(&mut connection)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn fail_utterance_refinement(
+        &self,
+        utterance_id: Uuid,
+        engine: &str,
+        error: &str,
+    ) -> Result<()> {
+        let mut connection = self.pool.get().await?;
+        diesel::update(
+            voice_utterance_refinements::table
+                .filter(voice_utterance_refinements::utterance_id.eq(utterance_id))
+                .filter(voice_utterance_refinements::engine.eq(engine)),
+        )
+        .set((
+            voice_utterance_refinements::status.eq("failed"),
+            voice_utterance_refinements::processing_error.eq(Some(error)),
+            voice_utterance_refinements::completed_at.eq(diesel::dsl::now),
+        ))
+        .execute(&mut connection)
+        .await?;
+        Ok(())
+    }
+
     pub async fn list_utterances(
         &self,
         room_id: Uuid,
@@ -398,12 +535,39 @@ impl Database {
                     username: speaker.username,
                 });
         }
+        let refinement_rows = if utterance_ids.is_empty() {
+            Vec::new()
+        } else {
+            voice_utterance_refinements::table
+                .filter(voice_utterance_refinements::utterance_id.eq_any(&utterance_ids))
+                .order(voice_utterance_refinements::created_at.asc())
+                .select(RefinementHistoryRow::as_select())
+                .load(&mut connection)
+                .await?
+        };
+        let mut refinements_by_utterance = HashMap::<Uuid, Vec<UtteranceRefinement>>::new();
+        for refinement in refinement_rows {
+            refinements_by_utterance
+                .entry(refinement.utterance_id)
+                .or_default()
+                .push(UtteranceRefinement {
+                    engine: refinement.engine,
+                    text: refinement.text,
+                    language: refinement.language,
+                    segments: serde_json::from_str(&refinement.segments_json).unwrap_or_default(),
+                    status: refinement.status,
+                    processing_error: refinement.processing_error,
+                    created_at: refinement.created_at,
+                    completed_at: refinement.completed_at,
+                });
+        }
         Ok(rows
             .into_iter()
             .map(|row| {
                 let row_id = row.id;
                 let mut history = UtteranceHistory::from(row);
                 history.speakers = speakers_by_utterance.remove(&row_id).unwrap_or_default();
+                history.refinements = refinements_by_utterance.remove(&row_id).unwrap_or_default();
                 history
             })
             .collect())
@@ -437,6 +601,7 @@ impl From<UtteranceHistoryRow> for UtteranceHistory {
                 t4_unix_ms: to_u64(row.t4_unix_ms),
             },
             speakers: Vec::new(),
+            refinements: Vec::new(),
         }
     }
 }

@@ -9,9 +9,16 @@ use tokio::{
     time::timeout,
 };
 
-use crate::{audio::pcm16_bytes, config::AsrConfig, protocol::INPUT_SAMPLE_RATE};
+use crate::{
+    audio::{assess_speech_quality, pcm16_bytes},
+    config::AsrConfig,
+    protocol::INPUT_SAMPLE_RATE,
+};
 
-use super::{LiveTranscription, Transcriber, Transcription, language_name, short_demo_delay};
+use super::{
+    CompletedTranscriptionEngine, LiveTranscription, Transcriber, Transcription, language_name,
+    short_demo_delay,
+};
 
 #[derive(Debug, thiserror::Error)]
 #[error("未识别到清晰语音")]
@@ -60,10 +67,7 @@ impl Transcriber for DemoTranscriber {
                 "ja" => format!("{seconds:.1} 秒の音声を受信しました。"),
                 _ => format!("Received a {seconds:.1} second voice sample."),
             };
-            Ok(Transcription {
-                text,
-                language: task_language,
-            })
+            Ok(Transcription::plain(text, task_language))
         });
         Ok(Some(LiveTranscription::new(audio_tx, task)))
     }
@@ -90,10 +94,24 @@ impl Transcriber for DemoTranscriber {
             let _ = updates.send(chunk.iter().collect());
             short_demo_delay(Duration::from_millis(30)).await;
         }
-        Ok(Transcription {
-            text,
-            language: detected.to_owned(),
-        })
+        Ok(Transcription::plain(text, detected))
+    }
+}
+
+#[async_trait]
+impl CompletedTranscriptionEngine for DemoTranscriber {
+    fn name(&self) -> &'static str {
+        "demo"
+    }
+
+    async fn transcribe_completed(
+        &self,
+        pcm: &[i16],
+        source_language: &str,
+    ) -> Result<Transcription> {
+        let (updates, _) = mpsc::unbounded_channel();
+        self.transcribe_streaming(pcm, source_language, updates)
+            .await
     }
 }
 
@@ -175,10 +193,7 @@ impl QwenAsrTranscriber {
     ) -> Result<Transcription> {
         let text = self.transcribe_batch(pcm, source_language).await?;
         if !text.is_empty() {
-            return Ok(Transcription {
-                text,
-                language: source_language.to_owned(),
-            });
+            return Ok(Transcription::plain(text, source_language));
         }
         if source_language != "auto" {
             tracing::warn!(
@@ -187,13 +202,27 @@ impl QwenAsrTranscriber {
             );
             let text = self.transcribe_batch(pcm, "auto").await?;
             if !text.is_empty() {
-                return Ok(Transcription {
-                    text,
-                    language: "auto".to_owned(),
-                });
+                return Ok(Transcription::plain(text, "auto"));
             }
         }
         Err(NoSpeechDetected.into())
+    }
+}
+
+#[async_trait]
+impl CompletedTranscriptionEngine for QwenAsrTranscriber {
+    fn name(&self) -> &'static str {
+        "qwen"
+    }
+
+    async fn transcribe_completed(
+        &self,
+        pcm: &[i16],
+        source_language: &str,
+    ) -> Result<Transcription> {
+        let prepared = prepare_asr_audio(pcm)?;
+        self.transcribe_batch_with_language_fallback(&prepared, source_language)
+            .await
     }
 }
 
@@ -300,7 +329,7 @@ impl Transcriber for QwenAsrTranscriber {
             if text.is_empty() {
                 return Err(NoSpeechDetected.into());
             }
-            Ok(Transcription { text, language })
+            Ok(Transcription::plain(text, language))
         });
         Ok(Some(LiveTranscription::new(audio_tx, task)))
     }
@@ -311,17 +340,16 @@ impl Transcriber for QwenAsrTranscriber {
         source_language: &str,
         updates: mpsc::UnboundedSender<String>,
     ) -> Result<Transcription> {
-        let prepared = prepare_asr_audio(pcm)?;
-        let transcription = self
-            .transcribe_batch_with_language_fallback(&prepared, source_language)
-            .await?;
+        let transcription = self.transcribe_completed(pcm, source_language).await?;
         let _ = updates.send(transcription.text.clone());
         Ok(transcription)
     }
 }
 
 fn prepare_asr_audio(pcm: &[i16]) -> Result<Vec<i16>> {
-    if pcm.is_empty() {
+    let quality = assess_speech_quality(pcm);
+    if !quality.accepts_asr() {
+        tracing::debug!(quality = %quality.summary(), "rejecting low-quality audio before ASR");
         return Err(NoSpeechDetected.into());
     }
     let mean = pcm.iter().map(|sample| *sample as i64).sum::<i64>() as f64 / pcm.len() as f64;
@@ -334,11 +362,8 @@ fn prepare_asr_audio(pcm: &[i16]) -> Result<Vec<i16>> {
         .map(|sample| sample.abs())
         .max()
         .unwrap_or(0);
-    if peak < 96 {
-        return Err(NoSpeechDetected.into());
-    }
     let gain = if peak < 20_000 {
-        (26_000_f64 / peak as f64).clamp(1.0, 8.0)
+        (26_000_f64 / peak as f64).clamp(1.0, 3.0)
     } else {
         1.0
     };
@@ -375,16 +400,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_quiet_audio_without_changing_length() {
-        let input = [0_i16, 120, -100, 80, -90];
+    fn normalizes_audible_audio_without_changing_length() {
+        let input = (0..16_000)
+            .map(|index| {
+                let phase = index as f32 * 2.0 * std::f32::consts::PI * 220.0 / 16_000.0;
+                (phase.sin() * 1_200.0) as i16
+            })
+            .collect::<Vec<_>>();
         let output = prepare_asr_audio(&input).unwrap();
         assert_eq!(output.len(), input.len());
-        assert!(output.iter().map(|sample| sample.abs()).max().unwrap() > 500);
+        assert!(output.iter().map(|sample| sample.abs()).max().unwrap() > 1_200);
+        assert!(output.iter().map(|sample| sample.abs()).max().unwrap() <= 3_600);
     }
 
     #[test]
     fn rejects_silent_audio_before_starting_qwen() {
         let error = prepare_asr_audio(&[0_i16; 16_000]).unwrap_err();
+        assert!(error.downcast_ref::<NoSpeechDetected>().is_some());
+    }
+
+    #[test]
+    fn rejects_inaudible_audio_instead_of_amplifying_it_into_asr() {
+        let input = (0..16_000)
+            .map(|index| {
+                let phase = index as f32 * 2.0 * std::f32::consts::PI * 220.0 / 16_000.0;
+                (phase.sin() * 300.0) as i16
+            })
+            .collect::<Vec<_>>();
+        let error = prepare_asr_audio(&input).unwrap_err();
         assert!(error.downcast_ref::<NoSpeechDetected>().is_some());
     }
 }

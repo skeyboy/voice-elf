@@ -1,9 +1,14 @@
+use std::io::Cursor;
+
 use anyhow::anyhow;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
+    http::{
+        StatusCode,
+        header::{CACHE_CONTROL, CONTENT_TYPE},
+    },
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
@@ -22,6 +27,10 @@ use crate::{
 
 pub const AUTH_COOKIE: &str = "voice_elf_session";
 const SESSION_DAYS: i64 = 7;
+const MAX_VOICE_REFERENCES: usize = 5;
+const MAX_VOICE_REFERENCE_BYTES: usize = 5 * 1024 * 1024;
+const MIN_VOICE_REFERENCE_MS: i64 = 3_000;
+const MAX_VOICE_REFERENCE_MS: i64 = 15_000;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -29,6 +38,20 @@ pub fn router() -> Router<AppState> {
         .route("/auth/login", post(login))
         .route("/auth/logout", delete(logout))
         .route("/auth/me", get(me))
+        .route(
+            "/voice-references",
+            get(list_voice_references)
+                .post(create_voice_reference)
+                .layer(DefaultBodyLimit::max(MAX_VOICE_REFERENCE_BYTES + 64 * 1024)),
+        )
+        .route(
+            "/voice-references/{voice_id}",
+            delete(delete_voice_reference),
+        )
+        .route(
+            "/voice-references/{voice_id}/audio",
+            get(voice_reference_audio),
+        )
         .route("/rooms", get(list_rooms).post(create_room))
         .route(
             "/rooms/{room_id}",
@@ -39,6 +62,183 @@ pub fn router() -> Router<AppState> {
             "/rooms/{room_id}/members/{user_id}",
             patch(update_room_member),
         )
+}
+
+#[derive(Serialize)]
+struct VoiceReferenceResponse {
+    id: Uuid,
+    name: String,
+    duration_ms: i64,
+    created_at: chrono::DateTime<Utc>,
+    audio_url: String,
+}
+
+impl From<crate::storage::VoiceReferenceRecord> for VoiceReferenceResponse {
+    fn from(reference: crate::storage::VoiceReferenceRecord) -> Self {
+        let id = reference.id;
+        Self {
+            id,
+            name: reference.name,
+            duration_ms: reference.duration_ms,
+            created_at: reference.created_at,
+            audio_url: format!("/api/voice-references/{id}/audio"),
+        }
+    }
+}
+
+async fn list_voice_references(
+    State(state): State<AppState>,
+    cookies: Cookies,
+) -> Result<Json<Vec<VoiceReferenceResponse>>, ApiError> {
+    let user = authenticate(&state, &cookies).await?;
+    let references = database(&state)?
+        .list_voice_references(user.id)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(references.into_iter().map(Into::into).collect()))
+}
+
+async fn create_voice_reference(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<VoiceReferenceResponse>), ApiError> {
+    let user = authenticate(&state, &cookies).await?;
+    let mut name = None;
+    let mut audio = None;
+    while let Some(field) = multipart.next_field().await.map_err(ApiError::internal)? {
+        match field.name() {
+            Some("name") => name = Some(field.text().await.map_err(ApiError::internal)?),
+            Some("audio") => {
+                let bytes = field.bytes().await.map_err(ApiError::internal)?;
+                if bytes.len() > MAX_VOICE_REFERENCE_BYTES {
+                    return Err(ApiError::bad_request("参考音频不能超过 5 MB"));
+                }
+                audio = Some(bytes);
+            }
+            _ => {}
+        }
+    }
+    let name = validate_voice_reference_name(name.as_deref().unwrap_or_default())?;
+    let audio = audio.ok_or_else(|| ApiError::bad_request("请选择参考音频"))?;
+    let duration_ms = validate_voice_reference_wav(&audio)?;
+    let database = database(&state)?;
+    let existing = database
+        .list_voice_references(user.id)
+        .await
+        .map_err(ApiError::internal)?;
+    if existing.len() >= MAX_VOICE_REFERENCES {
+        return Err(ApiError::conflict("每个账号最多保存 5 个自定义音色"));
+    }
+    if existing.iter().any(|reference| reference.name == name) {
+        return Err(ApiError::conflict("已有同名的自定义音色"));
+    }
+
+    let id = Uuid::new_v4();
+    let audio_path = state
+        .media
+        .save_voice_reference(user.id, id, &audio)
+        .await
+        .map_err(ApiError::internal)?;
+    let reference = match database
+        .create_voice_reference(id, user.id, &name, &audio_path, duration_ms)
+        .await
+    {
+        Ok(reference) => reference,
+        Err(error) => {
+            let _ = state.media.delete_voice_reference(&audio_path).await;
+            return Err(ApiError::internal(error));
+        }
+    };
+    Ok((StatusCode::CREATED, Json(reference.into())))
+}
+
+async fn voice_reference_audio(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path(voice_id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let user = authenticate(&state, &cookies).await?;
+    let reference = database(&state)?
+        .get_voice_reference(voice_id, user.id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("自定义音色不存在"))?;
+    let bytes = tokio::fs::read(&reference.audio_path)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut response = bytes.into_response();
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, "audio/wav".parse().unwrap());
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, "private, no-store".parse().unwrap());
+    Ok(response)
+}
+
+async fn delete_voice_reference(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path(voice_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let user = authenticate(&state, &cookies).await?;
+    let reference = database(&state)?
+        .delete_voice_reference(voice_id, user.id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("自定义音色不存在"))?;
+    state
+        .media
+        .delete_voice_reference(&reference.audio_path)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn validate_voice_reference_name(value: &str) -> Result<String, ApiError> {
+    let name = value.trim();
+    if name.is_empty() || name.chars().count() > 32 {
+        return Err(ApiError::bad_request("音色名称长度必须为 1 到 32 个字符"));
+    }
+    Ok(name.to_owned())
+}
+
+fn validate_voice_reference_wav(bytes: &[u8]) -> Result<i64, ApiError> {
+    if bytes.len() > MAX_VOICE_REFERENCE_BYTES {
+        return Err(ApiError::bad_request("参考音频不能超过 5 MB"));
+    }
+    let mut reader = hound::WavReader::new(Cursor::new(bytes))
+        .map_err(|_| ApiError::bad_request("参考音频必须为有效的 WAV 文件"))?;
+    let spec = reader.spec();
+    if spec.sample_format != hound::SampleFormat::Int
+        || spec.bits_per_sample != 16
+        || spec.channels != 1
+        || !(16_000..=48_000).contains(&spec.sample_rate)
+    {
+        return Err(ApiError::bad_request(
+            "参考音频必须为 16-48 kHz 的单声道 PCM16 WAV",
+        ));
+    }
+    let duration_ms = i64::from(reader.duration()) * 1_000 / i64::from(spec.sample_rate);
+    if !(MIN_VOICE_REFERENCE_MS..=MAX_VOICE_REFERENCE_MS).contains(&duration_ms) {
+        return Err(ApiError::bad_request("参考音频时长必须为 3 到 15 秒"));
+    }
+    let mut squared_total = 0.0_f64;
+    let mut peak = 0_i32;
+    let mut sample_count = 0_u64;
+    for sample in reader.samples::<i16>() {
+        let sample = sample.map_err(|_| ApiError::bad_request("参考音频数据不完整"))?;
+        let value = i32::from(sample);
+        peak = peak.max(value.abs());
+        squared_total += f64::from(value) * f64::from(value);
+        sample_count += 1;
+    }
+    let rms = (squared_total / sample_count.max(1) as f64).sqrt() / f64::from(i16::MAX);
+    if peak < 655 || rms < 0.005 {
+        return Err(ApiError::bad_request("参考音频音量过低，请重新录制"));
+    }
+    Ok(duration_ms)
 }
 
 #[derive(Debug)]
@@ -584,5 +784,36 @@ mod tests {
     fn hashes_session_tokens_deterministically() {
         assert_eq!(token_hash("token"), token_hash("token"));
         assert_ne!(token_hash("token"), "token");
+    }
+
+    #[test]
+    fn validates_private_voice_reference_input() {
+        assert_eq!(
+            validate_voice_reference_name("  我的声音  ").unwrap(),
+            "我的声音"
+        );
+        assert!(validate_voice_reference_name("").is_err());
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reference.wav");
+        let mut writer = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for index in 0..16_000 * 3 {
+            writer
+                .write_sample(((index % 200) as i16 - 100) * 100)
+                .unwrap();
+        }
+        writer.finalize().unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(validate_voice_reference_wav(&bytes).unwrap(), 3_000);
+        assert!(validate_voice_reference_wav(b"not a wav").is_err());
     }
 }

@@ -4,7 +4,8 @@ use tokio::sync::mpsc;
 
 use crate::{
     audio::pcm16_bytes,
-    protocol::{PipelinePhase, ProcessingStage, ServerEvent},
+    backends::{TtsChunkSink, TtsRequest},
+    protocol::{AudioCodec, PipelinePhase, ProcessingStage, ServerEvent},
     storage::UtteranceAudioUpdate,
 };
 
@@ -13,8 +14,6 @@ use super::{
     events::{send_event, send_state},
     jobs::SynthesisJob,
 };
-
-const AUDIO_CHUNK_SAMPLES: usize = 4_096;
 
 pub(super) async fn run_synthesis_worker(
     context: PipelineContext,
@@ -52,26 +51,117 @@ async fn synthesize(context: &PipelineContext, mut job: SynthesisJob) -> Result<
         Some(&utterance_id),
     )
     .await?;
-    let audio = context
-        .services
-        .synthesizer
-        .synthesize(
-            &job.translated_text,
-            &job.utterance.config.target_language,
-            &job.utterance.config.voice,
-        )
+    let reference_audio_path = if let Some(id) = job
+        .utterance
+        .config
+        .voice
+        .strip_prefix("custom:")
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+    {
+        let database = context
+            .database
+            .as_ref()
+            .context("custom voice references require PostgreSQL")?;
+        let reference = database
+            .get_voice_reference(id, context.user_id)
+            .await?
+            .context("custom voice reference does not exist or is not owned by this user")?;
+        Some(reference.audio_path.into())
+    } else {
+        None
+    };
+    let request = TtsRequest {
+        text: job.translated_text.clone(),
+        language: job.utterance.config.target_language.clone(),
+        voice: job.utterance.config.voice.clone(),
+        reference_audio_path,
+    };
+    let synthesizer = context.services.synthesizer.clone();
+    let (audio_tx, mut audio_rx) = mpsc::channel(8);
+    let synthesis = tokio::spawn(async move {
+        synthesizer
+            .synthesize(&request, TtsChunkSink::new(audio_tx))
+            .await
+    });
+    let mut samples = Vec::new();
+    let mut sample_rate = None;
+    let mut channels = None;
+    let mut engine = None;
+    let mut stream_started = false;
+    while let Some(chunk) = audio_rx.recv().await {
+        if let Some(expected) = sample_rate
+            && expected != chunk.sample_rate
+        {
+            anyhow::bail!("TTS engine changed sample rate during one utterance");
+        }
+        if let Some(expected) = channels
+            && expected != chunk.channels
+        {
+            anyhow::bail!("TTS engine changed channel count during one utterance");
+        }
+        if let Some(expected) = engine
+            && expected != chunk.engine
+        {
+            anyhow::bail!("TTS fallback changed engines after streaming started");
+        }
+        sample_rate = Some(chunk.sample_rate);
+        channels = Some(chunk.channels);
+        engine = Some(chunk.engine);
+        if !stream_started {
+            send_event(
+                &context.output,
+                ServerEvent::AudioStart {
+                    utterance_id: utterance_id.clone(),
+                    engine: chunk.engine.to_owned(),
+                    codec: AudioCodec::PcmS16le,
+                    sample_rate: chunk.sample_rate,
+                    channels: chunk.channels,
+                    sample_count: None,
+                },
+            )
+            .await?;
+            send_state(&context.output, PipelinePhase::Playing, Some(&utterance_id)).await?;
+            stream_started = true;
+        }
+        if context
+            .output
+            .send(Message::Binary(pcm16_bytes(&chunk.samples).into()))
+            .await
+            .is_err()
+        {
+            tracing::debug!(%utterance_id, "audio subscriber disconnected during playback stream");
+        }
+        samples.extend_from_slice(&chunk.samples);
+    }
+    let synthesis_result = synthesis
         .await
-        .context("TTS generation failed")?;
-    if audio.samples.is_empty() {
+        .context("TTS engine task failed")?
+        .context("TTS generation failed");
+    if stream_started {
+        let channel_count = usize::from(channels.unwrap_or(1));
+        let _ = send_event(
+            &context.output,
+            ServerEvent::AudioEnd {
+                utterance_id: utterance_id.clone(),
+                sample_count: samples.len() / channel_count,
+            },
+        )
+        .await;
+    }
+    synthesis_result?;
+    if samples.is_empty() {
         anyhow::bail!("TTS returned empty audio");
     }
+    let sample_rate = sample_rate.context("TTS returned no sample rate")?;
+    let channels = channels.context("TTS returned no channel count")?;
     let media = context
         .media
         .save_translated(
             context.session_id,
             job.utterance.id,
-            &audio.samples,
-            audio.sample_rate,
+            &samples,
+            sample_rate,
+            channels,
         )
         .await
         .context("failed to persist translated audio")?;
@@ -98,34 +188,6 @@ async fn synthesize(context: &PipelineContext, mut job: SynthesisJob) -> Result<
             utterance_id: utterance_id.clone(),
             source_audio_url: None,
             translated_audio_url: Some(media.url),
-        },
-    )
-    .await?;
-    send_event(
-        &context.output,
-        ServerEvent::AudioStart {
-            utterance_id: utterance_id.clone(),
-            sample_rate: audio.sample_rate,
-            sample_count: audio.samples.len(),
-        },
-    )
-    .await?;
-    send_state(&context.output, PipelinePhase::Playing, Some(&utterance_id)).await?;
-    for samples in audio.samples.chunks(AUDIO_CHUNK_SAMPLES) {
-        if context
-            .output
-            .send(Message::Binary(pcm16_bytes(samples).into()))
-            .await
-            .is_err()
-        {
-            tracing::debug!(%utterance_id, "audio subscriber disconnected during playback stream");
-            break;
-        }
-    }
-    send_event(
-        &context.output,
-        ServerEvent::AudioEnd {
-            utterance_id: utterance_id.clone(),
         },
     )
     .await?;

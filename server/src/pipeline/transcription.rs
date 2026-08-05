@@ -10,18 +10,29 @@ use crate::{
 use super::{
     PipelineContext,
     events::{send_event, send_state},
-    jobs::{TranslationJob, UtteranceJob},
+    jobs::{RefinementJob, TranslationJob, UtteranceJob},
 };
 
 pub(super) async fn run_transcription_worker(
     context: PipelineContext,
     mut input: mpsc::Receiver<UtteranceJob>,
     output: mpsc::Sender<TranslationJob>,
+    refinement: mpsc::Sender<RefinementJob>,
 ) {
     while let Some(job) = input.recv().await {
         let utterance_id = job.id;
         match transcribe(&context, job).await {
             Ok(job) => {
+                if !context.services.refinement_engines.is_empty() {
+                    let refinement_job = RefinementJob {
+                        utterance_id: job.utterance.id,
+                        audio: job.utterance.audio.clone(),
+                        source_language: job.transcription.language.clone(),
+                    };
+                    if let Err(error) = refinement.try_send(refinement_job) {
+                        tracing::warn!(%error, %utterance_id, "accurate transcription queue is full; skipping refinement");
+                    }
+                }
                 if output.send(job).await.is_err() {
                     break;
                 }
@@ -68,12 +79,7 @@ async fn transcribe(context: &PipelineContext, mut job: UtteranceJob) -> Result<
     prepare_utterance(context, &mut job).await?;
     let transcription = if let Some(live) = job.live.take() {
         match live.finish().await {
-            Ok(primary) => context
-                .services
-                .transcriber
-                .refine_transcription(&job.audio, &job.config.source_language, primary)
-                .await
-                .context("parallel ASR refinement failed")?,
+            Ok(primary) => primary,
             Err(error) => {
                 tracing::warn!(%error, %utterance_id, "live ASR failed; retrying completed utterance");
                 transcribe_completed_audio(context, &job, &utterance_id).await?

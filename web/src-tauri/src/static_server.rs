@@ -15,11 +15,14 @@ use axum::{
         header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, TRANSFER_ENCODING, UPGRADE},
     },
     response::IntoResponse,
-    routing::{any, get},
+    routing::{any, get, post},
 };
 use futures_util::{SinkExt, StreamExt};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
+#[cfg(desktop)]
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::RwLock;
 use tokio_tungstenite::{
     connect_async,
@@ -42,6 +45,14 @@ struct ServerState {
     client: reqwest::Client,
     upstream: Arc<RwLock<Url>>,
     settings_path: PathBuf,
+    shell: Option<ShellWindows>,
+}
+
+#[derive(Clone)]
+struct ShellWindows {
+    app: AppHandle,
+    #[cfg(desktop)]
+    origin: Url,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -49,24 +60,41 @@ struct AppConfig {
     api_url: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SubtitleWindowRequest {
+    room_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubtitleWindowActionRequest {
+    room_id: String,
+    action: SubtitleWindowAction,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SubtitleWindowAction {
+    State,
+    ToggleFullscreen,
+    Minimize,
+    Hide,
+}
+
+#[cfg(desktop)]
+#[derive(Debug, Serialize)]
+struct SubtitleWindowState {
+    fullscreen: bool,
+}
+
 pub(crate) struct ServerHandle {
     pub(crate) origin: String,
     pub(crate) task: tauri::async_runtime::JoinHandle<()>,
 }
 
-pub(crate) fn start(config_dir: PathBuf) -> Result<ServerHandle> {
+pub(crate) fn start(app_handle: AppHandle, config_dir: PathBuf) -> Result<ServerHandle> {
     let settings_path = config_dir.join(SETTINGS_FILE);
     let upstream = configured_upstream(&settings_path)?;
     let upstream_description = upstream.to_string();
-    let state = ServerState {
-        client: reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("failed to create the application proxy client")?,
-        upstream: Arc::new(RwLock::new(upstream)),
-        settings_path,
-    };
-    let app = router(state);
     let listener = StdTcpListener::bind(("127.0.0.1", 0))
         .context("failed to bind the embedded Axum server")?;
     listener
@@ -76,6 +104,20 @@ pub(crate) fn start(config_dir: PathBuf) -> Result<ServerHandle> {
         .local_addr()
         .context("failed to read the embedded Axum address")?;
     let origin = format!("http://{address}");
+    let state = ServerState {
+        client: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("failed to create the application proxy client")?,
+        upstream: Arc::new(RwLock::new(upstream)),
+        settings_path,
+        shell: Some(ShellWindows {
+            app: app_handle,
+            #[cfg(desktop)]
+            origin: Url::parse(&origin).context("failed to parse the embedded app origin")?,
+        }),
+    };
+    let app = router(state);
     eprintln!("Voice Elf app shell listening at {origin}; upstream: {upstream_description}");
     let task = tauri::async_runtime::spawn(async move {
         let listener = match tokio::net::TcpListener::from_std(listener) {
@@ -156,6 +198,18 @@ fn router(state: ServerState) -> Router {
             "/__voice_elf/config",
             get(get_app_config).put(update_app_config),
         )
+        .route("/__voice_elf/subtitle-window", post(open_subtitle_window))
+        .route(
+            "/__voice_elf/subtitle-window/close",
+            post(close_subtitle_window),
+        )
+        .route(
+            "/__voice_elf/subtitle-window/action",
+            post(control_subtitle_window),
+        )
+        .route("/__voice_elf/settings-window", post(open_settings_window))
+        .route("/__voice_elf/app/quit", post(confirm_app_quit))
+        .route("/__voice_elf/app/quit/cancel", post(cancel_app_quit))
         .route("/ws", get(proxy_websocket))
         .route("/api", any(proxy_http))
         .route("/api/{*path}", any(proxy_http))
@@ -171,6 +225,244 @@ fn router(state: ServerState) -> Router {
             HeaderValue::from_static("same-origin"),
         ))
         .with_state(state)
+}
+
+#[cfg(desktop)]
+async fn open_subtitle_window(
+    State(state): State<ServerState>,
+    Json(request): Json<SubtitleWindowRequest>,
+) -> Response<Body> {
+    if !valid_room_id(&request.room_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "房间 ID 无效" })),
+        )
+            .into_response();
+    }
+    let Some(shell) = state.shell else {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    };
+    let label = subtitle_window_label(&request.room_id);
+    if let Some(window) = shell.app.get_webview_window(&label) {
+        if let Err(error) = crate::show_and_focus(&window) {
+            return shell_window_error("无法显示字幕悬浮窗", error);
+        }
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let mut url = shell.origin;
+    url.set_path(&format!("/rooms/{}/subtitles", request.room_id));
+    match WebviewWindowBuilder::new(&shell.app, label, WebviewUrl::External(url))
+        .title("Voice Elf 实时字幕")
+        .inner_size(1100.0, 460.0)
+        .min_inner_size(420.0, 180.0)
+        .resizable(true)
+        .maximizable(true)
+        .minimizable(true)
+        .closable(true)
+        .always_on_top(true)
+        .center()
+        .build()
+    {
+        Ok(_) => StatusCode::CREATED.into_response(),
+        Err(error) => shell_window_error("无法创建字幕悬浮窗", error),
+    }
+}
+
+#[cfg(mobile)]
+async fn open_subtitle_window(Json(request): Json<SubtitleWindowRequest>) -> Response<Body> {
+    if !valid_room_id(&request.room_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    StatusCode::NOT_IMPLEMENTED.into_response()
+}
+
+#[cfg(desktop)]
+async fn close_subtitle_window(
+    State(state): State<ServerState>,
+    Json(request): Json<SubtitleWindowRequest>,
+) -> Response<Body> {
+    if !valid_room_id(&request.room_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(shell) = state.shell else {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    };
+    let Some(window) = shell
+        .app
+        .get_webview_window(&subtitle_window_label(&request.room_id))
+    else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    match hide_subtitle_window(&window) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => shell_window_error("无法关闭字幕悬浮窗", error),
+    }
+}
+
+#[cfg(mobile)]
+async fn close_subtitle_window(Json(request): Json<SubtitleWindowRequest>) -> Response<Body> {
+    if !valid_room_id(&request.room_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    StatusCode::NOT_IMPLEMENTED.into_response()
+}
+
+#[cfg(desktop)]
+async fn control_subtitle_window(
+    State(state): State<ServerState>,
+    Json(request): Json<SubtitleWindowActionRequest>,
+) -> Response<Body> {
+    if !valid_room_id(&request.room_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(shell) = state.shell else {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    };
+    let Some(window) = shell
+        .app
+        .get_webview_window(&subtitle_window_label(&request.room_id))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let result = match request.action {
+        SubtitleWindowAction::State => window.is_fullscreen(),
+        SubtitleWindowAction::ToggleFullscreen => toggle_subtitle_fullscreen(&window),
+        SubtitleWindowAction::Minimize => minimize_subtitle_window(&window).map(|_| false),
+        SubtitleWindowAction::Hide => hide_subtitle_window(&window).map(|_| false),
+    };
+    match result {
+        Ok(fullscreen) => Json(SubtitleWindowState { fullscreen }).into_response(),
+        Err(error) => shell_window_error("无法控制字幕悬浮窗", error),
+    }
+}
+
+#[cfg(mobile)]
+async fn control_subtitle_window(
+    Json(request): Json<SubtitleWindowActionRequest>,
+) -> Response<Body> {
+    if !valid_room_id(&request.room_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let _ = request.action;
+    StatusCode::NOT_IMPLEMENTED.into_response()
+}
+
+#[cfg(desktop)]
+fn toggle_subtitle_fullscreen(window: &tauri::WebviewWindow) -> tauri::Result<bool> {
+    let fullscreen = window.is_fullscreen()?;
+    if fullscreen {
+        window.set_fullscreen(false)?;
+        window.set_always_on_top(true)?;
+        return Ok(false);
+    }
+    window.set_always_on_top(false)?;
+    if let Err(error) = window.set_fullscreen(true) {
+        let _ = window.set_always_on_top(true);
+        return Err(error);
+    }
+    Ok(true)
+}
+
+#[cfg(desktop)]
+fn leave_subtitle_fullscreen(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    if window.is_fullscreen()? {
+        window.set_fullscreen(false)?;
+    }
+    window.set_always_on_top(true)
+}
+
+#[cfg(desktop)]
+fn minimize_subtitle_window(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    leave_subtitle_fullscreen(window)?;
+    window.minimize()
+}
+
+#[cfg(desktop)]
+fn hide_subtitle_window(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    leave_subtitle_fullscreen(window)?;
+    window.hide()
+}
+
+#[cfg(desktop)]
+async fn open_settings_window(State(state): State<ServerState>) -> Response<Body> {
+    let Some(shell) = state.shell else {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    };
+    match show_settings_window(&shell.app, &shell.origin) {
+        Ok(true) => StatusCode::CREATED.into_response(),
+        Ok(false) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => shell_window_error("无法打开字幕大屏设置", error),
+    }
+}
+
+#[cfg(mobile)]
+async fn open_settings_window() -> Response<Body> {
+    StatusCode::NOT_IMPLEMENTED.into_response()
+}
+
+#[cfg(desktop)]
+pub(crate) fn show_settings_window(app: &AppHandle, origin: &Url) -> tauri::Result<bool> {
+    if let Some(window) = app.get_webview_window("subtitle-settings") {
+        crate::show_and_focus(&window)?;
+        return Ok(false);
+    }
+    let mut url = origin.clone();
+    url.set_path("/settings");
+    WebviewWindowBuilder::new(app, "subtitle-settings", WebviewUrl::External(url))
+        .title("Voice Elf 设置")
+        .inner_size(920.0, 800.0)
+        .min_inner_size(600.0, 640.0)
+        .resizable(true)
+        .maximizable(true)
+        .minimizable(true)
+        .closable(true)
+        .center()
+        .build()?;
+    Ok(true)
+}
+
+async fn confirm_app_quit(State(state): State<ServerState>) -> Response<Body> {
+    let Some(shell) = state.shell else {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    };
+    crate::confirm_app_exit(&shell.app);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn cancel_app_quit(State(state): State<ServerState>) -> Response<Body> {
+    let Some(shell) = state.shell else {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    };
+    crate::cancel_app_exit(&shell.app);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+fn valid_room_id(room_id: &str) -> bool {
+    !room_id.is_empty()
+        && room_id.len() <= 80
+        && room_id
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_'))
+}
+
+#[cfg(desktop)]
+fn subtitle_window_label(room_id: &str) -> String {
+    format!("subtitles-{room_id}")
+}
+
+#[cfg(desktop)]
+fn shell_window_error(message: &str, error: tauri::Error) -> Response<Body> {
+    eprintln!("{message}: {error}");
+    shell_window_message(message)
+}
+
+#[cfg(desktop)]
+fn shell_window_message(message: &str) -> Response<Body> {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
 }
 
 async fn shell_health(State(state): State<ServerState>) -> impl IntoResponse {
@@ -488,6 +780,7 @@ mod tests {
             client: reqwest::Client::new(),
             upstream: Arc::new(RwLock::new(Url::parse(DEFAULT_UPSTREAM).unwrap())),
             settings_path: settings_path.clone(),
+            shell: None,
         };
         let response = update_app_config(State(state.clone()), Json(config.clone())).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -506,11 +799,21 @@ mod tests {
 
     #[tokio::test]
     async fn serves_the_spa_for_client_side_routes() {
-        let response = static_asset(OriginalUri("/rooms/test-room".parse().unwrap())).await;
+        let response =
+            static_asset(OriginalUri("/rooms/test-room/subtitles".parse().unwrap())).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "text/html");
         let body = to_bytes(response.into_body(), 8 * 1024).await.unwrap();
         assert!(body.starts_with(b"<!doctype html>"));
+    }
+
+    #[test]
+    fn accepts_only_safe_room_ids_for_window_labels_and_paths() {
+        assert!(valid_room_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(valid_room_id("meeting_room-1"));
+        assert!(!valid_room_id("../settings"));
+        assert!(!valid_room_id("room?admin=true"));
+        assert!(!valid_room_id(""));
     }
 
     #[tokio::test]

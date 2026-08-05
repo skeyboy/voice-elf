@@ -249,18 +249,29 @@ export class PcmPlayer {
     if (this.context.state === 'suspended') await this.context.resume();
   }
 
-  async enqueue(bytes: ArrayBuffer, sampleRate: number, onEnded?: () => void) {
+  async enqueue(
+    bytes: ArrayBuffer,
+    sampleRate: number,
+    channels = 1,
+    onEnded?: () => void,
+  ) {
     if (this.muted) return;
+    if (channels < 1 || bytes.byteLength % (channels * Int16Array.BYTES_PER_ELEMENT) !== 0) {
+      throw new Error('服务端返回了无效的音频帧');
+    }
     this.pendingEnqueues += 1;
     this.updatePlaybackState();
     try {
       await this.unlock();
       const context = this.context as AudioContext;
       const samples = new Int16Array(bytes);
-      const buffer = context.createBuffer(1, samples.length, sampleRate);
-      const channel = buffer.getChannelData(0);
-      for (let index = 0; index < samples.length; index += 1) {
-        channel[index] = samples[index] / 32768;
+      const frameCount = samples.length / channels;
+      const buffer = context.createBuffer(channels, frameCount, sampleRate);
+      for (let channelIndex = 0; channelIndex < channels; channelIndex += 1) {
+        const channel = buffer.getChannelData(channelIndex);
+        for (let frameIndex = 0; frameIndex < frameCount; frameIndex += 1) {
+          channel[frameIndex] = samples[frameIndex * channels + channelIndex] / 32768;
+        }
       }
       const source = context.createBufferSource();
       const generation = this.generation;

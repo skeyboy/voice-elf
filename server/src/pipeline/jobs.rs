@@ -17,6 +17,7 @@ use super::{
     PipelineContext,
     events::{send_event, send_state},
     latency::{LatencyObserver, SpeechStart},
+    refinement::run_refinement_worker,
     synthesis::run_synthesis_worker,
     transcription::run_transcription_worker,
     translation::run_translation_worker,
@@ -98,6 +99,12 @@ pub(super) struct TranslationJob {
     pub transcription: Transcription,
 }
 
+pub(super) struct RefinementJob {
+    pub utterance_id: Uuid,
+    pub audio: Vec<i16>,
+    pub source_language: String,
+}
+
 pub(super) struct SynthesisJob {
     pub utterance: UtteranceJob,
     pub translated_text: String,
@@ -117,18 +124,21 @@ impl PipelineWorkers {
         let (transcription_tx, transcription_rx) = mpsc::channel(TEXT_QUEUE_CAPACITY);
         let (translation_tx, translation_rx) = mpsc::channel(TEXT_QUEUE_CAPACITY);
         let (synthesis_tx, synthesis_rx) = mpsc::channel(TEXT_QUEUE_CAPACITY);
+        let (refinement_tx, refinement_rx) = mpsc::channel(TEXT_QUEUE_CAPACITY);
 
         let handles = vec![
             tokio::spawn(run_transcription_worker(
                 context.clone(),
                 transcription_rx,
                 translation_tx,
+                refinement_tx,
             )),
             tokio::spawn(run_translation_worker(
                 context.clone(),
                 translation_rx,
                 synthesis_tx,
             )),
+            tokio::spawn(run_refinement_worker(context.clone(), refinement_rx)),
             tokio::spawn(run_synthesis_worker(context, synthesis_rx)),
         ];
 
@@ -428,8 +438,8 @@ mod tests {
 
     use crate::{
         backends::{
-            AppServices, DemoSynthesizer, DemoTranscriber, DemoTranslator, NoSpeechDetected,
-            Transcriber, Transcription,
+            AppServices, CompletedTranscriptionEngine, DemoSynthesizer, DemoTranscriber,
+            DemoTranslator, NoSpeechDetected, Transcriber, Transcription,
         },
         media::MediaStore,
         protocol::SessionConfig,
@@ -501,6 +511,7 @@ mod tests {
             .unwrap();
         let services = Arc::new(AppServices {
             transcriber: Arc::new(DemoTranscriber::new()),
+            refinement_engines: Vec::new(),
             translator: Arc::new(DemoTranslator::new()),
             synthesizer: Arc::new(DemoSynthesizer::new()),
             backend_name: "demo",
@@ -560,6 +571,21 @@ mod tests {
     struct EmptyTranscriber;
 
     #[async_trait::async_trait]
+    impl CompletedTranscriptionEngine for EmptyTranscriber {
+        fn name(&self) -> &'static str {
+            "empty"
+        }
+
+        async fn transcribe_completed(
+            &self,
+            _pcm: &[i16],
+            _source_language: &str,
+        ) -> anyhow::Result<Transcription> {
+            Err(NoSpeechDetected.into())
+        }
+    }
+
+    #[async_trait::async_trait]
     impl Transcriber for EmptyTranscriber {
         async fn transcribe_streaming(
             &self,
@@ -571,6 +597,92 @@ mod tests {
         }
     }
 
+    struct SlowRefinement;
+
+    #[async_trait::async_trait]
+    impl CompletedTranscriptionEngine for SlowRefinement {
+        fn name(&self) -> &'static str {
+            "slow-refinement"
+        }
+
+        async fn transcribe_completed(
+            &self,
+            _pcm: &[i16],
+            source_language: &str,
+        ) -> anyhow::Result<Transcription> {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Ok(Transcription::plain("accurate transcript", source_language))
+        }
+    }
+
+    #[tokio::test]
+    async fn accurate_transcription_does_not_block_realtime_translation() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = MediaStore::new(directory.path().join("media"))
+            .await
+            .unwrap();
+        let services = Arc::new(AppServices {
+            transcriber: Arc::new(DemoTranscriber::new()),
+            refinement_engines: vec![Arc::new(SlowRefinement)],
+            translator: Arc::new(DemoTranslator::new()),
+            synthesizer: Arc::new(DemoSynthesizer::new()),
+            backend_name: "test",
+        });
+        let (output, mut events) = mpsc::channel(256);
+        let context = PipelineContext {
+            services,
+            database: None,
+            media,
+            session_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            room_id: Uuid::new_v4(),
+            output: output.clone(),
+        };
+        let workers = PipelineWorkers::start(context);
+        workers
+            .enqueue(
+                Uuid::new_v4(),
+                vec![1_000; 4_800],
+                SpeechStart::now(),
+                &SessionConfig::default(),
+                &output,
+            )
+            .await
+            .unwrap();
+
+        let mut event_types = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(message) = events.recv().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let event: Value = serde_json::from_str(&text).unwrap();
+                let Some(event_type) = event["type"].as_str() else {
+                    continue;
+                };
+                event_types.push(event_type.to_owned());
+                if event_type == "transcript_refinement"
+                    && event["status"].as_str() == Some("completed")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let translation = event_types
+            .iter()
+            .position(|event| event == "translation")
+            .unwrap();
+        let refinement = event_types
+            .iter()
+            .rposition(|event| event == "transcript_refinement")
+            .unwrap();
+        assert!(translation < refinement, "event order: {event_types:?}");
+        workers.abort().await;
+    }
+
     #[tokio::test]
     async fn recognition_failure_stays_attached_to_its_utterance() {
         let directory = tempfile::tempdir().unwrap();
@@ -579,6 +691,7 @@ mod tests {
             .unwrap();
         let services = Arc::new(AppServices {
             transcriber: Arc::new(EmptyTranscriber),
+            refinement_engines: Vec::new(),
             translator: Arc::new(DemoTranslator::new()),
             synthesizer: Arc::new(DemoSynthesizer::new()),
             backend_name: "test",

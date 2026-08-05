@@ -309,6 +309,17 @@ svg {
   display: none;
 }
 
+.room-display-actions,
+.room-display-actions .room-owner-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.open-subtitles {
+  color: var(--green);
+}
+
 .icon-button.danger {
   color: #a64f3b;
 }
@@ -1319,6 +1330,14 @@ h2 {
 
 .toast.error {
   border-left-color: var(--coral);
+}
+
+.toast.info {
+  border-left-color: var(--green);
+}
+
+.toast.warning {
+  border-left-color: var(--yellow);
 }
 
 @media (max-width: 900px) {
