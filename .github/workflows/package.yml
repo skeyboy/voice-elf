@@ -25,7 +25,7 @@ env:
 jobs:
   validate-rust:
     name: Validate / Rust
-    runs-on: macos-15-intel
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - name: Check out source
@@ -46,11 +46,36 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run workspace tests
-        run: cargo test --workspace --locked
+        run: |
+          test_log="$RUNNER_TEMP/cargo-test.log"
+          if cargo test --workspace --locked 2>&1 | tee "$test_log"; then
+            exit 0
+          fi
+
+          diagnostic="$(tail -n 80 "$test_log")"
+          diagnostic="${diagnostic//'%'/'%25'}"
+          diagnostic="${diagnostic//$'\r'/'%0D'}"
+          diagnostic="${diagnostic//$'\n'/'%0A'}"
+          printf '::error file=Cargo.toml,line=1,title=Rust workspace tests failed::%s\n' "$diagnostic"
+          {
+            printf '### Rust workspace test failure\n\n```text\n'
+            tail -n 80 "$test_log"
+            printf '\n```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Upload Rust diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: diagnostics-rust-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cargo-test.log
+          if-no-files-found: ignore
+          retention-days: 14
 
   validate-web:
     name: Validate / Web
-    runs-on: macos-15-intel
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - name: Check out source
@@ -98,7 +123,7 @@ jobs:
     needs:
       - validate-rust
       - validate-web
-    runs-on: macos-15-intel
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - name: Check out source
@@ -203,7 +228,7 @@ jobs:
     needs:
       - validate-rust
       - validate-web
-    runs-on: macos-15-intel
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - name: Check out source
@@ -269,7 +294,7 @@ jobs:
   verify-android:
     name: Verify / Android package
     needs: package-android
-    runs-on: macos-15-intel
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - name: Install Java
@@ -313,7 +338,7 @@ jobs:
   verify-macos-intel:
     name: Verify / macOS Intel package
     needs: package-macos-intel
-    runs-on: macos-15-intel
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - name: Download macOS package
@@ -352,7 +377,7 @@ jobs:
     needs:
       - verify-android
       - verify-macos-intel
-    runs-on: macos-15-intel
+    runs-on: macos-15
     timeout-minutes: 15
     permissions:
       contents: write

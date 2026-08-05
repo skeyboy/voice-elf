@@ -251,7 +251,7 @@ Run Windows packaging on Windows, macOS/iOS packaging on macOS, and Android pack
 
 ## Continuous integration and releases
 
-GitHub Actions runs the Rust and Web validations independently on `macos-15-intel`. After both validations pass, Android and Intel macOS packaging run in parallel. Separate downstream jobs verify checksums, Android archive structure and ABIs, and the macOS disk image, `x86_64` executable, and 11.0 deployment target. This dependency graph keeps validation, packaging, and artifact failures isolated in the Actions history.
+GitHub Actions runs the Rust and Web validations independently on the ARM-based `macos-15` runner. After both validations pass, Android and Intel macOS packaging run in parallel on the same runner. The macOS job cross-compiles for `x86_64-apple-darwin`; separate downstream jobs verify checksums, Android archive structure and ABIs, and the macOS disk image, Intel executable architecture, and 11.0 deployment target. This dependency graph keeps validation, packaging, and artifact failures isolated in the Actions history.
 
 Every pull request, push to `main`, and manual run produces 14-day workflow artifacts. Pushing a version tag matching the Tauri version, such as `v0.1.0`, additionally creates or updates the matching GitHub Release with the verified APK, AAB, Intel DMG, checksums, and build manifests.
 
