@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1"
 argon2 = "0.5"
 async-trait = "0.1"
-axum = { version = "0.8", features = ["multipart", "ws"] }
+axum = { version = "0.8", features = ["form", "multipart", "ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 diesel = { version = "2.3", default-features = false, features = ["32-column-tables", "chrono", "postgres", "uuid"] }
@@ -16,7 +16,7 @@ diesel_migrations = "2.3"
 futures-util = "0.3"
 hex = "0.4"
 hound = "3.5"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "multipart", "rustls", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["form", "json", "multipart", "rustls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11.0"

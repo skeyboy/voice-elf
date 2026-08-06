@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use url::{Host, Url};
 
 const DEFAULT_MOSS_NANO_VOICE_MAP: &str = concat!(
     "F1=demo-1,",
@@ -36,6 +37,51 @@ pub struct AppConfig {
     pub tts: TtsConfig,
     pub inference_timeout: Duration,
     pub database_url: Option<String>,
+    pub authority: AuthorityConfig,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthorityMode {
+    Standalone,
+    Bus,
+    Tenant,
+}
+
+impl AuthorityMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standalone => "standalone",
+            Self::Bus => "bus",
+            Self::Tenant => "tenant",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AuthorityConfig {
+    pub mode: AuthorityMode,
+    pub base_url: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub check_interval: Duration,
+    pub request_timeout: Duration,
+}
+
+impl std::fmt::Debug for AuthorityConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorityConfig")
+            .field("mode", &self.mode)
+            .field("base_url", &self.base_url)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("check_interval", &self.check_interval)
+            .field("request_timeout", &self.request_timeout)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,20 +147,14 @@ impl AppConfig {
             .parse()
             .context("VOICE_ELF_BIND must be a socket address")?;
 
-        let backend_mode = match env::var("VOICE_ELF_BACKEND")
-            .unwrap_or_else(|_| "demo".to_owned())
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "demo" => BackendMode::Demo,
-            "local" => BackendMode::Local,
-            value => anyhow::bail!("VOICE_ELF_BACKEND must be 'demo' or 'local', got '{value}'"),
-        };
+        let backend_mode = parse_backend_mode(env::var("VOICE_ELF_BACKEND").ok())?;
 
         let timeout_seconds = env::var("VOICE_ELF_INFERENCE_TIMEOUT_SECONDS")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(120);
+
+        let authority = authority_config_from_env()?;
 
         Ok(Self {
             bind,
@@ -237,6 +277,7 @@ impl AppConfig {
             },
             inference_timeout: Duration::from_secs(timeout_seconds),
             database_url: env::var("DATABASE_URL").ok().filter(|url| !url.is_empty()),
+            authority,
         })
     }
 
@@ -262,6 +303,90 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+fn parse_backend_mode(value: Option<String>) -> Result<BackendMode> {
+    let value = value
+        .unwrap_or_else(|| "local".to_owned())
+        .to_ascii_lowercase();
+    match value.as_str() {
+        "demo" => Ok(BackendMode::Demo),
+        "local" => Ok(BackendMode::Local),
+        value => anyhow::bail!("VOICE_ELF_BACKEND must be 'demo' or 'local', got '{value}'"),
+    }
+}
+
+fn authority_config_from_env() -> Result<AuthorityConfig> {
+    let mode = match env::var("VOICE_ELF_AUTHORITY_MODE")
+        .unwrap_or_else(|_| "standalone".to_owned())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "standalone" => AuthorityMode::Standalone,
+        "bus" => AuthorityMode::Bus,
+        "tenant" => AuthorityMode::Tenant,
+        value => anyhow::bail!(
+            "VOICE_ELF_AUTHORITY_MODE must be 'standalone', 'bus', or 'tenant', got '{value}'"
+        ),
+    };
+    let base_url = env::var("VOICE_ELF_AUTHORITY_URL")
+        .ok()
+        .map(|value| value.trim_end_matches('/').to_owned())
+        .filter(|value| !value.is_empty());
+    let client_id = env::var("VOICE_ELF_AUTHORITY_CLIENT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let client_secret = env::var("VOICE_ELF_AUTHORITY_CLIENT_SECRET")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    if mode == AuthorityMode::Tenant {
+        let value = base_url
+            .as_deref()
+            .context("VOICE_ELF_AUTHORITY_URL is required in tenant mode")?;
+        validate_authority_url(value)?;
+        if client_id.is_none() {
+            anyhow::bail!("VOICE_ELF_AUTHORITY_CLIENT_ID is required in tenant mode");
+        }
+        if client_secret.is_none() {
+            anyhow::bail!("VOICE_ELF_AUTHORITY_CLIENT_SECRET is required in tenant mode");
+        }
+    }
+
+    Ok(AuthorityConfig {
+        mode,
+        base_url,
+        client_id,
+        client_secret,
+        check_interval: Duration::from_secs(
+            env::var("VOICE_ELF_AUTHORITY_CHECK_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(300)
+                .max(30),
+        ),
+        request_timeout: Duration::from_secs(
+            env::var("VOICE_ELF_AUTHORITY_TIMEOUT_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(10)
+                .clamp(2, 60),
+        ),
+    })
+}
+
+fn validate_authority_url(value: &str) -> Result<()> {
+    let url = Url::parse(value).context("VOICE_ELF_AUTHORITY_URL must be a valid URL")?;
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    let loopback = matches!(url.host(), Some(Host::Domain("localhost")))
+        || matches!(url.host(), Some(Host::Ipv4(address)) if address.is_loopback())
+        || matches!(url.host(), Some(Host::Ipv6(address)) if address.is_loopback());
+    if url.scheme() != "http" || !loopback {
+        anyhow::bail!("VOICE_ELF_AUTHORITY_URL must use HTTPS except for loopback development");
+    }
+    Ok(())
 }
 
 fn env_flag(name: &str) -> bool {
@@ -313,6 +438,15 @@ fn resolve_workspace_executable(path: impl Into<PathBuf>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requires_demo_backend_to_be_explicit() {
+        assert_eq!(parse_backend_mode(None).unwrap(), BackendMode::Local);
+        assert_eq!(
+            parse_backend_mode(Some("demo".to_owned())).unwrap(),
+            BackendMode::Demo
+        );
+    }
 
     #[test]
     fn resolves_resource_paths_from_the_workspace_root() {

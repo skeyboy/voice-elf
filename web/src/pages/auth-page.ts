@@ -7,14 +7,17 @@ export class AuthPage implements Page {
   private root: HTMLElement | null = null;
   private mode: 'login' | 'register' = 'login';
 
-  constructor(private readonly onAuthenticated: (user: User) => void) {}
+  constructor(
+    private readonly onAuthenticated: (user: User) => void,
+    private readonly systemName = 'Voice Elf',
+  ) {}
 
   mount(root: HTMLElement) {
     this.root = root;
     root.innerHTML = `
       <main class="auth-page">
         <form class="auth-panel">
-          <div class="auth-brand"><span class="brand-mark"><i data-lucide="audio-lines"></i></span><strong>Voice Elf</strong></div>
+          <div class="auth-brand"><span class="brand-mark"><i data-lucide="audio-lines"></i></span><strong>${escapeHtml(this.systemName)}</strong></div>
           <div class="auth-mode" role="tablist">
             <button class="active" data-mode="login" type="button" role="tab">登录</button>
             <button data-mode="register" type="button" role="tab">注册</button>
@@ -60,6 +63,7 @@ export class AuthPage implements Page {
     this.root.querySelector<HTMLInputElement>('[name="password"]')!.autocomplete =
       mode === 'login' ? 'current-password' : 'new-password';
     this.root.querySelector('.form-error')!.textContent = '';
+    this.root.querySelector('.form-error')!.classList.remove('success');
   }
 
   private async submit(event: SubmitEvent, form: HTMLFormElement) {
@@ -69,6 +73,7 @@ export class AuthPage implements Page {
     const values = new FormData(form);
     submit.disabled = true;
     errorElement.textContent = '';
+    errorElement.classList.remove('success');
     try {
       const user = await apiRequest<User>(`/api/auth/${this.mode}`, {
         method: 'POST',
@@ -77,6 +82,12 @@ export class AuthPage implements Page {
           password: values.get('password'),
         }),
       });
+      if (user.status === 'pending') {
+        errorElement.classList.add('success');
+        errorElement.textContent = '注册申请已提交，请等待管理员验证后登录';
+        form.reset();
+        return;
+      }
       this.onAuthenticated(user);
     } catch (error) {
       errorElement.textContent = error instanceof Error ? error.message : '账号请求失败';
@@ -131,4 +142,10 @@ export class AuthPage implements Page {
     save.addEventListener('click', () => void persist());
     refreshIcons(section);
   }
+}
+
+function escapeHtml(value: string) {
+  const element = document.createElement('div');
+  element.textContent = value;
+  return element.innerHTML;
 }

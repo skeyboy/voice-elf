@@ -2,12 +2,6 @@ import { MicrophoneCapture, PcmPlayer, Waveform, type VadBoundary } from '../aud
 import type { ServerEvent, SessionConfig } from '../protocol';
 import type { ConnectionStatus } from '../components/topbar';
 
-interface PlaybackProgress {
-  utteranceId: string;
-  currentSeconds: number;
-  durationSeconds: number;
-}
-
 const MIN_VALID_SPEECH_FRAMES = 10;
 const PLAYBACK_TAIL_GUARD_MS = 300;
 
@@ -16,7 +10,6 @@ interface VoiceSessionCallbacks {
   onConnection: (status: ConnectionStatus) => void;
   onRecording: (recording: boolean) => void;
   onCaptureError: (message: string) => void;
-  onPlaybackProgress: (progress: PlaybackProgress) => void;
 }
 
 export class VoiceSession {
@@ -27,10 +20,7 @@ export class VoiceSession {
   private reconnectTimer = 0;
   private receivingAudio: {
     utteranceId: string;
-    sampleRate: number;
     channels: number;
-    sampleCount: number;
-    playedSamples: number;
   } | null = null;
   private audioSampleRate = 24_000;
   private recording = false;
@@ -271,19 +261,7 @@ export class VoiceSession {
     if (message.data instanceof ArrayBuffer) {
       const playback = this.receivingAudio;
       if (!playback) return;
-      const chunkSamples =
-        message.data.byteLength /
-        (Int16Array.BYTES_PER_ELEMENT * playback.channels);
-      void this.player.enqueue(message.data, this.audioSampleRate, playback.channels, () => {
-        if (!playback) return;
-        playback.playedSamples += chunkSamples;
-        this.callbacks.onPlaybackProgress({
-          utteranceId: playback.utteranceId,
-          currentSeconds: playback.playedSamples / playback.sampleRate,
-          durationSeconds:
-            Math.max(playback.sampleCount, playback.playedSamples) / playback.sampleRate,
-        });
-      });
+      void this.player.enqueue(message.data, this.audioSampleRate, playback.channels);
       return;
     }
     let event: ServerEvent;
@@ -307,22 +285,11 @@ export class VoiceSession {
       this.audioSampleRate = event.sample_rate;
       this.receivingAudio = {
         utteranceId: event.utterance_id,
-        sampleRate: event.sample_rate,
         channels: event.channels,
-        sampleCount: event.sample_count ?? 0,
-        playedSamples: 0,
       };
-      this.callbacks.onPlaybackProgress({
-        utteranceId: event.utterance_id,
-        currentSeconds: 0,
-        durationSeconds: (event.sample_count ?? 0) / event.sample_rate,
-      });
     }
     if (event.type === 'audio_end') {
-      if (this.receivingAudio?.utteranceId === event.utterance_id) {
-        this.receivingAudio.sampleCount = event.sample_count;
-      }
-      this.receivingAudio = null;
+      if (this.receivingAudio?.utteranceId === event.utterance_id) this.receivingAudio = null;
     }
     this.callbacks.onEvent(event);
   }

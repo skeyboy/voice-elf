@@ -1,5 +1,7 @@
 mod api;
+mod asr_manager;
 mod audio;
+mod authority;
 mod backends;
 mod config;
 mod media;
@@ -35,7 +37,9 @@ use tower_http::{
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    backends::AppServices,
+    asr_manager::AsrManager,
+    authority::AuthorityService,
+    backends::{AppServices, AsrBackendRegistry},
     config::AppConfig,
     media::MediaStore,
     protocol::{ClientEvent, ServerEvent},
@@ -49,6 +53,9 @@ pub(crate) struct AppState {
     pub(crate) database: Option<Database>,
     pub(crate) media: MediaStore,
     pub(crate) rooms: RoomHub,
+    pub(crate) authority: AuthorityService,
+    pub(crate) asr: AsrManager,
+    pub(crate) setup_token_hash: Arc<str>,
 }
 
 #[tokio::main]
@@ -64,18 +71,59 @@ async fn main() -> Result<()> {
 
     let config = AppConfig::from_env()?;
     let services = Arc::new(AppServices::from_config(&config)?);
+    let asr_registry = AsrBackendRegistry::from_config(&config)?;
     let database = match &config.database_url {
         Some(url) => Some(Database::connect(url).await?),
         None => None,
     };
     let database_enabled = database.is_some();
+    if let Some(database) = &database {
+        database
+            .ensure_asr_system_setting(asr_registry.default_backend_id())
+            .await?;
+    }
+    let initialized = match &database {
+        Some(database) => database.system_installation().await?.is_some(),
+        None => false,
+    };
+    let configured_setup_token = std::env::var("VOICE_ELF_SETUP_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if configured_setup_token
+        .as_ref()
+        .is_some_and(|token| token.chars().count() < 16)
+    {
+        anyhow::bail!("VOICE_ELF_SETUP_TOKEN must contain at least 16 characters");
+    }
+    let generated_setup_token = configured_setup_token.is_none().then(|| {
+        format!(
+            "vesetup_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..20]
+        )
+    });
+    if !initialized {
+        if let Some(token) = &generated_setup_token {
+            tracing::warn!(setup_token = %token, "system initialization token generated");
+        } else {
+            tracing::info!("system initialization requires VOICE_ELF_SETUP_TOKEN");
+        }
+    }
+    let setup_token = configured_setup_token
+        .or(generated_setup_token)
+        .expect("a setup token is always available");
     let media = MediaStore::new(config.media_dir.clone()).await?;
+    let authority = AuthorityService::new(config.authority.clone());
+    let asr = AsrManager::new(asr_registry, database.clone(), authority.clone());
     let state = AppState {
         services: services.clone(),
         database,
         media: media.clone(),
         rooms: RoomHub::default(),
+        authority: authority.clone(),
+        asr,
+        setup_token_hash: Arc::from(api::token_hash(&setup_token)),
     };
+    authority.start();
     let static_files = ServeDir::new(&config.web_dist).append_index_html_on_directories(true);
     let index_file = config.web_dist.join("index.html");
     let media_files = Router::new()
@@ -90,8 +138,12 @@ async fn main() -> Result<()> {
         .route("/ws", get(websocket))
         .nest("/media", media_files)
         .route_service("/login", ServeFile::new(&index_file))
+        .route_service("/setup", ServeFile::new(&index_file))
         .route_service("/rooms", ServeFile::new(&index_file))
         .route_service("/rooms/{room_id}", ServeFile::new(&index_file))
+        .route_service("/rooms/{room_id}/subtitles", ServeFile::new(&index_file))
+        .route_service("/me", ServeFile::new(&index_file))
+        .route_service("/admin", ServeFile::new(&index_file))
         .route_service("/settings", ServeFile::new(&index_file))
         .fallback_service(static_files)
         .layer(middleware::from_fn(cache_vad_assets))
@@ -115,6 +167,7 @@ async fn main() -> Result<()> {
         database = database_enabled,
         web_dist = %config.web_dist.display(),
         media_dir = %media.root().display(),
+        authority_mode = config.authority.mode.as_str(),
         "voice elf server listening"
     );
     axum::serve(listener, app).await?;
@@ -165,6 +218,9 @@ async fn authorize_media(
         Ok(None) => return api::ApiError::not_found("音频不存在").into_response(),
         Err(error) => return api::ApiError::internal(error).into_response(),
     };
+    if user.is_admin() {
+        return next.run(request).await;
+    }
     match database.can_view_room(room_id, user.id).await {
         Ok(true) => next.run(request).await,
         Ok(false) => api::ApiError::forbidden("无权访问该房间音频").into_response(),
@@ -173,13 +229,18 @@ async fn authorize_media(
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let authority = state.authority.snapshot().await;
+    let asr = state.asr.effective_selection().await.ok();
     (
         StatusCode::OK,
         Json(json!({
             "status": "ok",
             "backend": state.services.backend_name,
+            "asr_backend": asr.as_ref().map(|selection| &selection.backend_id),
+            "asr_config_source": asr.as_ref().map(|selection| &selection.source),
             "database": state.database.is_some(),
             "media": true,
+            "authority": authority,
             "version": env!("CARGO_PKG_VERSION"),
         })),
     )
@@ -206,6 +267,9 @@ async fn websocket(
         .await
         .map_err(api::ApiError::internal)?
         .ok_or_else(|| api::ApiError::not_found("房间不存在"))?;
+    if room.status != "active" {
+        return Err(api::ApiError::forbidden("会议已停止实时语音接入"));
+    }
     if !database
         .can_view_room(room.id, user.id)
         .await
@@ -217,10 +281,15 @@ async fn websocket(
         .list_room_members(room.id)
         .await
         .map_err(api::ApiError::internal)?;
+    let (services, _) = state
+        .asr
+        .services_for_session(&state.services)
+        .await
+        .map_err(|error| api::ApiError::unavailable(format!("ASR 服务不可用: {error}")))?;
     Ok(ws
         .max_message_size(256 * 1024)
         .max_frame_size(256 * 1024)
-        .on_upgrade(move |socket| handle_socket(socket, state, room, user, members))
+        .on_upgrade(move |socket| handle_socket(socket, state, room, user, members, services))
         .into_response())
 }
 
@@ -230,6 +299,7 @@ async fn handle_socket(
     room: storage::RoomRecord,
     user: storage::UserRecord,
     members: Vec<storage::RoomMemberRecord>,
+    services: Arc<AppServices>,
 ) {
     let room_id = room.id;
     let user_id = user.id;
@@ -237,19 +307,20 @@ async fn handle_socket(
         &room,
         &user,
         &members,
-        state.services.clone(),
+        services,
         state.database.clone(),
         state.media.clone(),
     );
     let rooms = state.rooms;
     let can_publish = connection.can_publish;
     let mut room_events = connection.events;
+    let mut revoked = connection.revoked;
     let (mut socket_writer, mut socket_reader) = socket.split();
     let subscribed = ServerEvent::RoomSubscribed {
         room_id: room_id.to_string(),
         can_publish,
         user_id,
-        backend: state.services.backend_name.to_owned(),
+        backend: connection.backend.to_owned(),
     };
     let Ok(subscribed) = serde_json::to_string(&subscribed) else {
         rooms.disconnect(room_id, user_id).await;
@@ -266,6 +337,7 @@ async fn handle_socket(
 
     loop {
         tokio::select! {
+            _ = revoked.recv() => break,
             event = room_events.recv() => match event {
                 Ok(message) => {
                     if socket_writer.send(message).await.is_err() {

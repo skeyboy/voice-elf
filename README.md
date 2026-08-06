@@ -44,8 +44,12 @@ cd web
 npm install
 npm run build
 cd ..
-cargo run --bin voice-elf-server
+VOICE_ELF_BACKEND=demo cargo run --bin voice-elf-server
 ```
+
+The demo backend is opt-in and returns placeholder transcripts only. Normal startup defaults to the `local` backend and fails fast when its ASR model is unavailable, preventing placeholder text from being mistaken for real recognition.
+
+System administrators can switch the effective ASR provider from `/admin` without restarting the service. The database stores only stable provider IDs; model paths and provider credentials remain server-side environment configuration. A change applies when a new room audio pipeline starts, while an already running pipeline keeps its provider snapshot until the room disconnects. In authorization-bus mode, administrators can assign a tenant override or leave it inheriting the system default. Tenant instances receive the resolved provider ID in their regular authorization check and verify that the provider is configured locally.
 
 After the initial model setup, the complete development stack can be managed from one terminal. `make dev` verifies PostgreSQL, the project-local Python/MOSS environment, Web dependencies, Rust VAD, and the server build before starting MOSS-TTS-Nano, the Rust server, and Vite. The processes run in project-specific detached sessions, so they remain available after the command exits without requiring a global service installation. Stop only removes processes owned by this stack and waits for ports `18083`, `3001`, and `5173` to be released; an unrelated process occupying one of those ports is reported and left untouched.
 
@@ -116,7 +120,7 @@ Qwen's stable token callback is forwarded immediately as real `transcript_delta`
 
 On the tested 2019 Intel Mac, a warm 6.5-second continuous sample produced its first source delta at about 3.9 seconds and completed ASR at about 8.8 seconds. A cold model can add roughly five seconds. CPU inference can therefore still lag behind live capture even though audio transport and event delivery are genuinely streaming. Server TTS runs in its own queue stage, so later ASR and translation tasks can continue while audio is synthesized.
 
-Qwen streaming uses two-second audio chunks. The configured 12-token decode budget bounds each streaming step while retaining enough capacity for normal Chinese and English speech rates. If live recognition fails or returns no text, the adapter retries the preserved utterance PCM with faster `--silent` batch recognition before reporting an error.
+Qwen streaming uses two-second audio chunks. The configured 12-token decode budget bounds each streaming step while retaining enough capacity for normal Chinese and English speech rates. If live recognition fails or returns no text, the adapter retries the preserved utterance PCM with faster `--silent` batch recognition before reporting an error. In automatic-language rooms, an empty auto-detection result gets a bounded Chinese-then-English retry so short human utterances are not discarded; rooms that primarily use another supported language should select it explicitly.
 
 ### Optional accurate transcription
 
@@ -155,7 +159,13 @@ createdb voice_elf
 echo 'DATABASE_URL=postgres://localhost/voice_elf' >> .env
 ```
 
-Accounts use Argon2 password hashes and seven-day HTTP-only session cookies. A user can create and control rooms; other registered users can search for a room, join it, browse its records, and subscribe to live transcripts, translations, protected source/translated audio URLs, and translated audio playback. `users`, `auth_sessions`, `rooms`, and `room_members` hold this authorization state.
+Accounts use Argon2 password hashes and seven-day HTTP-only session cookies. The setup wizard creates the first active system administrator; later registrations remain pending until an administrator verifies them. Administrators can approve, suspend, restore, or promote accounts. Suspending an account revokes its HTTP sessions and disconnects its active room connections. The meeting directory is restricted at the database query layer: users only see rooms they created or previously joined. A meeting creator is its administrator and can update the room, manage member speaking permissions, and remove the meeting from active views. Authenticated users can still join an active room through its direct meeting link; after joining, they can browse its records and subscribe to live transcripts, translations, protected source/translated audio URLs, and translated audio playback. `users`, `auth_sessions`, `rooms`, and `room_members` hold this authorization state.
+
+On a new database, the browser is redirected to `/setup` before login or business routes are available. The four-step setup checks PostgreSQL and instance authorization, records the system and organization names plus public URL, and atomically creates the first active system administrator. Set `VOICE_ELF_SETUP_TOKEN` to a random value of at least 16 characters before first start; when it is omitted, the server prints a generated `vesetup_...` token in the startup log. This prevents another network user from claiming an uninitialized deployment. Existing databases with users are automatically marked initialized by migration and do not show the wizard.
+
+Self-hosted tenant licensing uses a separate control plane and is disabled by default. Set `VOICE_ELF_AUTHORITY_MODE=bus` on the central authorization service, or set it to `tenant` together with `VOICE_ELF_AUTHORITY_URL`, `VOICE_ELF_AUTHORITY_CLIENT_ID`, and `VOICE_ELF_AUTHORITY_CLIENT_SECRET` on a tenant backend. Tenant users and business data remain in that tenant's PostgreSQL and media directory; only deployment credentials, entitlement state, expiry, and heartbeat metadata reach the bus. See [`docs/multi-tenant-plan.md`](docs/multi-tenant-plan.md) for the protocol, failure policy, and deployment sequence.
+
+Room and private voice-reference removal uses `deleted_at` soft deletion. Historical database rows and meeting audio remain retained for recovery and audit instead of being physically removed. Authentication-session revocation remains a physical deletion because an invalidated credential must not stay usable.
 
 Each room-owner publisher connection creates a row in `voice_sessions`; read-only member subscriptions do not create inference sessions. Completed utterances are stored in `voice_utterances` with their account/room ownership, source and translated text, language pair, audio duration, all `t0` through `t4` latency measurements, and the two audio file paths and URLs. Audio samples remain in WAV files rather than PostgreSQL binary columns. Media URLs require a logged-in owner or room member.
 
@@ -175,6 +185,25 @@ POST   /api/auth/register
 POST   /api/auth/login
 DELETE /api/auth/logout
 GET    /api/auth/me
+GET    /api/admin/overview
+GET    /api/admin/asr
+PATCH  /api/admin/asr
+GET    /api/admin/users?q=&status=&role=&sort=&order=&page=&page_size=
+PATCH  /api/admin/users/{user_id}
+GET    /api/admin/rooms?q=&status=&sort=&order=&page=&page_size=
+PATCH  /api/admin/rooms/{room_id}
+GET    /api/admin/rooms/{room_id}/inspect
+GET    /api/instance/authorization
+POST   /api/authority/oauth/token
+POST   /api/authority/entitlements/check
+GET    /api/admin/authority/tenants?q=&status=&sort=&order=&page=&page_size=
+POST   /api/admin/authority/tenants
+PATCH  /api/admin/authority/tenants/{tenant_id}
+PATCH  /api/admin/authority/tenants/{tenant_id}/asr
+GET    /api/admin/authority/tenants/{tenant_id}/instances
+POST   /api/admin/authority/tenants/{tenant_id}/instances
+PATCH  /api/admin/authority/instances/{instance_id}
+POST   /api/admin/authority/instances/{instance_id}/rotate-secret
 GET    /api/rooms?q=room-name
 POST   /api/rooms
 GET    /api/rooms/{room_id}?q=transcript-text
@@ -183,6 +212,8 @@ DELETE /api/rooms/{room_id}
 POST   /api/rooms/{room_id}/join
 PATCH  /api/rooms/{room_id}/members/{user_id}
 ```
+
+System-management endpoints require an active system administrator session. Account status changes and meeting status changes are enforced server-side. The inspection endpoint reads meeting members and history without joining the room or opening a WebSocket, so it does not alter membership or online presence. The proposed client-transparent tenant isolation design is documented in [`docs/multi-tenant-plan.md`](docs/multi-tenant-plan.md).
 
 Room update/delete and speaking-permission management are owner-only. Every joined, unmuted member can publish Web VAD boundaries and 16 kHz PCM16 frames through the room WebSocket. The server aligns 512-sample frames from active speakers, mixes them into one room-level ASR/translation/TTS pipeline, and broadcasts member presence, speaking state, speaker attribution, text, and audio to all participants. The endpoint requires the session cookie and an authorized room ID: `ws://localhost:3001/ws?room_id={room_id}`. The first server event confirms whether the current member can publish:
 
@@ -214,6 +245,7 @@ The frontend uses SvelteKit file routing and is split into route pages, reusable
 
 ```text
 /login             account login and registration
+/admin             system personnel and meeting management
 /rooms             searchable room directory
 /rooms/{room_id}   translation, participant controls, live room state, and history
 /rooms/{room_id}/subtitles

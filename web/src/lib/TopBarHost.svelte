@@ -1,12 +1,24 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { page } from '$app/stores';
   import { onMount } from 'svelte';
   import { apiRequest, type User } from '../api';
-  import { TopBar } from '../components/topbar';
+  import { TopBar, type AppSection } from '../components/topbar';
   import { connectionStatus, resetSession } from './session';
 
   export let user: User;
+  export let systemName = 'Voice Elf';
+  export let organizationName = '';
   let host: HTMLElement;
+  let topbar: TopBar | null = null;
+  let activeSection: AppSection = 'home';
+
+  $: activeSection = $page.url.pathname === '/admin'
+    ? 'admin'
+    : $page.url.pathname === '/me' || $page.url.pathname === '/settings'
+      ? 'profile'
+      : 'home';
+  $: topbar?.setActiveSection(activeSection);
 
   async function logout() {
     try {
@@ -18,17 +30,22 @@
   }
 
   onMount(() => {
-    const topbar = new TopBar(
+    topbar = new TopBar(
       user,
+      systemName,
+      organizationName,
       () => void goto('/rooms'),
-      () => void goto('/settings'),
+      () => void goto('/me'),
+      () => void goto('/admin'),
       () => void logout(),
     );
+    topbar.setActiveSection(activeSection);
     host.append(topbar.element);
-    const unsubscribe = connectionStatus.subscribe((status) => topbar.setConnection(status));
+    const unsubscribe = connectionStatus.subscribe((status) => topbar?.setConnection(status));
     return () => {
       unsubscribe();
-      topbar.element.remove();
+      topbar?.element.remove();
+      topbar = null;
     };
   });
 </script>

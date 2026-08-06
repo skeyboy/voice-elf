@@ -12,6 +12,14 @@ type TranscriptEvent = {
   speakers?: SpeakerIdentity[];
 };
 
+interface StreamingTextState {
+  target: string;
+  done: boolean;
+  onStreamingChange: (streaming: boolean) => void;
+}
+
+const TYPEWRITER_INTERVAL_MS = 28;
+
 export class ConversationView {
   readonly element: HTMLElement;
   private readonly list: HTMLElement;
@@ -22,7 +30,10 @@ export class ConversationView {
   private readonly speakers = new Map<string, SpeakerIdentity[]>();
   private readonly mediaAudios = new Set<HTMLAudioElement>();
   private readonly mediaObjectUrls = new Set<string>();
+  private readonly streamingText = new Map<HTMLElement, StreamingTextState>();
   private activeMediaAudio: HTMLAudioElement | null = null;
+  private typewriterFrame = 0;
+  private typewriterLastTick = 0;
   private autoFollow = true;
   private programmaticScroll = false;
   private scrollEndTimer = 0;
@@ -71,6 +82,10 @@ export class ConversationView {
     this.mediaObjectUrls.clear();
     this.activeMediaAudio = null;
     this.player.stop();
+    window.cancelAnimationFrame(this.typewriterFrame);
+    this.typewriterFrame = 0;
+    this.typewriterLastTick = 0;
+    this.streamingText.clear();
     this.rows.clear();
     this.speakers.clear();
     this.list.replaceChildren(this.emptyState);
@@ -164,7 +179,14 @@ export class ConversationView {
     this.setSourceText(article, event.text, streaming);
     const pendingLabel = article.querySelector<HTMLElement>('.translation-line.pending small');
     const pendingText = article.querySelector<HTMLElement>('.translation-line.pending .translation-text');
-    if (!streaming && event.text && pendingLabel && pendingText) {
+    if (
+      !streaming &&
+      event.text &&
+      pendingLabel &&
+      pendingText &&
+      !pendingText.dataset.streamText &&
+      !this.streamingText.has(pendingText)
+    ) {
       pendingLabel.textContent = 'TRANSLATION';
       pendingText.textContent = '正在翻译';
     }
@@ -178,6 +200,9 @@ export class ConversationView {
       audio.pause();
       this.mediaAudios.delete(audio);
     });
+    article.querySelectorAll<HTMLElement>('[data-stream-text]').forEach((element) =>
+      this.streamingText.delete(element),
+    );
     article.remove();
     this.rows.delete(id);
     this.speakers.delete(id);
@@ -203,18 +228,20 @@ export class ConversationView {
         </div>
         <div class="source-block">
           <p class="source-text" aria-live="polite">
-            <span class="source-content"></span>
+            <span class="source-content" data-stream-text=""></span>
+            <span class="source-media media-slot" aria-label="原声音频"></span>
             <span class="recognition-status" role="status" hidden><i data-lucide="loader-circle"></i><span>识别中</span></span>
           </p>
           <div class="refinement-slot" aria-live="polite"></div>
-          <div class="source-media media-slot" aria-label="原声音频"></div>
         </div>
         <div class="translation-line pending">
           <span class="direction-mark"><i data-lucide="sparkles"></i></span>
           <div class="translation-body">
             <small>TRANSLATION</small>
-            <p class="translation-text" data-stream-text="">等待原文完成</p>
-            <div class="translated-media media-slot" aria-label="译声音频"></div>
+            <p class="translation-copy">
+              <span class="translation-text" data-stream-text="">等待原文完成</span>
+              <span class="translated-media media-slot" aria-label="译声音频"></span>
+            </p>
           </div>
         </div>
         <span class="item-latency">处理中</span>
@@ -279,12 +306,8 @@ export class ConversationView {
 
   applyTranscriptDelta(event: Extract<ServerEvent, { type: 'transcript_delta' }>) {
     const article = this.ensureTranscriptRow(event);
-    const content = article.querySelector<HTMLElement>('.source-content')!;
-    if (event.done) {
-      this.setSourceText(article, event.text, false);
-    } else {
-      this.appendStreamingText(content, event.text);
-      this.setSourceStreamingState(article, true);
+    this.setSourceText(article, event.text, !event.done);
+    if (!event.done) {
       const translation = article.querySelector<HTMLElement>('.translation-line.pending .translation-text');
       if (translation && event.text && !translation.dataset.streamText) {
         translation.textContent = '正在实时翻译';
@@ -330,13 +353,15 @@ export class ConversationView {
     if (!article) return;
     article.classList.remove('transcript-streaming');
     article.classList.add('recognition-failed');
-    this.setSourceText(article, message, false);
+    this.setSourceText(article, message, false, false);
     const line = article.querySelector<HTMLElement>('.translation-line');
     if (line) {
       line.classList.add('pending');
       line.querySelector('.direction-mark')!.innerHTML = '<i data-lucide="circle-alert"></i>';
       line.querySelector('small')!.textContent = 'ASR';
-      line.querySelector<HTMLElement>('.translation-text')!.textContent = '本条未进入翻译';
+      this.commitText(line.querySelector<HTMLElement>('.translation-text')!, '本条未进入翻译');
+      this.setTranslationStreamingState(line, false);
+      line.classList.add('pending');
       refreshIcons(line);
     }
     const latency = article.querySelector('.item-latency');
@@ -355,7 +380,9 @@ export class ConversationView {
         line.classList.add('pending');
         line.querySelector('.direction-mark')!.innerHTML = '<i data-lucide="circle-alert"></i>';
         line.querySelector('small')!.textContent = 'TRANSLATION';
-        line.querySelector<HTMLElement>('.translation-text')!.textContent = message;
+        this.commitText(line.querySelector<HTMLElement>('.translation-text')!, message);
+        this.setTranslationStreamingState(line, false);
+        line.classList.add('pending');
         refreshIcons(line);
       }
     } else {
@@ -375,17 +402,12 @@ export class ConversationView {
     if (!article) return;
     const line = article.querySelector<HTMLElement>('.translation-line');
     if (!line) return;
-    line.classList.toggle('pending', !event.done);
-    line.classList.toggle('translation-streaming', !event.done);
     line.querySelector('small')!.textContent =
       languageNames[event.target_language] ?? event.target_language;
     const text = line.querySelector<HTMLElement>('.translation-text')!;
-    if (!event.done) {
-      this.appendStreamingText(text, event.text);
-    } else {
-      text.textContent = event.text;
-      text.dataset.streamText = event.text;
-    }
+    this.queueStreamingText(text, event.text, event.done, (streaming) =>
+      this.setTranslationStreamingState(line, streaming),
+    );
     refreshIcons(line);
     if (event.done) {
       const itemLatency = this.rows.get(event.utterance_id)?.querySelector('.item-latency');
@@ -407,13 +429,17 @@ export class ConversationView {
     }
     const line = this.rows.get(event.utterance_id)?.querySelector<HTMLElement>('.translation-line');
     if (!line) return;
-    line.classList.remove('pending');
-    line.classList.remove('translation-streaming');
     line.querySelector('small')!.textContent =
       languageNames[event.target_language] ?? event.target_language;
     const text = line.querySelector<HTMLElement>('.translation-text')!;
-    text.textContent = event.translated_text;
-    text.dataset.streamText = event.translated_text;
+    if (this.streamingText.has(text) || line.classList.contains('translation-streaming')) {
+      this.queueStreamingText(text, event.translated_text, true, (streaming) =>
+        this.setTranslationStreamingState(line, streaming),
+      );
+    } else {
+      this.commitText(text, event.translated_text);
+      this.setTranslationStreamingState(line, false);
+    }
     refreshIcons(line);
     this.followIfEnabled();
   }
@@ -427,13 +453,13 @@ export class ConversationView {
     const translated = translatedContainer.querySelector<HTMLElement>('[data-media-kind="translated"]');
     if (event.source_audio_url && !source) {
       sourceContainer.append(
-        this.createMediaPlayer(event.source_audio_url, '原声', event.utterance_id, false),
+        this.createMediaPlayer(event.source_audio_url, '原声', false),
       );
     }
     if (event.translated_audio_url && !translated) {
       translatedContainer.querySelector('.tts-generation')?.remove();
       translatedContainer.append(
-        this.createMediaPlayer(event.translated_audio_url, '译声', event.utterance_id, true),
+        this.createMediaPlayer(event.translated_audio_url, '译声', true),
       );
     }
     refreshIcons(article);
@@ -445,7 +471,7 @@ export class ConversationView {
     if (!container) return;
     let status = container.querySelector<HTMLElement>('.tts-generation');
     if (!status) {
-      status = document.createElement('div');
+      status = document.createElement('span');
       status.className = 'tts-generation';
       status.innerHTML = '<i data-lucide="audio-lines"></i><span>服务端生成译声</span>';
       container.append(status);
@@ -453,16 +479,6 @@ export class ConversationView {
     }
     this.setItemStatus(id, '服务端生成译声');
     this.followIfEnabled();
-  }
-
-  updateTranslatedProgress(id: string, current: number, duration: number) {
-    const control = this.rows.get(id)?.querySelector<HTMLElement>('.translated-audio');
-    const progress = control?.querySelector<HTMLInputElement>('.audio-progress');
-    const time = control?.querySelector<HTMLOutputElement>('.audio-time');
-    if (!progress || !time || !Number.isFinite(duration) || duration <= 0) return;
-    progress.max = String(duration);
-    progress.value = String(Math.min(current, duration));
-    time.textContent = `${formatMediaTime(current)} / ${formatMediaTime(duration)}`;
   }
 
   updateItemLatency(id: string, totalMs: number) {
@@ -507,9 +523,9 @@ export class ConversationView {
     this.list.scrollTo({ top: this.list.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
   }
 
-  private createMediaPlayer(url: string, label: string, utteranceId: string, translated: boolean) {
-    const wrapper = document.createElement('div');
-    wrapper.className = `media-player${translated ? ' translated-audio' : ''}`;
+  private createMediaPlayer(url: string, label: string, translated: boolean) {
+    const wrapper = document.createElement('span');
+    wrapper.className = 'media-player';
     wrapper.dataset.mediaKind = translated ? 'translated' : 'source';
     const button = document.createElement('button');
     button.type = 'button';
@@ -520,43 +536,18 @@ export class ConversationView {
     audio.setAttribute('playsinline', '');
     wrapper.append(button, audio);
     this.mediaAudios.add(audio);
-    this.renderMediaButton(button, label, false);
-
-    if (translated) {
-      const progress = document.createElement('input');
-      progress.className = 'audio-progress';
-      progress.type = 'range';
-      progress.min = '0';
-      progress.max = '1';
-      progress.step = '0.01';
-      progress.value = '0';
-      progress.setAttribute('aria-label', '译声播放进度');
-      const time = document.createElement('output');
-      time.className = 'audio-time';
-      time.textContent = '0:00 / --:--';
-      wrapper.append(progress, time);
-      audio.addEventListener('loadedmetadata', () =>
-        this.updateTranslatedProgress(utteranceId, audio.currentTime, audio.duration),
-      );
-      audio.addEventListener('timeupdate', () =>
-        this.updateTranslatedProgress(utteranceId, audio.currentTime, audio.duration),
-      );
-      progress.addEventListener('input', () => {
-        if (Number.isFinite(audio.duration)) audio.currentTime = Number(progress.value);
-      });
-    }
+    this.renderMediaButton(button, label, 'idle');
 
     button.addEventListener('click', async () => {
       if (audio.paused) {
         this.player.stop();
-        await this.player.unlock();
-        if (this.activeMediaAudio && this.activeMediaAudio !== audio) this.activeMediaAudio.pause();
-        this.activeMediaAudio = audio;
         try {
+          await this.player.unlock();
+          if (this.activeMediaAudio && this.activeMediaAudio !== audio) this.activeMediaAudio.pause();
+          this.activeMediaAudio = audio;
           if (!audio.src) {
             button.disabled = true;
-            button.innerHTML = `<i data-lucide="loader-circle"></i><span>加载${label}</span>`;
-            refreshIcons(button);
+            this.renderMediaButton(button, label, 'loading');
             const response = await fetch(url, {
               credentials: 'include',
               cache: 'no-store',
@@ -569,7 +560,6 @@ export class ConversationView {
             audio.src = objectUrl;
             audio.load();
           }
-          this.onMediaPlaybackChange(true);
           await audio.play();
         } catch (error) {
           this.activeMediaAudio = null;
@@ -579,7 +569,7 @@ export class ConversationView {
           );
         } finally {
           button.disabled = false;
-          if (audio.paused) this.renderMediaButton(button, label, false);
+          if (audio.paused) this.renderMediaButton(button, label, 'idle');
         }
       } else {
         audio.pause();
@@ -590,34 +580,40 @@ export class ConversationView {
       const status = audio.error?.code;
       this.onError(`无法加载${label}${status ? `（媒体错误 ${status}）` : ''}`);
     });
-    audio.addEventListener('play', () => this.renderMediaButton(button, label, true));
+    audio.addEventListener('play', () => {
+      this.onMediaPlaybackChange(true);
+      this.renderMediaButton(button, label, 'playing');
+    });
     audio.addEventListener('pause', () => {
       this.onMediaPlaybackChange(false);
-      this.renderMediaButton(button, label, false);
+      this.renderMediaButton(button, label, 'idle');
     });
     audio.addEventListener('ended', () => {
       this.onMediaPlaybackChange(false);
-      this.renderMediaButton(button, label, false);
+      this.renderMediaButton(button, label, 'idle');
       if (this.activeMediaAudio === audio) this.activeMediaAudio = null;
     });
     return wrapper;
   }
 
-  private liveText(value: string) {
-    const span = document.createElement('span');
-    span.className = 'live-text';
-    span.textContent = value;
-    window.setTimeout(() => {
-      if (span.isConnected) span.replaceWith(document.createTextNode(span.textContent ?? ''));
-    }, 220);
-    return span;
-  }
-
-  private setSourceText(article: HTMLElement, value: string, streaming: boolean) {
+  private setSourceText(
+    article: HTMLElement,
+    value: string,
+    streaming: boolean,
+    animate?: boolean,
+  ) {
     const content = article.querySelector<HTMLElement>('.source-content')!;
-    content.textContent = value;
-    content.dataset.streamText = value;
-    this.setSourceStreamingState(article, streaming);
+    const shouldAnimate =
+      animate ??
+      (streaming || article.classList.contains('transcript-streaming') || this.streamingText.has(content));
+    if (shouldAnimate) {
+      this.queueStreamingText(content, value, !streaming, (active) =>
+        this.setSourceStreamingState(article, active),
+      );
+    } else {
+      this.commitText(content, value);
+      this.setSourceStreamingState(article, streaming);
+    }
   }
 
   private setSourceStreamingState(article: HTMLElement, streaming: boolean) {
@@ -628,24 +624,106 @@ export class ConversationView {
     status.hidden = !streaming;
   }
 
-  private appendStreamingText(container: HTMLElement, nextText: string) {
-    const currentText = container.dataset.streamText ?? '';
-    if (!nextText.startsWith(currentText)) {
-      container.textContent = nextText;
-      container.dataset.streamText = nextText;
-      return;
-    }
-    const delta = nextText.slice(currentText.length);
-    if (!delta) return;
-    if (!currentText) container.replaceChildren();
-    container.append(this.liveText(delta));
-    container.dataset.streamText = nextText;
+  private setTranslationStreamingState(line: HTMLElement, streaming: boolean) {
+    line.classList.toggle('pending', streaming);
+    line.classList.toggle('translation-streaming', streaming);
   }
 
-  private renderMediaButton(button: HTMLButtonElement, label: string, playing: boolean) {
-    button.innerHTML = `<i data-lucide="${playing ? 'pause' : 'play'}"></i><span>${playing ? '暂停' : '播放'}${label}</span>`;
-    button.title = `${playing ? '暂停' : '播放'}${label}`;
+  private queueStreamingText(
+    element: HTMLElement,
+    target: string,
+    done: boolean,
+    onStreamingChange: (streaming: boolean) => void,
+  ) {
+    const state = { target, done, onStreamingChange };
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let displayed = element.textContent ?? '';
+    if (!target.startsWith(displayed)) {
+      displayed = commonGraphemePrefix(displayed, target);
+      element.textContent = displayed;
+    }
+    element.dataset.streamText = target;
+    if (reducedMotion) {
+      element.textContent = target;
+      if (done) this.streamingText.delete(element);
+      else this.streamingText.set(element, state);
+      onStreamingChange(!done);
+      return;
+    }
+    if (displayed === target && done) {
+      this.streamingText.delete(element);
+      onStreamingChange(false);
+      return;
+    }
+    this.streamingText.set(element, state);
+    onStreamingChange(true);
+    if (displayed !== target) this.ensureTypewriter();
+  }
+
+  private commitText(element: HTMLElement, value: string) {
+    this.streamingText.delete(element);
+    element.textContent = value;
+    element.dataset.streamText = value;
+  }
+
+  private ensureTypewriter() {
+    if (this.typewriterFrame || !this.hasPendingText()) return;
+    this.typewriterLastTick = performance.now() - TYPEWRITER_INTERVAL_MS;
+    this.typewriterFrame = window.requestAnimationFrame(this.advanceTypewriter);
+  }
+
+  private advanceTypewriter = (timestamp: number) => {
+    this.typewriterFrame = 0;
+    const elapsed = timestamp - this.typewriterLastTick;
+    if (elapsed < TYPEWRITER_INTERVAL_MS) {
+      this.typewriterFrame = window.requestAnimationFrame(this.advanceTypewriter);
+      return;
+    }
+    const steps = Math.min(4, Math.max(1, Math.floor(elapsed / TYPEWRITER_INTERVAL_MS)));
+    this.typewriterLastTick = timestamp;
+    let changed = false;
+    for (const [element, state] of this.streamingText) {
+      let displayed = element.textContent ?? '';
+      if (!state.target.startsWith(displayed)) {
+        displayed = commonGraphemePrefix(displayed, state.target);
+        element.textContent = displayed;
+      }
+      if (displayed === state.target) continue;
+      const remaining = graphemes(state.target.slice(displayed.length));
+      const catchUp = remaining.length > 72 ? 6 : remaining.length > 36 ? 4 : remaining.length > 16 ? 2 : 1;
+      element.textContent = displayed + remaining.slice(0, Math.max(steps, catchUp)).join('');
+      changed = true;
+      if (element.textContent === state.target && state.done) {
+        this.streamingText.delete(element);
+        state.onStreamingChange(false);
+      }
+    }
+    if (changed) this.followIfEnabled();
+    if (this.hasPendingText()) {
+      this.typewriterFrame = window.requestAnimationFrame(this.advanceTypewriter);
+    } else {
+      this.typewriterLastTick = 0;
+    }
+  };
+
+  private hasPendingText() {
+    return Array.from(this.streamingText).some(
+      ([element, state]) => (element.textContent ?? '') !== state.target,
+    );
+  }
+
+  private renderMediaButton(
+    button: HTMLButtonElement,
+    label: string,
+    state: 'idle' | 'loading' | 'playing',
+  ) {
+    const playing = state === 'playing';
+    const action = state === 'loading' ? `加载${label}` : `${playing ? '暂停' : '播放'}${label}`;
+    button.innerHTML = `<i data-lucide="${state === 'loading' ? 'loader-circle' : playing ? 'pause' : 'play'}"></i>`;
+    button.dataset.state = state;
+    button.title = action;
     button.setAttribute('aria-label', button.title);
+    button.setAttribute('aria-pressed', String(playing));
     refreshIcons(button);
   }
 }
@@ -659,11 +737,28 @@ function formatTimestamp(value?: string) {
   }).format(value ? new Date(value) : new Date());
 }
 
-function formatMediaTime(seconds: number) {
-  const safe = Math.max(0, Math.floor(Number.isFinite(seconds) ? seconds : 0));
-  return `${Math.floor(safe / 60)}:${String(safe % 60).padStart(2, '0')}`;
-}
-
 function refinementEngineLabel(engine: string) {
   return engine === 'moss-transcribe-diarize' ? 'MOSS' : engine;
+}
+
+function graphemes(value: string) {
+  if ('Segmenter' in Intl) {
+    const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+    return Array.from(segmenter.segment(value), (part) => part.segment);
+  }
+  return Array.from(value);
+}
+
+function commonGraphemePrefix(left: string, right: string) {
+  const leftParts = graphemes(left);
+  const rightParts = graphemes(right);
+  let length = 0;
+  while (
+    length < leftParts.length &&
+    length < rightParts.length &&
+    leftParts[length] === rightParts[length]
+  ) {
+    length += 1;
+  }
+  return leftParts.slice(0, length).join('');
 }

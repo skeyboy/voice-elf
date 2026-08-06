@@ -4,11 +4,34 @@
   import { onMount } from 'svelte';
   import TopBarHost from '$lib/TopBarHost.svelte';
   import ToastRegion from '$lib/ToastRegion.svelte';
-  import { currentUser, loadSession, showError, showToast, type ToastKind } from '$lib/session';
+  import {
+    currentUser,
+    instanceAuthorization,
+    loadAuthorization,
+    loadSetup,
+    loadSession,
+    showError,
+    showToast,
+    systemSetup,
+    type ToastKind,
+  } from '$lib/session';
   import '../styles/index.css';
 
+  const refreshAuthorization = async (force = false) => {
+    const authorization = await loadAuthorization(force);
+    if (authorization.allowed) void loadSession();
+    return authorization;
+  };
+
   onMount(() => {
-    void loadSession();
+    void loadSetup().then((setup) => {
+      if (setup.initialized) void refreshAuthorization();
+    });
+    const authorizationTimer = window.setInterval(() => {
+      void loadSetup(true).then((setup) => {
+        if (setup.initialized) void refreshAuthorization(true);
+      });
+    }, 60_000);
     let quitPromptTimer = 0;
     let quitPromptOpen = false;
 
@@ -48,21 +71,82 @@
     window.addEventListener('voice-elf:native-toast', handleNativeToast);
     return () => {
       window.clearTimeout(quitPromptTimer);
+      window.clearInterval(authorizationTimer);
       window.removeEventListener('voice-elf:native-quit-requested', handleQuitRequest);
       window.removeEventListener('voice-elf:native-toast', handleNativeToast);
     };
   });
 
-  $: if ($currentUser !== undefined) {
+  $: if ($systemSetup) {
+    const setupRoute = $page.url.pathname === '/setup';
+    if (!$systemSetup.initialized && !setupRoute) void goto('/setup', { replaceState: true });
+    if ($systemSetup.initialized && setupRoute) {
+      void goto($currentUser ? '/rooms' : '/login', { replaceState: true });
+    }
+    if ($systemSetup.profile) document.title = $systemSetup.profile.system_name;
+  }
+
+  $: if ($systemSetup?.initialized && $instanceAuthorization?.allowed && $currentUser !== undefined) {
     const loginRoute = $page.url.pathname === '/login';
     if (!$currentUser && !loginRoute) void goto('/login', { replaceState: true });
     if ($currentUser && loginRoute) void goto('/rooms', { replaceState: true });
   }
 </script>
 
-{#if $currentUser && $page.url.pathname !== '/login' && !$page.url.pathname.endsWith('/subtitles')}
-  <TopBarHost user={$currentUser} />
+{#if !$systemSetup}
+  <main class="license-state-page">
+    <section class="license-state-panel license-state-loading" aria-live="polite">
+      <span class="license-state-icon" aria-hidden="true">...</span>
+      <h1>正在检查系统状态</h1>
+    </section>
+  </main>
+{:else if !$systemSetup.initialized}
+  {#if $page.url.pathname === '/setup'}
+    <slot />
+  {:else}
+    <main class="license-state-page">
+      <section class="license-state-panel license-state-loading" aria-live="polite">
+        <span class="license-state-icon" aria-hidden="true">...</span>
+        <h1>正在进入初始化向导</h1>
+      </section>
+    </main>
+  {/if}
+{:else if !$instanceAuthorization}
+  <main class="license-state-page">
+    <section class="license-state-panel license-state-loading" aria-live="polite">
+      <span class="license-state-icon" aria-hidden="true">...</span>
+      <h1>正在验证实例</h1>
+    </section>
+  </main>
+{:else if !$instanceAuthorization.allowed}
+  <main class="license-state-page">
+    <section class="license-state-panel" aria-live="polite">
+      <span class="license-state-icon" aria-hidden="true">!</span>
+      <p>{$instanceAuthorization.tenant_name ?? 'VOICE ELF INSTANCE'}</p>
+      <h1>实例授权不可用</h1>
+      <strong>{$instanceAuthorization.message}</strong>
+      {#if $instanceAuthorization.last_checked_at}
+        <small>最后校验 {new Date($instanceAuthorization.last_checked_at).toLocaleString('zh-CN')}</small>
+      {/if}
+      <button type="button" on:click={() => refreshAuthorization(true)}>重新校验</button>
+    </section>
+  </main>
+{:else}
+  {#if $instanceAuthorization && ['warning', 'grace'].includes($instanceAuthorization.status)}
+    <aside class="license-warning" role="status">
+      <strong>{$instanceAuthorization.message}</strong>
+      {#if $instanceAuthorization.license_expires_at}
+        <span>到期时间 {new Date($instanceAuthorization.license_expires_at).toLocaleString('zh-CN')}</span>
+      {/if}
+    </aside>
+  {/if}
+  {#if $currentUser && $page.url.pathname !== '/login' && !$page.url.pathname.endsWith('/subtitles')}
+    <TopBarHost
+      user={$currentUser}
+      systemName={$systemSetup.profile?.system_name ?? 'Voice Elf'}
+      organizationName={$systemSetup.profile?.organization_name ?? ''}
+    />
+  {/if}
+  <slot />
 {/if}
-
-<slot />
 <ToastRegion />

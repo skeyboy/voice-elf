@@ -46,6 +46,7 @@ export class SubtitlePage implements Page {
   private fitAllowGrow = false;
   private fitScale = 1;
   private announcedText = new Set<string>();
+  private historySync: Promise<void> | null = null;
   private readonly handleBrowserFullscreenChange = () => {
     this.setFullscreenControl(Boolean(document.fullscreenElement));
   };
@@ -71,6 +72,7 @@ export class SubtitlePage implements Page {
       this.onRooms();
       return;
     }
+    this.mergeHistory(detail);
     root.innerHTML = this.template();
     root.querySelector('.subtitle-room-name')!.textContent = detail.room.name;
     void loadAppConfig().then((config) => {
@@ -107,6 +109,7 @@ export class SubtitlePage implements Page {
     this.fitTimer = 0;
     this.unsubscribePreferences();
     this.unsubscribePreferences = () => {};
+    this.historySync = null;
     document.removeEventListener('fullscreenchange', this.handleBrowserFullscreenChange);
     document.body.classList.remove('subtitle-route');
     this.root = null;
@@ -207,6 +210,7 @@ export class SubtitlePage implements Page {
     switch (event.type) {
       case 'room_subscribed':
         this.setConnection('connected');
+        void this.syncHistory();
         break;
       case 'ready':
         this.setConnection('connected');
@@ -255,18 +259,7 @@ export class SubtitlePage implements Page {
   private ensureUtterance(id: string) {
     let utterance = this.utterances.get(id);
     if (!utterance) {
-      utterance = {
-        id,
-        source: '',
-        sourceTarget: '',
-        sourceDone: false,
-        translation: '',
-        translationTarget: '',
-        translationDone: false,
-        speakers: [],
-        sourceStreaming: false,
-        translationStreaming: false,
-      };
+      utterance = this.createUtterance(id);
       this.utterances.set(id, utterance);
       this.order.push(id);
       while (this.order.length > MAX_VISIBLE_UTTERANCES) {
@@ -275,6 +268,76 @@ export class SubtitlePage implements Page {
       }
     }
     return utterance;
+  }
+
+  private createUtterance(id: string): CaptionUtterance {
+    return {
+      id,
+      source: '',
+      sourceTarget: '',
+      sourceDone: false,
+      translation: '',
+      translationTarget: '',
+      translationDone: false,
+      speakers: [],
+      sourceStreaming: false,
+      translationStreaming: false,
+    };
+  }
+
+  private mergeHistory(detail: RoomDetail) {
+    const recent = detail.utterances
+      .filter((utterance) => utterance.source_text || utterance.translated_text)
+      .slice(0, MAX_VISIBLE_UTTERANCES)
+      .reverse();
+    const historyIds = new Set<string>();
+    for (const record of recent) {
+      historyIds.add(record.id);
+      const utterance = this.utterances.get(record.id) ?? this.createUtterance(record.id);
+      if (record.source_text) {
+        utterance.source = record.source_text;
+        utterance.sourceTarget = record.source_text;
+        utterance.sourceDone = true;
+        utterance.sourceStreaming = false;
+      }
+      if (record.translated_text) {
+        utterance.translation = record.translated_text;
+        utterance.translationTarget = record.translated_text;
+        utterance.translationDone = true;
+        utterance.translationStreaming = false;
+      }
+      utterance.speakers = record.speakers;
+      this.utterances.set(record.id, utterance);
+    }
+
+    // Events received after the history snapshot are newer and stay at the end.
+    const liveOnly = this.order.filter((id) => !historyIds.has(id) && this.utterances.has(id));
+    this.order = [...recent.map((record) => record.id), ...liveOnly].slice(
+      -MAX_VISIBLE_UTTERANCES,
+    );
+    const retained = new Set(this.order);
+    for (const id of this.utterances.keys()) {
+      if (!retained.has(id)) this.utterances.delete(id);
+    }
+  }
+
+  private syncHistory() {
+    if (this.historySync) return this.historySync;
+    this.historySync = this.getDetail()
+      .then((detail) => {
+        if (this.destroyed) return;
+        this.mergeHistory(detail);
+        this.render();
+      })
+      .catch((error) => {
+        if (!this.destroyed) {
+          this.onError(error instanceof Error ? error.message : '无法同步字幕记录');
+        }
+      })
+      .finally(() => {
+        this.historySync = null;
+      });
+    return this.historySync;
   }
 
   private removeUtterance(id: string) {

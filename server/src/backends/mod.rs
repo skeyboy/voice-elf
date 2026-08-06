@@ -3,11 +3,12 @@ mod moss;
 mod translator;
 mod tts;
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures_util::future::join_all;
+use serde::Serialize;
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::config::{AppConfig, BackendMode};
@@ -20,6 +21,120 @@ pub use tts::DemoSynthesizer;
 pub use tts::{TtsChunkSink, TtsEngine, TtsRequest, build_tts_engine};
 
 pub use crate::protocol::TranscriptionSegment;
+
+pub const QWEN_LOCAL_ASR_ID: &str = "qwen-local";
+pub const DEMO_ASR_ID: &str = "demo";
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AsrBackendInfo {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub engine: &'static str,
+    pub description: &'static str,
+    pub available: bool,
+    pub production: bool,
+}
+
+#[derive(Clone)]
+struct AsrBackendEntry {
+    info: AsrBackendInfo,
+    transcriber: Option<Arc<dyn Transcriber>>,
+}
+
+#[derive(Clone)]
+pub struct AsrBackendRegistry {
+    entries: Arc<HashMap<&'static str, AsrBackendEntry>>,
+    default_backend_id: &'static str,
+}
+
+impl AsrBackendRegistry {
+    pub fn from_config(config: &AppConfig) -> Result<Self> {
+        let mut entries = HashMap::new();
+        entries.insert(
+            DEMO_ASR_ID,
+            AsrBackendEntry {
+                info: AsrBackendInfo {
+                    id: DEMO_ASR_ID,
+                    name: "演示占位识别",
+                    engine: "内置 Demo",
+                    description: "仅用于界面联调，不执行真实语音识别",
+                    available: true,
+                    production: false,
+                },
+                transcriber: Some(Arc::new(DemoTranscriber::new())),
+            },
+        );
+
+        let qwen_available = config
+            .asr
+            .model_dir
+            .as_ref()
+            .is_some_and(|model_dir| model_dir.is_dir());
+        let qwen = if qwen_available {
+            Some(Arc::new(QwenAsrTranscriber::new(
+                config.asr.clone(),
+                config.inference_timeout,
+            )?) as Arc<dyn Transcriber>)
+        } else {
+            None
+        };
+        entries.insert(
+            QWEN_LOCAL_ASR_ID,
+            AsrBackendEntry {
+                info: AsrBackendInfo {
+                    id: QWEN_LOCAL_ASR_ID,
+                    name: "Qwen3 ASR 本地模型",
+                    engine: "Qwen3-ASR-0.6B",
+                    description: "在当前实例本地执行流式识别，音频不离开部署环境",
+                    available: qwen.is_some(),
+                    production: true,
+                },
+                transcriber: qwen,
+            },
+        );
+
+        let default_backend_id = match config.backend_mode {
+            BackendMode::Demo => DEMO_ASR_ID,
+            BackendMode::Local => QWEN_LOCAL_ASR_ID,
+        };
+        if !entries
+            .get(default_backend_id)
+            .is_some_and(|entry| entry.transcriber.is_some())
+        {
+            bail!("default ASR backend '{default_backend_id}' is not available");
+        }
+        Ok(Self {
+            entries: Arc::new(entries),
+            default_backend_id,
+        })
+    }
+
+    pub fn default_backend_id(&self) -> &'static str {
+        self.default_backend_id
+    }
+
+    pub fn providers(&self) -> Vec<AsrBackendInfo> {
+        let mut providers = self
+            .entries
+            .values()
+            .map(|entry| entry.info.clone())
+            .collect::<Vec<_>>();
+        providers.sort_by_key(|provider| (!provider.production, provider.name));
+        providers
+    }
+
+    pub fn services_for(
+        &self,
+        services: &AppServices,
+        backend_id: &str,
+    ) -> Option<Arc<AppServices>> {
+        let entry = self.entries.get(backend_id)?;
+        let transcriber = entry.transcriber.as_ref()?.clone();
+        Some(Arc::new(
+            services.with_transcriber(transcriber, entry.info.id),
+        ))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Transcription {
@@ -273,6 +388,20 @@ impl AppServices {
             }
         }
     }
+
+    fn with_transcriber(
+        &self,
+        transcriber: Arc<dyn Transcriber>,
+        backend_name: &'static str,
+    ) -> Self {
+        Self {
+            transcriber,
+            refinement_engines: self.refinement_engines.clone(),
+            translator: self.translator.clone(),
+            synthesizer: self.synthesizer.clone(),
+            backend_name,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -287,6 +416,20 @@ mod tests {
             Transcription::plain("hello wonderful world", "en"),
         ];
         assert_eq!(select_consensus(&candidates).unwrap().text, "Hello, world!");
+    }
+
+    #[test]
+    fn registry_keeps_demo_explicitly_non_production() {
+        let provider = AsrBackendInfo {
+            id: DEMO_ASR_ID,
+            name: "Demo",
+            engine: "Demo",
+            description: "placeholder",
+            available: true,
+            production: false,
+        };
+        assert!(!provider.production);
+        assert_eq!(QWEN_LOCAL_ASR_ID, "qwen-local");
     }
 }
 

@@ -38,6 +38,7 @@ struct RoomRuntime {
     channel: broadcast::Sender<Message>,
     members: HashMap<Uuid, RuntimeMember>,
     audio_tx: Option<mpsc::Sender<RoomAudioCommand>>,
+    backend: Option<&'static str>,
 }
 
 struct RuntimeMember {
@@ -46,11 +47,14 @@ struct RuntimeMember {
     is_muted: bool,
     connections: usize,
     is_speaking: bool,
+    disconnect: broadcast::Sender<()>,
 }
 
 pub(crate) struct RoomConnection {
     pub events: broadcast::Receiver<Message>,
+    pub revoked: broadcast::Receiver<()>,
     pub can_publish: bool,
+    pub backend: &'static str,
 }
 
 #[derive(Debug)]
@@ -96,6 +100,7 @@ impl RoomHub {
             channel: broadcast::channel(ROOM_MESSAGE_CAPACITY).0,
             members: HashMap::new(),
             audio_tx: None,
+            backend: None,
         });
         for member in members {
             let current = runtime
@@ -107,6 +112,7 @@ impl RoomHub {
                     is_muted: member.is_muted,
                     connections: 0,
                     is_speaking: false,
+                    disconnect: broadcast::channel(8).0,
                 });
             current.username.clone_from(&member.username);
             current.is_owner = member.is_owner;
@@ -121,12 +127,15 @@ impl RoomHub {
                 is_muted: false,
                 connections: 0,
                 is_speaking: false,
+                disconnect: broadcast::channel(8).0,
             });
         current.connections += 1;
         let can_publish = current.is_owner || !current.is_muted;
+        let revoked = current.disconnect.subscribe();
         let events = runtime.channel.subscribe();
 
         if runtime.audio_tx.is_none() {
+            runtime.backend = Some(services.backend_name);
             runtime.audio_tx = Some(self.start_audio_runtime(
                 room,
                 runtime.channel.clone(),
@@ -135,11 +144,54 @@ impl RoomHub {
                 media,
             ));
         }
+        let runtime_backend = runtime
+            .backend
+            .expect("room runtime backend is set with its audio pipeline");
         drop(rooms);
         self.broadcast_members(room.id);
         RoomConnection {
             events,
+            revoked,
             can_publish,
+            backend: runtime_backend,
+        }
+    }
+
+    pub(crate) async fn disconnect_user(&self, user_id: Uuid) {
+        let affected = {
+            let mut rooms = self
+                .rooms
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            rooms
+                .iter_mut()
+                .filter_map(|(room_id, runtime)| {
+                    let member = runtime.members.get_mut(&user_id)?;
+                    member.connections = 0;
+                    member.is_speaking = false;
+                    let _ = member.disconnect.send(());
+                    Some((*room_id, runtime.audio_tx.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (room_id, audio_tx) in affected {
+            if let Some(sender) = audio_tx {
+                let _ = sender
+                    .send(RoomAudioCommand::RemoveSpeaker { user_id })
+                    .await;
+            }
+            self.broadcast_members(room_id);
+        }
+    }
+
+    pub(crate) async fn close_room(&self, room_id: Uuid) {
+        let runtime = self
+            .rooms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&room_id);
+        if let Some(sender) = runtime.and_then(|room| room.audio_tx) {
+            let _ = sender.send(RoomAudioCommand::Shutdown).await;
         }
     }
 

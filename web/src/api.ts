@@ -3,6 +3,10 @@ import type { LatencyReport, TranscriptionSegment } from './protocol';
 export interface User {
   id: string;
   username: string;
+  role: 'admin' | 'member';
+  status: 'pending' | 'active' | 'suspended';
+  verified_at: string | null;
+  last_login_at: string | null;
   created_at: string;
 }
 
@@ -14,12 +18,15 @@ export interface RoomSummary {
   source_language: string;
   target_language: string;
   max_utterance_seconds: number;
+  status: 'active' | 'ended' | 'archived';
   created_at: string;
   updated_at: string;
   is_owner: boolean;
   is_member: boolean;
   member_count: number;
   utterance_count: number;
+  duration_ms: number;
+  last_activity_at: string;
   preview_text: string | null;
 }
 
@@ -83,6 +90,152 @@ export interface VoiceReference {
   duration_ms: number;
   created_at: string;
   audio_url: string;
+}
+
+export interface AdminOverview {
+  total_users: number;
+  pending_users: number;
+  suspended_users: number;
+  active_rooms: number;
+  total_rooms: number;
+}
+
+export interface InstanceAuthorization {
+  mode: 'standalone' | 'bus' | 'tenant';
+  allowed: boolean;
+  status: 'standalone' | 'checking' | 'authorized' | 'warning' | 'grace' | 'blocked';
+  message: string;
+  tenant_id: string | null;
+  tenant_name: string | null;
+  instance_id: string | null;
+  instance_name: string | null;
+  asr_backend_id: string | null;
+  asr_config_source: 'system' | 'tenant' | null;
+  license_expires_at: string | null;
+  grace_ends_at: string | null;
+  lease_expires_at: string | null;
+  last_checked_at: string | null;
+  next_check_at: string | null;
+}
+
+export interface SystemProfile {
+  id: string;
+  system_name: string;
+  organization_name: string;
+  public_url: string | null;
+  deployment_mode: 'standalone' | 'bus' | 'tenant';
+  initialized_by: string;
+  initialized_at: string;
+}
+
+export interface SetupStatus {
+  initialized: boolean;
+  database_ready: boolean;
+  initialization_allowed: boolean;
+  deployment_mode: 'standalone' | 'bus' | 'tenant';
+  backend: string;
+  authorization: InstanceAuthorization;
+  profile: SystemProfile | null;
+}
+
+export interface InitializeSystemInput {
+  setup_token: string;
+  system_name: string;
+  organization_name: string;
+  public_url: string;
+  admin_username: string;
+  admin_password: string;
+}
+
+export interface InitializeSystemResponse {
+  profile: SystemProfile;
+  user: User;
+}
+
+export interface AuthorityTenant {
+  id: string;
+  name: string;
+  slug: string;
+  status: 'active' | 'suspended' | 'revoked';
+  license_expires_at: string;
+  grace_ends_at: string;
+  warning_days: number;
+  offline_lease_minutes: number;
+  asr_backend_id: string | null;
+  created_at: string;
+  updated_at: string;
+  instance_count: number;
+  last_seen_at: string | null;
+}
+
+export interface AuthorityInstance {
+  id: string;
+  tenant_id: string;
+  name: string;
+  client_id: string;
+  status: 'active' | 'revoked';
+  last_seen_at: string | null;
+  last_authorized_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface IssuedAuthorityCredential {
+  instance: AuthorityInstance;
+  client_secret: string;
+}
+
+export interface AsrProvider {
+  id: string;
+  name: string;
+  engine: string;
+  description: string;
+  available: boolean;
+  production: boolean;
+}
+
+export interface AsrSystemSetting {
+  id: string;
+  backend_id: string;
+  updated_by: string | null;
+  updated_at: string;
+}
+
+export interface EffectiveAsrSelection {
+  backend_id: string;
+  source: 'system' | 'tenant';
+  tenant_id: string | null;
+  tenant_name: string | null;
+}
+
+export interface AsrManagement {
+  providers: AsrProvider[];
+  system_setting: AsrSystemSetting;
+  effective: EffectiveAsrSelection;
+  can_update_system: boolean;
+  applies_to: 'new_room_pipelines';
+}
+
+export interface AdminUser {
+  id: string;
+  username: string;
+  role: User['role'];
+  status: User['status'];
+  verified_at: string | null;
+  last_login_at: string | null;
+  created_at: string;
+  owned_room_count: number;
+  joined_room_count: number;
+  utterance_count: number;
+  last_activity_at: string | null;
+}
+
+export interface Paginated<T> {
+  items: T[];
+  page: number;
+  page_size: number;
+  total: number;
+  total_pages: number;
 }
 
 export class ApiRequestError extends Error {

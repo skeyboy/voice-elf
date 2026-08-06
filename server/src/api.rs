@@ -25,6 +25,10 @@ use crate::{
     storage::{Database, RoomSummary, UserRecord, UtteranceHistory},
 };
 
+mod asr;
+mod authority;
+mod setup;
+
 pub const AUTH_COOKIE: &str = "voice_elf_session";
 const SESSION_DAYS: i64 = 7;
 const MAX_VOICE_REFERENCES: usize = 5;
@@ -34,10 +38,19 @@ const MAX_VOICE_REFERENCE_MS: i64 = 15_000;
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .merge(authority::router())
+        .merge(asr::router())
+        .merge(setup::router())
         .route("/auth/register", post(register))
         .route("/auth/login", post(login))
         .route("/auth/logout", delete(logout))
         .route("/auth/me", get(me))
+        .route("/admin/overview", get(admin_overview))
+        .route("/admin/users", get(admin_list_users))
+        .route("/admin/users/{user_id}", patch(admin_update_user))
+        .route("/admin/rooms", get(admin_list_rooms))
+        .route("/admin/rooms/{room_id}", patch(admin_update_room))
+        .route("/admin/rooms/{room_id}/inspect", get(admin_inspect_room))
         .route(
             "/voice-references",
             get(list_voice_references)
@@ -183,16 +196,11 @@ async fn delete_voice_reference(
     Path(voice_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     let user = authenticate(&state, &cookies).await?;
-    let reference = database(&state)?
+    database(&state)?
         .delete_voice_reference(voice_id, user.id)
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("自定义音色不存在"))?;
-    state
-        .media
-        .delete_voice_reference(&reference.audio_path)
-        .await
-        .map_err(ApiError::internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -256,6 +264,14 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, message)
     }
 
+    fn license_required(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::PAYMENT_REQUIRED, message)
+    }
+
+    fn setup_required() -> Self {
+        Self::new(StatusCode::PRECONDITION_REQUIRED, "系统尚未完成初始化")
+    }
+
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
@@ -268,7 +284,7 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, message)
     }
 
-    fn unavailable(message: impl Into<String>) -> Self {
+    pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, message)
     }
 
@@ -301,6 +317,10 @@ struct Credentials {
 pub struct UserResponse {
     pub id: Uuid,
     pub username: String,
+    pub role: String,
+    pub status: String,
+    pub verified_at: Option<chrono::DateTime<Utc>>,
+    pub last_login_at: Option<chrono::DateTime<Utc>>,
     pub created_at: chrono::DateTime<Utc>,
 }
 
@@ -309,6 +329,10 @@ impl From<UserRecord> for UserResponse {
         Self {
             id: user.id,
             username: user.username,
+            role: user.role,
+            status: user.status,
+            verified_at: user.verified_at,
+            last_login_at: user.last_login_at,
             created_at: user.created_at,
         }
     }
@@ -319,6 +343,8 @@ async fn register(
     cookies: Cookies,
     Json(credentials): Json<Credentials>,
 ) -> Result<(StatusCode, Json<UserResponse>), ApiError> {
+    require_initialized(&state).await?;
+    require_authority(&state).await?;
     let database = database(&state)?;
     let username = validate_username(&credentials.username)?;
     validate_password(&credentials.password)?;
@@ -339,7 +365,9 @@ async fn register(
         .create_user(&username, &password_hash)
         .await
         .map_err(ApiError::internal)?;
-    issue_session(database, &cookies, user.id).await?;
+    if user.status == "active" {
+        issue_session(database, &cookies, user.id).await?;
+    }
     Ok((StatusCode::CREATED, Json(user.into())))
 }
 
@@ -348,6 +376,8 @@ async fn login(
     cookies: Cookies,
     Json(credentials): Json<Credentials>,
 ) -> Result<Json<UserResponse>, ApiError> {
+    require_initialized(&state).await?;
+    require_authority(&state).await?;
     let database = database(&state)?;
     let username = credentials.username.trim();
     let Some(user) = database
@@ -365,6 +395,16 @@ async fn login(
     if !valid {
         return Err(ApiError::unauthorized());
     }
+    match user.status.as_str() {
+        "pending" => return Err(ApiError::forbidden("账号正在等待管理员验证")),
+        "suspended" => return Err(ApiError::forbidden("账号已停用，请联系管理员")),
+        "active" => {}
+        _ => return Err(ApiError::forbidden("账号状态异常，请联系管理员")),
+    }
+    let user = database
+        .record_login(user.id)
+        .await
+        .map_err(ApiError::internal)?;
     issue_session(database, &cookies, user.id).await?;
     Ok(Json(user.into()))
 }
@@ -391,6 +431,194 @@ async fn me(
     cookies: Cookies,
 ) -> Result<Json<UserResponse>, ApiError> {
     Ok(Json(authenticate(&state, &cookies).await?.into()))
+}
+
+#[derive(Deserialize)]
+struct AdminListQuery {
+    q: Option<String>,
+    status: Option<String>,
+    role: Option<String>,
+    sort: Option<String>,
+    order: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct AdminUserInput {
+    role: String,
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct AdminRoomInput {
+    status: String,
+}
+
+async fn admin_overview(
+    State(state): State<AppState>,
+    cookies: Cookies,
+) -> Result<Json<crate::storage::AdminOverview>, ApiError> {
+    require_admin(&state, &cookies).await?;
+    Ok(Json(
+        database(&state)?
+            .admin_overview()
+            .await
+            .map_err(ApiError::internal)?,
+    ))
+}
+
+async fn admin_list_users(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Query(query): Query<AdminListQuery>,
+) -> Result<Json<crate::storage::Paginated<crate::storage::AdminUserSummary>>, ApiError> {
+    require_admin(&state, &cookies).await?;
+    let status = validate_optional_enum(
+        query.status.as_deref(),
+        &["pending", "active", "suspended"],
+        "人员状态",
+    )?;
+    let role = validate_optional_enum(query.role.as_deref(), &["admin", "member"], "人员角色")?;
+    let sort = validate_sort(
+        query.sort.as_deref(),
+        &["created_at", "username", "last_login"],
+        "created_at",
+    )?;
+    let (page, page_size) = pagination(query.page, query.page_size);
+    let descending = validate_order(query.order.as_deref())?;
+    Ok(Json(
+        database(&state)?
+            .list_admin_users(
+                query.q.as_deref(),
+                status,
+                role,
+                sort,
+                descending,
+                page,
+                page_size,
+            )
+            .await
+            .map_err(ApiError::internal)?,
+    ))
+}
+
+async fn admin_update_user(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path(user_id): Path<Uuid>,
+    Json(input): Json<AdminUserInput>,
+) -> Result<Json<UserResponse>, ApiError> {
+    let admin = require_admin(&state, &cookies).await?;
+    if admin.id == user_id {
+        return Err(ApiError::bad_request("不能在管理台修改自己的角色或状态"));
+    }
+    validate_enum(&input.role, &["admin", "member"], "人员角色")?;
+    validate_enum(
+        &input.status,
+        &["pending", "active", "suspended"],
+        "人员状态",
+    )?;
+    let user = database(&state)?
+        .update_admin_user(user_id, &input.role, &input.status)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("人员不存在"))?;
+    if user.status != "active" {
+        state.rooms.disconnect_user(user.id).await;
+    }
+    Ok(Json(user.into()))
+}
+
+async fn admin_list_rooms(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Query(query): Query<AdminListQuery>,
+) -> Result<Json<crate::storage::Paginated<RoomSummary>>, ApiError> {
+    let admin = require_admin(&state, &cookies).await?;
+    let status = validate_optional_enum(
+        query.status.as_deref(),
+        &["active", "ended", "archived"],
+        "会议状态",
+    )?;
+    let sort = validate_sort(
+        query.sort.as_deref(),
+        &["updated_at", "created_at", "name"],
+        "updated_at",
+    )?;
+    let (page, page_size) = pagination(query.page, query.page_size);
+    let descending = validate_order(query.order.as_deref())?;
+    Ok(Json(
+        database(&state)?
+            .list_admin_rooms(
+                admin.id,
+                query.q.as_deref(),
+                status,
+                sort,
+                descending,
+                page,
+                page_size,
+            )
+            .await
+            .map_err(ApiError::internal)?,
+    ))
+}
+
+async fn admin_update_room(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path(room_id): Path<Uuid>,
+    Json(input): Json<AdminRoomInput>,
+) -> Result<Json<RoomSummary>, ApiError> {
+    let admin = require_admin(&state, &cookies).await?;
+    validate_enum(&input.status, &["active", "ended", "archived"], "会议状态")?;
+    let room = database(&state)?
+        .update_admin_room_status(room_id, &input.status)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("会议不存在"))?;
+    if room.status != "active" {
+        state.rooms.close_room(room.id).await;
+    }
+    Ok(Json(
+        database(&state)?
+            .room_summary(&room, admin.id)
+            .await
+            .map_err(ApiError::internal)?,
+    ))
+}
+
+async fn admin_inspect_room(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path(room_id): Path<Uuid>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<RoomDetailResponse>, ApiError> {
+    let admin = require_admin(&state, &cookies).await?;
+    let database = database(&state)?;
+    let room = database
+        .get_room(room_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("会议不存在"))?;
+    let summary = database
+        .room_summary(&room, admin.id)
+        .await
+        .map_err(ApiError::internal)?;
+    let utterances = database
+        .list_utterances(room_id, query.q.as_deref())
+        .await
+        .map_err(ApiError::internal)?;
+    let member_records = database
+        .list_room_members(room_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let members = state.rooms.member_states(room_id, &member_records);
+    Ok(Json(RoomDetailResponse {
+        room: summary,
+        members,
+        utterances,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -471,6 +699,9 @@ async fn join_room(
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("房间不存在"))?;
+    if room.status != "active" {
+        return Err(ApiError::forbidden("会议当前不接受新成员加入"));
+    }
     database
         .join_room(room_id, user.id)
         .await
@@ -496,6 +727,9 @@ async fn room_detail(
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("房间不存在"))?;
+    if room.status == "archived" {
+        return Err(ApiError::not_found("房间不存在"));
+    }
     if !database
         .can_view_room(room_id, user.id)
         .await
@@ -600,10 +834,6 @@ async fn delete_room(
 ) -> Result<StatusCode, ApiError> {
     let user = authenticate(&state, &cookies).await?;
     let database = database(&state)?;
-    let media_paths = database
-        .room_media_paths(room_id)
-        .await
-        .map_err(ApiError::internal)?;
     if !database
         .delete_room(room_id, user.id)
         .await
@@ -611,17 +841,12 @@ async fn delete_room(
     {
         return Err(ApiError::forbidden("只有房主可以删除房间"));
     }
-    for path in media_paths {
-        if let Err(error) = tokio::fs::remove_file(&path).await
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(%error, %path, "failed to delete room audio file");
-        }
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn authenticate(state: &AppState, cookies: &Cookies) -> Result<UserRecord, ApiError> {
+    require_initialized(state).await?;
+    require_authority(state).await?;
     let token = cookies
         .get(AUTH_COOKIE)
         .map(|cookie| cookie.value().to_owned())
@@ -631,6 +856,34 @@ pub async fn authenticate(state: &AppState, cookies: &Cookies) -> Result<UserRec
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(ApiError::unauthorized)
+}
+
+async fn require_initialized(state: &AppState) -> Result<(), ApiError> {
+    if database(state)?
+        .system_installation()
+        .await
+        .map_err(ApiError::internal)?
+        .is_some()
+    {
+        return Ok(());
+    }
+    Err(ApiError::setup_required())
+}
+
+async fn require_authority(state: &AppState) -> Result<(), ApiError> {
+    if state.authority.allowed().await {
+        return Ok(());
+    }
+    let snapshot = state.authority.snapshot().await;
+    Err(ApiError::license_required(snapshot.message))
+}
+
+async fn require_admin(state: &AppState, cookies: &Cookies) -> Result<UserRecord, ApiError> {
+    let user = authenticate(state, cookies).await?;
+    if !user.is_admin() {
+        return Err(ApiError::forbidden("需要系统管理员权限"));
+    }
+    Ok(user)
 }
 
 async fn issue_session(
@@ -661,6 +914,56 @@ fn database(state: &AppState) -> Result<&Database, ApiError> {
         .database
         .as_ref()
         .ok_or_else(|| ApiError::unavailable("账号功能需要 PostgreSQL"))
+}
+
+fn pagination(page: Option<i64>, page_size: Option<i64>) -> (i64, i64) {
+    (
+        page.unwrap_or(1).max(1),
+        page_size.unwrap_or(20).clamp(1, 100),
+    )
+}
+
+fn validate_optional_enum<'a>(
+    value: Option<&'a str>,
+    allowed: &[&str],
+    label: &str,
+) -> Result<Option<&'a str>, ApiError> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => {
+            validate_enum(value, allowed, label)?;
+            Ok(Some(value))
+        }
+        None => Ok(None),
+    }
+}
+
+fn validate_enum(value: &str, allowed: &[&str], label: &str) -> Result<(), ApiError> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!("无效的{label}")))
+    }
+}
+
+fn validate_sort<'a>(
+    value: Option<&'a str>,
+    allowed: &[&str],
+    default: &'a str,
+) -> Result<&'a str, ApiError> {
+    let value = value.unwrap_or(default);
+    if allowed.contains(&value) {
+        Ok(value)
+    } else {
+        Err(ApiError::bad_request("无效的排序字段"))
+    }
+}
+
+fn validate_order(value: Option<&str>) -> Result<bool, ApiError> {
+    match value.unwrap_or("desc") {
+        "desc" => Ok(true),
+        "asc" => Ok(false),
+        _ => Err(ApiError::bad_request("无效的排序方向")),
+    }
 }
 
 fn validate_username(value: &str) -> Result<String, ApiError> {
@@ -784,6 +1087,22 @@ mod tests {
     fn hashes_session_tokens_deterministically() {
         assert_eq!(token_hash("token"), token_hash("token"));
         assert_ne!(token_hash("token"), "token");
+    }
+
+    #[test]
+    fn validates_admin_list_parameters() {
+        assert_eq!(pagination(None, None), (1, 20));
+        assert_eq!(pagination(Some(-5), Some(500)), (1, 100));
+        assert_eq!(
+            validate_optional_enum(Some("active"), &["active", "ended"], "状态").unwrap(),
+            Some("active")
+        );
+        assert!(validate_optional_enum(Some("unknown"), &["active", "ended"], "状态").is_err());
+        assert_eq!(
+            validate_sort(None, &["created_at", "username"], "created_at").unwrap(),
+            "created_at"
+        );
+        assert!(validate_order(Some("sideways")).is_err());
     }
 
     #[test]

@@ -3,6 +3,7 @@ import {
   createVoiceReference,
   deleteVoiceReference,
   listVoiceReferences,
+  type User,
   type VoiceReference,
 } from '../api';
 import { refreshIcons } from '../components/icons';
@@ -35,22 +36,41 @@ export class SettingsPage implements Page {
   private recordingTimer = 0;
 
   constructor(
-    private readonly userId: string,
-    private readonly onRooms: () => void,
+    private readonly user: User,
     private readonly onServerChanged: () => void,
   ) {}
 
   mount(root: HTMLElement) {
     this.root = root;
-    const preferences = loadPreferences(this.userId);
+    const preferences = loadPreferences(this.user.id);
+    const avatar = escapeHtml(Array.from(this.user.username)[0]?.toUpperCase() ?? 'V');
     root.innerHTML = `
-      <main class="settings-page app-shell">
-        <section class="settings-heading">
-          <button class="icon-button settings-back" type="button" title="返回房间" aria-label="返回房间"><i data-lucide="arrow-left"></i></button>
-          <div><span class="section-kicker"><i data-lucide="settings-2"></i> APP SETTINGS</span><h1>设置</h1></div>
+      <main class="profile-page app-shell">
+        <section class="profile-page-heading">
+          <span class="section-kicker"><i data-lucide="user-round"></i> ACCOUNT</span>
+          <h1>我的</h1>
+          <p>管理个人音色、设备偏好与字幕大屏显示。</p>
         </section>
-        <section class="settings-form" aria-label="应用设置">
-          <div class="settings-section-heading"><i data-lucide="volume-2"></i><div><strong>翻译播报</strong><span>从 13 个参考声中选择播报人，并设置是否自动播放</span></div></div>
+        <div class="profile-layout">
+          <aside class="profile-sidebar" aria-label="用户信息">
+            <div class="profile-identity">
+              <span class="profile-avatar" aria-hidden="true">${avatar}</span>
+              <div><strong>${escapeHtml(this.user.username)}</strong><span>Voice Elf 用户</span></div>
+            </div>
+            <dl class="profile-details">
+              <div><dt>用户 ID</dt><dd title="${this.user.id}">${escapeHtml(shortUserId(this.user.id))}</dd></div>
+              <div><dt>加入时间</dt><dd>${formatAccountDate(this.user.created_at)}</dd></div>
+            </dl>
+            <div class="profile-security-note"><i data-lucide="shield-check"></i><span><strong>访问受保护</strong><small>仅可查看你创建或参加过的会议</small></span></div>
+            <nav class="profile-section-nav" aria-label="设置分区">
+              <a href="#user-settings">用户设置</a>
+              <a href="#general-settings">通用设置</a>
+              <a href="#subtitle-settings">字幕大屏</a>
+            </nav>
+          </aside>
+          <section class="settings-form" aria-label="个人与应用设置">
+          <div class="settings-category-heading" id="user-settings"><span>用户设置</span><h2>语音与播报</h2></div>
+          <div class="settings-section-heading"><i data-lucide="volume-2"></i><div><strong>翻译播报</strong><span>选择播报声音并设置自动播放</span></div></div>
           <label class="settings-field"><span>播报人</span><select class="settings-voice">${voiceOptions()}</select><small class="voice-preview"></small></label>
           <section class="voice-reference-settings" aria-labelledby="voice-reference-title">
             <div class="voice-reference-heading"><div><strong id="voice-reference-title">我的声音</strong><small>录制或上传 3–15 秒的人声参考</small></div><span class="voice-reference-count">0 / 5</span></div>
@@ -72,6 +92,7 @@ export class SettingsPage implements Page {
             <input class="settings-autoplay" type="checkbox" role="switch">
             <span class="toggle-track" aria-hidden="true"></span>
           </label>
+          <div class="settings-category-heading" id="general-settings"><span>通用设置</span><h2>设备与采集</h2></div>
           <div class="settings-section-heading"><i data-lucide="audio-waveform"></i><div><strong>音频采集</strong><span>控制当前设备的浏览器人声检测方式</span></div></div>
           <label class="toggle-field">
             <span><strong>增强人声过滤</strong><small>过滤持续低频嗡声、宽带噪声和短促非人声</small></span>
@@ -79,7 +100,7 @@ export class SettingsPage implements Page {
             <span class="toggle-track" aria-hidden="true"></span>
           </label>
           <div class="settings-divider"></div>
-          <div class="settings-section-heading"><i data-lucide="captions"></i><div><strong>字幕大屏</strong><span>设置独立字幕页和 App 悬浮窗的实时显示样式</span></div></div>
+          <div class="settings-section-heading" id="subtitle-settings"><i data-lucide="captions"></i><div><strong>字幕大屏</strong><span>设置独立字幕页和 App 悬浮窗的实时显示样式</span></div></div>
           <div class="subtitle-settings-controls">
             <fieldset class="subtitle-setting-group">
               <legend>展示内容</legend>
@@ -134,7 +155,8 @@ export class SettingsPage implements Page {
             </div>
           </div>
           <div class="settings-saved playback-saved" role="status" aria-live="polite"></div>
-        </section>
+          </section>
+        </div>
       </main>
     `;
     const voice = root.querySelector<HTMLSelectElement>('.settings-voice')!;
@@ -152,7 +174,7 @@ export class SettingsPage implements Page {
         (custom ? `${custom.name} · 我的参考声` : '正在加载我的声音');
     };
     const persist = () => {
-      savePreferences(this.userId, {
+      savePreferences(this.user.id, {
         voice: voice.value,
         autoplay: autoplay.checked,
         enhancedVoiceFilter: enhancedVoiceFilter.checked,
@@ -164,7 +186,6 @@ export class SettingsPage implements Page {
         if (this.root) saved.textContent = '';
       }, 1600);
     };
-    root.querySelector('.settings-back')?.addEventListener('click', this.onRooms);
     voice.addEventListener('change', persist);
     autoplay.addEventListener('change', persist);
     enhancedVoiceFilter.addEventListener('change', persist);
@@ -455,7 +476,7 @@ export class SettingsPage implements Page {
 
   private mountSubtitleSettings(root: HTMLElement) {
     const controls = root.querySelector<HTMLElement>('.subtitle-settings-controls')!;
-    let preferences = loadSubtitlePreferences(this.userId);
+    let preferences = loadSubtitlePreferences(this.user.id);
     const render = (next: SubtitlePreferences) => {
       preferences = next;
       controls.querySelectorAll<HTMLInputElement>('input[name="subtitle-display"]').forEach((input) => {
@@ -502,7 +523,7 @@ export class SettingsPage implements Page {
         (next as Record<string, string | number>)[key] =
           input.type === 'color' ? input.value : Number(input.value);
       });
-      render(saveSubtitlePreferences(this.userId, next));
+      render(saveSubtitlePreferences(this.user.id, next));
       const saved = controls.querySelector<HTMLElement>('.subtitle-saved')!;
       saved.textContent = '已自动保存并同步';
       window.clearTimeout(this.subtitleSavedTimer);
@@ -534,7 +555,7 @@ export class SettingsPage implements Page {
       persist();
     });
     render(preferences);
-    this.unsubscribeSubtitlePreferences = subscribeSubtitlePreferences(this.userId, render);
+    this.unsubscribeSubtitlePreferences = subscribeSubtitlePreferences(this.user.id, render);
   }
 
   private async mountAppConfig(root: HTMLElement) {
@@ -584,6 +605,18 @@ function customVoiceValue(id: string) {
 
 function formatDuration(durationMs: number) {
   return `${(durationMs / 1_000).toFixed(1)} 秒`;
+}
+
+function formatAccountDate(value: string) {
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  }).format(new Date(value));
+}
+
+function shortUserId(value: string) {
+  return `${value.slice(0, 8)}…${value.slice(-4)}`;
 }
 
 function errorMessage(error: unknown, fallback: string) {

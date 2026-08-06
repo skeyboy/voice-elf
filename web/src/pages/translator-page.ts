@@ -70,7 +70,8 @@ export class TranslatorPage implements Page {
     });
     this.members = detail.members;
     const currentMember = detail.members.find((member) => member.user_id === this.userId);
-    this.canPublish = detail.room.is_owner || Boolean(currentMember && !currentMember.is_muted);
+    this.canPublish = detail.room.status === 'active'
+      && (detail.room.is_owner || Boolean(currentMember && !currentMember.is_muted));
     this.sourceLanguage = detail.room.source_language;
     this.targetLanguage = detail.room.target_language;
     this.maxUtteranceSeconds = detail.room.max_utterance_seconds;
@@ -96,6 +97,20 @@ export class TranslatorPage implements Page {
     );
     refreshIcons(root);
 
+    this.unsubscribePreferences = subscribePreferences(this.userId, (next) => {
+      this.voice = next.voice;
+      this.enhancedVoiceFilter = next.enhancedVoiceFilter;
+      this.player.muted = !next.autoplay;
+      this.voiceSession?.sendConfig();
+    });
+    if (detail.room.status !== 'active') {
+      root.querySelector<HTMLButtonElement>('.record-button')!.disabled = true;
+      root.querySelector<HTMLElement>('.capture-state')!.textContent = '会议已结束';
+      root.querySelector<HTMLElement>('.session-badge-text')!.textContent = '仅查看记录';
+      root.querySelector<HTMLButtonElement>('.open-subtitles')!.disabled = true;
+      this.onConnection('hidden');
+      return;
+    }
     this.voiceSession = new VoiceSession(
       detail.room.id,
       this.canPublish,
@@ -108,20 +123,8 @@ export class TranslatorPage implements Page {
         onConnection: (status) => this.setConnection(status),
         onRecording: (recording) => this.setRecording(recording),
         onCaptureError: this.onError,
-        onPlaybackProgress: (progress) =>
-          this.conversation?.updateTranslatedProgress(
-            progress.utteranceId,
-            progress.currentSeconds,
-            progress.durationSeconds,
-          ),
       },
     );
-    this.unsubscribePreferences = subscribePreferences(this.userId, (next) => {
-      this.voice = next.voice;
-      this.enhancedVoiceFilter = next.enhancedVoiceFilter;
-      this.player.muted = !next.autoplay;
-      this.voiceSession?.sendConfig();
-    });
     this.voiceSession.connect();
   }
 
@@ -165,7 +168,7 @@ export class TranslatorPage implements Page {
           <div class="room-identity-static">
             <span class="room-status-icon"><i data-lucide="door-open"></i></span>
             <span><small>当前房间</small><strong class="room-name">${escapeHtml(room.name)}</strong></span>
-            <span class="room-role${room.is_owner ? ' owner' : ''}">${room.is_owner ? '房主控制' : this.canPublish ? '成员发言' : '已被禁言'}</span>
+            <span class="room-role${room.is_owner ? ' owner' : ''}">${room.status !== 'active' ? '会议已结束' : room.is_owner ? '房主控制' : this.canPublish ? '成员发言' : '已被禁言'}</span>
           </div>
           <form class="record-search">
             <i data-lucide="search"></i><input type="search" placeholder="检索转写或翻译记录" aria-label="检索房间记录"><button type="submit">检索</button>
@@ -587,7 +590,10 @@ export class TranslatorPage implements Page {
   }
 
   private async deleteRoom() {
-    if (!this.room?.is_owner || !window.confirm(`确认删除房间“${this.room.name}”及其全部记录？`)) return;
+    if (
+      !this.room?.is_owner ||
+      !window.confirm(`确认删除会议“${this.room.name}”？\n\n会议将从列表移除，历史数据不会被物理删除。`)
+    ) return;
     try {
       await apiRequest(`/api/rooms/${this.room.id}`, { method: 'DELETE' });
       this.onDeleted();

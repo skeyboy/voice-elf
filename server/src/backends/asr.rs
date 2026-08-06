@@ -20,6 +20,9 @@ use super::{
     short_demo_delay,
 };
 
+const AUTO_LANGUAGE_FALLBACKS: &[&str] = &["zh", "en"];
+const MAX_ASR_GAIN: f64 = 8.0;
+
 #[derive(Debug, thiserror::Error)]
 #[error("未识别到清晰语音")]
 pub struct NoSpeechDetected;
@@ -191,18 +194,17 @@ impl QwenAsrTranscriber {
         pcm: &[i16],
         source_language: &str,
     ) -> Result<Transcription> {
-        let text = self.transcribe_batch(pcm, source_language).await?;
-        if !text.is_empty() {
-            return Ok(Transcription::plain(text, source_language));
-        }
-        if source_language != "auto" {
-            tracing::warn!(
-                source_language,
-                "Qwen ASR forced language returned no text; retrying auto detection"
-            );
-            let text = self.transcribe_batch(pcm, "auto").await?;
+        for (attempt, language) in language_attempts(source_language).into_iter().enumerate() {
+            if attempt > 0 {
+                tracing::warn!(
+                    source_language,
+                    fallback_language = language,
+                    "Qwen ASR returned no text; retrying completed utterance with language fallback"
+                );
+            }
+            let text = self.transcribe_batch(pcm, language).await?;
             if !text.is_empty() {
-                return Ok(Transcription::plain(text, "auto"));
+                return Ok(Transcription::plain(text, language));
             }
         }
         Err(NoSpeechDetected.into())
@@ -363,7 +365,7 @@ fn prepare_asr_audio(pcm: &[i16]) -> Result<Vec<i16>> {
         .max()
         .unwrap_or(0);
     let gain = if peak < 20_000 {
-        (26_000_f64 / peak as f64).clamp(1.0, 3.0)
+        (26_000_f64 / peak as f64).clamp(1.0, MAX_ASR_GAIN)
     } else {
         1.0
     };
@@ -371,6 +373,16 @@ fn prepare_asr_audio(pcm: &[i16]) -> Result<Vec<i16>> {
         .into_iter()
         .map(|sample| (sample as f64 * gain).round().clamp(-32_768.0, 32_767.0) as i16)
         .collect())
+}
+
+fn language_attempts(source_language: &str) -> Vec<&str> {
+    if source_language == "auto" {
+        std::iter::once("auto")
+            .chain(AUTO_LANGUAGE_FALLBACKS.iter().copied())
+            .collect()
+    } else {
+        vec![source_language, "auto"]
+    }
 }
 
 fn emit_valid_utf8(pending: &mut Vec<u8>, updates: &mpsc::UnboundedSender<String>) -> Result<()> {
@@ -397,6 +409,8 @@ fn emit_valid_utf8(pending: &mut Vec<u8>, updates: &mpsc::UnboundedSender<String
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
     use super::*;
 
     #[test]
@@ -410,7 +424,65 @@ mod tests {
         let output = prepare_asr_audio(&input).unwrap();
         assert_eq!(output.len(), input.len());
         assert!(output.iter().map(|sample| sample.abs()).max().unwrap() > 1_200);
-        assert!(output.iter().map(|sample| sample.abs()).max().unwrap() <= 3_600);
+        assert!(output.iter().map(|sample| sample.abs()).max().unwrap() <= 9_600);
+    }
+
+    #[test]
+    fn retries_empty_auto_detection_with_product_language_priorities() {
+        assert_eq!(language_attempts("auto"), ["auto", "zh", "en"]);
+        assert_eq!(language_attempts("ja"), ["ja", "auto"]);
+    }
+
+    #[tokio::test]
+    async fn retries_an_empty_auto_result_with_chinese() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("fake-qwen-asr");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+cat >/dev/null
+language=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --language) shift; language="$1" ;;
+  esac
+  shift
+done
+if [ "$language" = Chinese ]; then
+  printf recognized
+fi
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).unwrap();
+
+        let transcriber = QwenAsrTranscriber::new(
+            AsrConfig {
+                binary,
+                model_dir: Some(directory.path().to_owned()),
+                stream_unfixed_chunks: 0,
+                stream_max_new_tokens: 32,
+                encoder_window_seconds: 4,
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let input = (0..16_000)
+            .map(|index| {
+                let phase = index as f32 * 2.0 * std::f32::consts::PI * 220.0 / 16_000.0;
+                (phase.sin() * 1_200.0) as i16
+            })
+            .collect::<Vec<_>>();
+
+        let result = transcriber
+            .transcribe_completed(&input, "auto")
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "recognized");
+        assert_eq!(result.language, "zh");
     }
 
     #[test]

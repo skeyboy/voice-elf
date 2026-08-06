@@ -2,17 +2,26 @@
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
   import { RoomsPage } from '../../pages/rooms-page';
-  import { showError } from '$lib/session';
+  import { currentUser, showError } from '$lib/session';
 
   let host: HTMLElement;
 
   onMount(() => {
-    const roomsPage = new RoomsPage(
-      (roomId) => void goto(`/rooms/${roomId}`),
-      showError,
-    );
-    void roomsPage.mount(host);
-    return () => void roomsPage.destroy();
+    let destroyPage = () => {};
+    const unsubscribe = currentUser.subscribe((user) => {
+      if (!user || host.childElementCount) return;
+      const roomsPage = new RoomsPage(
+        user,
+        (roomId) => void goto(`/rooms/${roomId}`),
+        showError,
+      );
+      void roomsPage.mount(host);
+      destroyPage = () => void roomsPage.destroy();
+    });
+    return () => {
+      unsubscribe();
+      destroyPage();
+    };
   });
 </script>
 

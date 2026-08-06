@@ -2,15 +2,18 @@
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
   import { AuthPage } from '../../pages/auth-page';
-  import { resetSession } from '$lib/session';
+  import { resetSession, systemSetup } from '$lib/session';
 
   let host: HTMLElement;
 
   onMount(() => {
-    const authPage = new AuthPage((user) => {
-      resetSession(user);
-      void goto('/rooms', { replaceState: true });
-    });
+    const authPage = new AuthPage(
+      (user) => {
+        resetSession(user);
+        void goto('/rooms', { replaceState: true });
+      },
+      $systemSetup?.profile?.system_name ?? 'Voice Elf',
+    );
     void authPage.mount(host);
     return () => void authPage.destroy();
   });
