@@ -4,6 +4,7 @@
   import { onMount } from 'svelte';
   import TopBarHost from '$lib/TopBarHost.svelte';
   import ToastRegion from '$lib/ToastRegion.svelte';
+  import { scheduleVadPreload } from '../audio';
   import {
     currentUser,
     instanceAuthorization,
@@ -24,6 +25,7 @@
   };
 
   onMount(() => {
+    const cancelVadPreload = scheduleVadPreload();
     void loadSetup().then((setup) => {
       if (setup.initialized) void refreshAuthorization();
     });
@@ -70,6 +72,7 @@
     window.addEventListener('voice-elf:native-quit-requested', handleQuitRequest);
     window.addEventListener('voice-elf:native-toast', handleNativeToast);
     return () => {
+      cancelVadPreload();
       window.clearTimeout(quitPromptTimer);
       window.clearInterval(authorizationTimer);
       window.removeEventListener('voice-elf:native-quit-requested', handleQuitRequest);

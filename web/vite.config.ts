@@ -6,16 +6,18 @@ export default defineConfig({
     {
       name: 'cross-origin-isolation',
       configureServer(server) {
-        server.middlewares.use((_request, response, next) => {
+        server.middlewares.use((request, response, next) => {
           response.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
           response.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+          setVadCacheHeaders(request.url, response);
           next();
         });
       },
       configurePreviewServer(server) {
-        server.middlewares.use((_request, response, next) => {
+        server.middlewares.use((request, response, next) => {
           response.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
           response.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+          setVadCacheHeaders(request.url, response);
           next();
         });
       },
@@ -42,3 +44,12 @@ export default defineConfig({
     target: 'es2022',
   },
 });
+
+function setVadCacheHeaders(url: string | undefined, response: import('node:http').ServerResponse) {
+  const path = url?.split('?', 1)[0];
+  if (path === '/wasm/manifest.json') {
+    response.setHeader('Cache-Control', 'no-cache');
+  } else if (/^\/wasm\/voice_elf_web_vad\.[a-f0-9]{16}\.wasm$/.test(path ?? '')) {
+    response.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  }
+}

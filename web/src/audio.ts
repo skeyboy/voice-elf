@@ -18,6 +18,7 @@ interface VadMessage {
     | 'speech_start'
     | 'speech_end'
     | 'flushed'
+    | 'preloaded'
     | 'error';
   payload?: ArrayBuffer;
   message?: string;
@@ -25,15 +26,61 @@ interface VadMessage {
   reason?: VadEndReason;
   speechFrames?: number;
   stage?: 'manifest' | 'download' | 'compile';
+  loadedBytes?: number;
+  totalBytes?: number;
 }
 
-const VAD_INITIALIZATION_TIMEOUT_MS = 30_000;
 const VAD_STAGE_LABELS = {
   worker: '启动 Worker',
   manifest: '读取资源清单',
   download: '下载 WASM',
   compile: '编译 WASM',
 } as const;
+const VAD_STAGE_TIMEOUT_MS: Record<keyof typeof VAD_STAGE_LABELS, number> = {
+  worker: 20_000,
+  manifest: 30_000,
+  download: 300_000,
+  compile: 90_000,
+};
+
+let sharedVadWorker: Worker | null = null;
+
+function acquireVadWorker() {
+  sharedVadWorker ??= new Worker('/vad-worker.js', {
+    type: 'module',
+    name: 'voice-elf-vad',
+  });
+  return sharedVadWorker;
+}
+
+export function scheduleVadPreload() {
+  const idleApi = window as unknown as {
+    requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number;
+    cancelIdleCallback?: (handle: number) => void;
+  };
+  let cancelled = false;
+  let idleId = 0;
+  let fallbackTimer = 0;
+  const preload = () => {
+    if (!cancelled) acquireVadWorker().postMessage({ type: 'preload' });
+  };
+  const scheduleWhenIdle = () => {
+    if (idleApi.requestIdleCallback) {
+      idleId = idleApi.requestIdleCallback(preload, { timeout: 5_000 });
+    } else {
+      fallbackTimer = window.setTimeout(preload, 1_500);
+    }
+  };
+  if (document.readyState === 'complete') scheduleWhenIdle();
+  else window.addEventListener('load', scheduleWhenIdle, { once: true });
+
+  return () => {
+    cancelled = true;
+    window.removeEventListener('load', scheduleWhenIdle);
+    if (idleId) idleApi.cancelIdleCallback?.(idleId);
+    window.clearTimeout(fallbackTimer);
+  };
+}
 
 export class MicrophoneCapture {
   private context: AudioContext | null = null;
@@ -53,22 +100,33 @@ export class MicrophoneCapture {
     inputSampleRate: number,
     enhancedVoiceFilter: boolean,
   ) {
-    const worker =
-      this.vadWorker ??
-      new Worker('/vad-worker.js', { type: 'module', name: 'voice-elf-vad' });
+    const worker = this.vadWorker ?? acquireVadWorker();
     this.vadWorker = worker;
     this.vadReady = false;
     const ready = new Promise<void>((resolve, reject) => {
       let initialized = false;
       let stage: keyof typeof VAD_STAGE_LABELS = 'worker';
-      const timeout = window.setTimeout(
-        () => reject(new Error(`浏览器音频 VAD 初始化超时（${VAD_STAGE_LABELS[stage]}）`)),
-        VAD_INITIALIZATION_TIMEOUT_MS,
-      );
+      let loadedBytes = 0;
+      let totalBytes = 0;
+      let timeout = 0;
+      const armTimeout = () => {
+        window.clearTimeout(timeout);
+        timeout = window.setTimeout(() => {
+          const progress =
+            stage === 'download' && loadedBytes > 0
+              ? `，已接收 ${(loadedBytes / 1024 / 1024).toFixed(1)} MB${totalBytes > 0 ? ` / ${(totalBytes / 1024 / 1024).toFixed(1)} MB` : ''}`
+              : '';
+          reject(new Error(`浏览器音频 VAD 初始化超时（${VAD_STAGE_LABELS[stage]}${progress}）`));
+        }, VAD_STAGE_TIMEOUT_MS[stage]);
+      };
+      armTimeout();
       worker.onmessage = (event: MessageEvent<VadMessage>) => {
         const message = event.data;
         if (message.type === 'initializing' && message.stage) {
           stage = message.stage;
+          loadedBytes = message.loadedBytes ?? loadedBytes;
+          totalBytes = message.totalBytes ?? totalBytes;
+          armTimeout();
         } else if (message.type === 'ready') {
           window.clearTimeout(timeout);
           initialized = true;
@@ -226,7 +284,9 @@ export class MicrophoneCapture {
   }
 
   private destroyVad() {
-    this.vadWorker?.terminate();
+    const worker = this.vadWorker;
+    worker?.terminate();
+    if (sharedVadWorker === worker) sharedVadWorker = null;
     this.vadWorker = null;
     this.vadReady = false;
     this.suppressed = false;

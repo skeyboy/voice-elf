@@ -16,9 +16,10 @@ let segmentAccepted = false;
 let pendingFrames = [];
 let suppressed = false;
 let enhancedVoiceFilter = false;
+let wasmLoading;
 
-function reportInitialization(stage) {
-  postMessage({ type: 'initializing', stage });
+function reportInitialization(stage, loadedBytes, totalBytes) {
+  postMessage({ type: 'initializing', stage, loadedBytes, totalBytes });
 }
 
 function segmentSpeechFrames() {
@@ -36,8 +37,36 @@ async function instantiateWasm(response) {
   return WebAssembly.instantiate(await response.arrayBuffer(), {});
 }
 
-async function loadWasmRuntime() {
-  if (wasm) return;
+function monitorDownload(response) {
+  if (!response.body || typeof TransformStream !== 'function') return response;
+  const declaredSize = Number(response.headers.get('content-length'));
+  const totalBytes = Number.isFinite(declaredSize) && declaredSize > 0 ? declaredSize : 0;
+  let loadedBytes = 0;
+  let lastReportAt = 0;
+  const body = response.body.pipeThrough(
+    new TransformStream({
+      transform(chunk, controller) {
+        loadedBytes += chunk.byteLength;
+        const now = performance.now();
+        if (now - lastReportAt >= 500 || (totalBytes > 0 && loadedBytes >= totalBytes)) {
+          reportInitialization('download', loadedBytes, totalBytes);
+          lastReportAt = now;
+        }
+        controller.enqueue(chunk);
+      },
+      flush() {
+        reportInitialization('compile', loadedBytes, totalBytes);
+      },
+    }),
+  );
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+async function downloadWasmRuntime() {
   reportInitialization('manifest');
   const manifestResponse = await fetch('/wasm/manifest.json', {
     cache: 'no-cache',
@@ -52,14 +81,35 @@ async function loadWasmRuntime() {
   }
 
   reportInitialization('download');
-  const response = await fetch(`/wasm/${manifest.file}`, {
-    cache: 'force-cache',
-    credentials: 'same-origin',
+  const url = `/wasm/${manifest.file}`;
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        cache: 'force-cache',
+        credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error(`VAD WASM request failed (${response.status})`);
+      const module = await instantiateWasm(monitorDownload(response));
+      wasm = module.instance.exports;
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) {
+        reportInitialization('download', 0, 0);
+        await new Promise((resolve) => setTimeout(resolve, 1_000 * (attempt + 1)));
+      }
+    }
+  }
+  throw lastError;
+}
+
+async function loadWasmRuntime() {
+  if (wasm) return;
+  wasmLoading ??= downloadWasmRuntime().finally(() => {
+    wasmLoading = undefined;
   });
-  if (!response.ok) throw new Error(`VAD WASM request failed (${response.status})`);
-  reportInitialization('compile');
-  const module = await instantiateWasm(response);
-  wasm = module.instance.exports;
+  await wasmLoading;
 }
 
 async function configureWasm(maxUtteranceSeconds, inputSampleRate, enhancedFilter) {
@@ -144,12 +194,16 @@ function processSamples(payload) {
 self.onmessage = async (event) => {
   try {
     if (event.data.type === 'init') {
+      if (wasmLoading && !wasm) reportInitialization('download');
       await configureWasm(
         event.data.maxUtteranceSeconds,
         event.data.inputSampleRate,
         event.data.enhancedVoiceFilter,
       );
       postMessage({ type: 'ready' });
+    } else if (event.data.type === 'preload') {
+      await loadWasmRuntime();
+      postMessage({ type: 'preloaded' });
     } else if (event.data.type === 'samples') {
       processSamples(event.data.payload);
     } else if (event.data.type === 'flush') {
