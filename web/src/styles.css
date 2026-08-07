@@ -557,6 +557,50 @@ input:disabled {
   border-radius: 5px;
 }
 
+.auth-guidance {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.auth-forgot,
+.auth-back {
+  width: fit-content;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #236b4d;
+  background: transparent;
+  border: 0;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.auth-forgot {
+  justify-self: end;
+  margin-top: -9px;
+}
+
+.auth-back {
+  justify-self: center;
+}
+
+.auth-back svg {
+  width: 13px;
+  height: 13px;
+}
+
+.auth-mode[hidden],
+.auth-guidance[hidden],
+.auth-email-field[hidden],
+.auth-password-field[hidden],
+.auth-forgot[hidden],
+.auth-back[hidden] {
+  display: none;
+}
+
 .primary-command {
   min-height: 40px;
   padding: 0 15px;
@@ -1223,9 +1267,15 @@ h2 {
   height: 86px;
 }
 
-.record-button {
+.record-control {
   grid-column: 2;
   z-index: 1;
+  justify-self: center;
+  display: grid;
+  justify-items: center;
+}
+
+.record-button {
   width: 64px;
   height: 64px;
   display: grid;

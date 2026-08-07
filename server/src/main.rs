@@ -4,12 +4,15 @@ mod audio;
 mod authority;
 mod backends;
 mod config;
+mod index_tts_runtime;
+mod mailer;
 mod media;
 mod pipeline;
 mod protocol;
 mod room_hub;
 mod schema;
 mod storage;
+mod tts_manager;
 
 use std::sync::Arc;
 
@@ -39,12 +42,14 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use crate::{
     asr_manager::AsrManager,
     authority::AuthorityService,
-    backends::{AppServices, AsrBackendRegistry},
+    backends::{AppServices, AsrBackendRegistry, TtsBackendRegistry},
     config::AppConfig,
+    mailer::MailService,
     media::MediaStore,
     protocol::{ClientEvent, ServerEvent},
     room_hub::RoomHub,
     storage::Database,
+    tts_manager::TtsManager,
 };
 
 #[derive(Clone)]
@@ -55,7 +60,9 @@ pub(crate) struct AppState {
     pub(crate) rooms: RoomHub,
     pub(crate) authority: AuthorityService,
     pub(crate) asr: AsrManager,
+    pub(crate) tts: TtsManager,
     pub(crate) setup_token_hash: Arc<str>,
+    pub(crate) mail: MailService,
 }
 
 #[tokio::main]
@@ -72,6 +79,7 @@ async fn main() -> Result<()> {
     let config = AppConfig::from_env()?;
     let services = Arc::new(AppServices::from_config(&config)?);
     let asr_registry = AsrBackendRegistry::from_config(&config)?;
+    let tts_registry = TtsBackendRegistry::from_config(&config, services.synthesizer.clone())?;
     let database = match &config.database_url {
         Some(url) => Some(Database::connect(url).await?),
         None => None,
@@ -80,6 +88,9 @@ async fn main() -> Result<()> {
     if let Some(database) = &database {
         database
             .ensure_asr_system_setting(asr_registry.default_backend_id())
+            .await?;
+        database
+            .ensure_tts_system_setting(tts_registry.default_backend_id())
             .await?;
     }
     let initialized = match &database {
@@ -112,8 +123,18 @@ async fn main() -> Result<()> {
         .or(generated_setup_token)
         .expect("a setup token is always available");
     let media = MediaStore::new(config.media_dir.clone()).await?;
+    let mail = MailService::new(config.mail.clone())?;
     let authority = AuthorityService::new(config.authority.clone());
     let asr = AsrManager::new(asr_registry, database.clone(), authority.clone());
+    let tts = TtsManager::new(
+        tts_registry,
+        database.clone(),
+        authority.clone(),
+        config.tts.index_tts.clone(),
+    )?;
+    if config.tts.index_tts.enabled {
+        tts.start_index_if_installed().await;
+    }
     let state = AppState {
         services: services.clone(),
         database,
@@ -121,7 +142,9 @@ async fn main() -> Result<()> {
         rooms: RoomHub::default(),
         authority: authority.clone(),
         asr,
+        tts,
         setup_token_hash: Arc::from(api::token_hash(&setup_token)),
+        mail,
     };
     authority.start();
     let static_files = ServeDir::new(&config.web_dist).append_index_html_on_directories(true);
@@ -139,6 +162,7 @@ async fn main() -> Result<()> {
         .nest("/media", media_files)
         .route_service("/login", ServeFile::new(&index_file))
         .route_service("/setup", ServeFile::new(&index_file))
+        .route_service("/reset-password", ServeFile::new(&index_file))
         .route_service("/rooms", ServeFile::new(&index_file))
         .route_service("/rooms/{room_id}", ServeFile::new(&index_file))
         .route_service("/rooms/{room_id}/subtitles", ServeFile::new(&index_file))
@@ -231,6 +255,7 @@ async fn authorize_media(
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let authority = state.authority.snapshot().await;
     let asr = state.asr.effective_selection().await.ok();
+    let tts = state.tts.effective_selection().await.ok();
     (
         StatusCode::OK,
         Json(json!({
@@ -238,6 +263,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             "backend": state.services.backend_name,
             "asr_backend": asr.as_ref().map(|selection| &selection.backend_id),
             "asr_config_source": asr.as_ref().map(|selection| &selection.source),
+            "tts_backend": tts.as_ref().map(|selection| &selection.backend_id),
+            "tts_config_source": tts.as_ref().map(|selection| &selection.source),
             "database": state.database.is_some(),
             "media": true,
             "authority": authority,
@@ -286,6 +313,11 @@ async fn websocket(
         .services_for_session(&state.services)
         .await
         .map_err(|error| api::ApiError::unavailable(format!("ASR 服务不可用: {error}")))?;
+    let (services, _) = state
+        .tts
+        .services_for_session(&services)
+        .await
+        .map_err(|error| api::ApiError::unavailable(format!("TTS 服务不可用: {error}")))?;
     Ok(ws
         .max_message_size(256 * 1024)
         .max_frame_size(256 * 1024)

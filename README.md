@@ -39,6 +39,8 @@ Prepare the server TTS models once. The script downloads pinned Kokoro and Super
 ./scripts/setup-server-tts.sh
 ./scripts/moss-nano-tts.sh setup
 ./scripts/moss-nano-tts.sh start
+# Optional IndexTTS2 provider (the same operation is available under Admin > TTS Management)
+./scripts/index-tts.sh enable
 ./scripts/moss-nano-tts.sh doctor
 cd web
 npm install
@@ -106,6 +108,12 @@ The server loads `.env` automatically. Relative filesystem paths in the server c
 
 MOSS-TTS-Nano runs as its official Python 3.12 ONNX service on `127.0.0.1:18083`; `scripts/moss-nano-tts.sh` pins the tested upstream revision and manages setup and runtime state. Setup bootstraps pinned `uv 0.11.32`, managed CPython 3.12.13, the locked Python dependencies, virtual environment, source, dependency cache, and model cache below the ignored project `.local/` directory. On macOS ARM, it also builds the OpenFST dependency for WeTextProcessing inside `.local/openfst/`; it does not install a global Homebrew package. No system Python or shell profile is modified, so a new checkout can recreate the same isolated runtime with `setup`; use `doctor` to verify it. Configure its URL, CPU threads, timeout, and the application voice-to-demo mapping with `TTS_MOSS_NANO_*`. Set `TTS_MOSS_NANO_ENABLED=false` to use only the stable Kokoro/Supertonic engines. `TTS_KOKORO_MODEL_DIR`, `TTS_SUPERTONIC_MODEL_DIR`, and `TTS_THREADS` override fallback defaults.
 
+IndexTTS2 is an optional second TTS provider. Admin > TTS Management can download the model in the background, start or stop its project-owned sidecar, show installation and health state, and enable the provider once its `/health` check succeeds. `scripts/index-tts.sh enable` provides the same install-and-start flow from a terminal. The script manages the official `index-tts/index-tts` source, its isolated `uv` environment, the complete `IndexTeam/IndexTTS-2` checkpoint set, the official example reference audio, and the HTTP sidecar on `127.0.0.1:18084`; progress is written to `.local/run/index-tts/manager.log`. Set `TTS_INDEX_ENABLED=true` to auto-start an already installed model when the main server starts. `TTS_INDEX_MANAGER_SCRIPT`, `TTS_INDEX_MODEL_DIR`, and `TTS_INDEX_RUNTIME_DIR` override the managed local paths. `INDEX_TTS_MODEL_SOURCE=modelscope` uses the upstream-documented ModelScope alternative instead of Hugging Face. `INDEX_TTS_REPOSITORY_URL` can point the source clone at a trusted mirror when direct GitHub access is slow; deployments should verify the resulting revision against the official repository.
+
+`TTS_INDEX_DEFAULT_REFERENCE_AUDIO` supplies the preset fallback voice; without it the official `examples/voice_01.wav` is used. `TTS_INDEX_DEFAULT_VOICE_ID` assigns that reference a stable voice ID, while `TTS_INDEX_VOICE_MAP` accepts comma-separated `VOICE=/absolute/reference.wav` entries. Uploaded user voice references are sent directly for zero-shot cloning. System changes and authority-bus tenant overrides apply to newly created room audio pipelines. IndexTTS2 code and weights are distributed under Bilibili's model license rather than the project's application license; review the upstream `LICENSE` and `INDEX_MODEL_LICENSE` before production or high-scale commercial use.
+
+The active provider publishes its available voice catalog through `GET /api/tts/voices`; the personal settings page uses this catalog instead of a hard-coded list. Administrators can assign or clear human-friendly aliases under Admin > TTS Management. Aliases only change display names: saved user preferences and synthesis requests continue to use the stable provider voice ID. Each self-hosted tenant keeps its own catalog, reference-audio mapping, and aliases in its local service and database.
+
 The ASR adapter starts at the VAD speech-start edge and receives PCM continuously while the speaker is still talking. Its low-latency defaults can be tuned with `QWEN_ASR_STREAM_UNFIXED_CHUNKS`, `QWEN_ASR_STREAM_MAX_NEW_TOKENS`, and `QWEN_ASR_ENCODER_WINDOW_SECONDS`; the adapter invokes:
 
 ```text
@@ -159,7 +167,16 @@ createdb voice_elf
 echo 'DATABASE_URL=postgres://localhost/voice_elf' >> .env
 ```
 
-Accounts use Argon2 password hashes and seven-day HTTP-only session cookies. The setup wizard creates the first active system administrator; later registrations remain pending until an administrator verifies them. Administrators can approve, suspend, restore, or promote accounts. Suspending an account revokes its HTTP sessions and disconnects its active room connections. The meeting directory is restricted at the database query layer: users only see rooms they created or previously joined. A meeting creator is its administrator and can update the room, manage member speaking permissions, and remove the meeting from active views. Authenticated users can still join an active room through its direct meeting link; after joining, they can browse its records and subscribe to live transcripts, translations, protected source/translated audio URLs, and translated audio playback. `users`, `auth_sessions`, `rooms`, and `room_members` hold this authorization state.
+Accounts use Argon2 password hashes and seven-day HTTP-only session cookies. Registration and first-run setup collect a unique email address for account recovery; users migrated from an older database keep a blank email until an administrator adds one. Password reset links expire after 30 minutes by default, are stored only as SHA-256 hashes, can be used once, and revoke every existing session when consumed. The public request endpoint always returns the same response and limits each account to three requests per hour. The setup wizard creates the first active system administrator; later registrations remain pending until an administrator verifies them. Administrators can create users, atomically import up to 500 users from CSV, update email/role/status, send a reset link, suspend accounts, and restore accounts. Suspending an account revokes its HTTP sessions and disconnects its active room connections. The meeting directory is restricted at the database query layer: users only see rooms they created or previously joined. A meeting creator is its administrator and can update the room, manage member speaking permissions, and remove the meeting from active views. Authenticated users can still join an active room through its direct meeting link; after joining, they can browse its records and subscribe to live transcripts, translations, protected source/translated audio URLs, and translated audio playback. `users`, `auth_sessions`, `password_reset_tokens`, `rooms`, and `room_members` hold this authorization state.
+
+Password recovery email is configured on each service instance, so tenant user data and SMTP credentials remain on that tenant's backend. The defaults target `smtp.163.com:465` with wrapper TLS and use `lylapp@163.com` as the test sender. Set `VOICE_ELF_SMTP_PASSWORD` to the mailbox client authorization code, not the webmail login password, and restart the service. Host, port, TLS mode, username, sender address/name, and reset expiry are all configurable through the `VOICE_ELF_SMTP_*` and `VOICE_ELF_PASSWORD_RESET_MINUTES` environment variables shown in `.env.example`. Reset links use the public URL stored by first-run setup; older installations with no stored URL can set `VOICE_ELF_PUBLIC_URL` as an explicit override. The authorization code is never returned to the browser or stored in PostgreSQL.
+
+The CSV importer accepts UTF-8 files with this header. `role` defaults to `member` and `status` defaults to `active` when the cells are empty:
+
+```csv
+username,email,password,role,status
+zhangsan,zhangsan@example.com,ChangeMe123,member,active
+```
 
 On a new database, the browser is redirected to `/setup` before login or business routes are available. The four-step setup checks PostgreSQL and instance authorization, records the system and organization names plus public URL, and atomically creates the first active system administrator. Set `VOICE_ELF_SETUP_TOKEN` to a random value of at least 16 characters before first start; when it is omitted, the server prints a generated `vesetup_...` token in the startup log. This prevents another network user from claiming an uninitialized deployment. Existing databases with users are automatically marked initialized by migration and do not show the wizard.
 
@@ -185,11 +202,18 @@ POST   /api/auth/register
 POST   /api/auth/login
 DELETE /api/auth/logout
 GET    /api/auth/me
+GET    /api/auth/password/status
+POST   /api/auth/password/forgot
+POST   /api/auth/password/reset
 GET    /api/admin/overview
+GET    /api/admin/email/status
 GET    /api/admin/asr
 PATCH  /api/admin/asr
 GET    /api/admin/users?q=&status=&role=&sort=&order=&page=&page_size=
+POST   /api/admin/users
+POST   /api/admin/users/import
 PATCH  /api/admin/users/{user_id}
+POST   /api/admin/users/{user_id}/password-reset
 GET    /api/admin/rooms?q=&status=&sort=&order=&page=&page_size=
 PATCH  /api/admin/rooms/{room_id}
 GET    /api/admin/rooms/{room_id}/inspect

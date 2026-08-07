@@ -143,12 +143,24 @@ async fn check_entitlement(
         Some(backend_id) => (backend_id.as_str(), "tenant"),
         None => (system_backend_id.as_str(), "system"),
     };
+    let system_tts_backend_id = database
+        .tts_system_setting()
+        .await
+        .map_err(ApiError::internal)?
+        .map(|setting| setting.backend_id)
+        .ok_or_else(|| ApiError::unavailable("系统 TTS 默认配置尚未初始化"))?;
+    let (tts_backend_id, tts_config_source) = match &context.tenant.tts_backend_id {
+        Some(backend_id) => (backend_id.as_str(), "tenant"),
+        None => (system_tts_backend_id.as_str(), "system"),
+    };
     let grant = evaluate_entitlement(
         &context.tenant,
         &context.instance,
         Utc::now(),
         asr_backend_id,
         asr_config_source,
+        tts_backend_id,
+        tts_config_source,
     );
     database
         .record_authority_check(
@@ -480,6 +492,8 @@ fn evaluate_entitlement(
     now: DateTime<Utc>,
     asr_backend_id: &str,
     asr_config_source: &str,
+    tts_backend_id: &str,
+    tts_config_source: &str,
 ) -> EntitlementGrant {
     let (allowed, status, message) = if instance.status != "active" {
         (false, "blocked", "当前部署实例已被撤销")
@@ -514,6 +528,8 @@ fn evaluate_entitlement(
         instance_name: instance.name.clone(),
         asr_backend_id: asr_backend_id.to_owned(),
         asr_config_source: asr_config_source.to_owned(),
+        tts_backend_id: tts_backend_id.to_owned(),
+        tts_config_source: tts_config_source.to_owned(),
         license_expires_at: tenant.license_expires_at,
         grace_ends_at: tenant.grace_ends_at,
         lease_expires_at,
@@ -535,6 +551,7 @@ mod tests {
             warning_days: 30,
             offline_lease_minutes: 1_440,
             asr_backend_id: None,
+            tts_backend_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -565,6 +582,8 @@ mod tests {
             now,
             "qwen-local",
             "system",
+            "local-fallback",
+            "system",
         );
         assert_eq!(warning.status, "warning");
         assert_eq!(warning.asr_backend_id, "qwen-local");
@@ -577,6 +596,8 @@ mod tests {
                 now,
                 "qwen-local",
                 "system",
+                "local-fallback",
+                "system",
             )
             .status,
             "grace"
@@ -588,6 +609,8 @@ mod tests {
                 &instance(expired_tenant.id),
                 now,
                 "qwen-local",
+                "system",
+                "local-fallback",
                 "system",
             )
             .allowed

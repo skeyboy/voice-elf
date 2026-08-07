@@ -18,8 +18,8 @@ use uuid::Uuid;
 use crate::{
     protocol::SessionConfig,
     schema::{
-        auth_sessions, room_members, rooms, system_installations, users, voice_references,
-        voice_sessions, voice_utterances,
+        auth_sessions, password_reset_tokens, room_members, rooms, system_installations, users,
+        voice_references, voice_sessions, voice_utterances,
     },
 };
 
@@ -54,6 +54,7 @@ struct NewSession<'a> {
 pub struct UserRecord {
     pub id: Uuid,
     pub username: String,
+    pub email: Option<String>,
     pub password_hash: String,
     pub role: String,
     pub status: String,
@@ -73,10 +74,20 @@ impl UserRecord {
 struct NewUser<'a> {
     id: Uuid,
     username: &'a str,
+    email: Option<&'a str>,
     password_hash: &'a str,
     role: &'a str,
     status: &'a str,
     verified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ManagedUserInput {
+    pub username: String,
+    pub email: String,
+    pub password_hash: String,
+    pub role: String,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Serialize, diesel::Queryable, diesel::Selectable)]
@@ -110,6 +121,15 @@ pub enum InitializeSystemOutcome {
 #[derive(Insertable)]
 #[diesel(table_name = auth_sessions)]
 struct NewAuthSession<'a> {
+    id: Uuid,
+    user_id: Uuid,
+    token_hash: &'a str,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = password_reset_tokens)]
+struct NewPasswordResetToken<'a> {
     id: Uuid,
     user_id: Uuid,
     token_hash: &'a str,
@@ -194,6 +214,7 @@ pub struct RoomSummary {
 pub struct AdminUserSummary {
     pub id: Uuid,
     pub username: String,
+    pub email: Option<String>,
     pub role: String,
     pub status: String,
     pub verified_at: Option<DateTime<Utc>>,
@@ -317,12 +338,18 @@ impl Database {
         Ok(())
     }
 
-    pub async fn create_user(&self, username: &str, password_hash: &str) -> Result<UserRecord> {
+    pub async fn create_user(
+        &self,
+        username: &str,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<UserRecord> {
         let mut connection = self.pool.get().await?;
         diesel::insert_into(users::table)
             .values(NewUser {
                 id: Uuid::new_v4(),
                 username,
+                email: Some(email),
                 password_hash,
                 role: "member",
                 status: "pending",
@@ -352,6 +379,7 @@ impl Database {
         public_url: Option<&str>,
         deployment_mode: &str,
         username: &str,
+        email: &str,
         password_hash: &str,
     ) -> Result<InitializeSystemOutcome> {
         let mut connection = self.pool.get().await?;
@@ -376,6 +404,7 @@ impl Database {
                     .values(NewUser {
                         id: Uuid::new_v4(),
                         username,
+                        email: Some(email),
                         password_hash,
                         role: "admin",
                         status: "active",
@@ -411,6 +440,159 @@ impl Database {
             .await
             .optional()
             .context("failed to find user")
+    }
+
+    pub async fn find_user_by_email(&self, email: &str) -> Result<Option<UserRecord>> {
+        let mut connection = self.pool.get().await?;
+        users::table
+            .filter(users::email.eq(Some(email)))
+            .select(UserRecord::as_select())
+            .first(&mut connection)
+            .await
+            .optional()
+            .context("failed to find user by email")
+    }
+
+    pub async fn find_user_by_account(&self, account: &str) -> Result<Option<UserRecord>> {
+        let mut connection = self.pool.get().await?;
+        users::table
+            .filter(
+                users::username
+                    .eq(account)
+                    .or(users::email.eq(Some(account.to_ascii_lowercase()))),
+            )
+            .select(UserRecord::as_select())
+            .first(&mut connection)
+            .await
+            .optional()
+            .context("failed to find user by account")
+    }
+
+    pub async fn get_user(&self, user_id: Uuid) -> Result<Option<UserRecord>> {
+        let mut connection = self.pool.get().await?;
+        users::table
+            .find(user_id)
+            .select(UserRecord::as_select())
+            .first(&mut connection)
+            .await
+            .optional()
+            .context("failed to get user")
+    }
+
+    pub async fn create_managed_users(
+        &self,
+        inputs: &[ManagedUserInput],
+    ) -> Result<Vec<UserRecord>> {
+        let mut connection = self.pool.get().await?;
+        connection
+            .transaction::<Vec<UserRecord>, diesel::result::Error, _>(async |connection| {
+                let mut created = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    let verified_at = (input.status == "active").then(Utc::now);
+                    let user = diesel::insert_into(users::table)
+                        .values(NewUser {
+                            id: Uuid::new_v4(),
+                            username: &input.username,
+                            email: Some(&input.email),
+                            password_hash: &input.password_hash,
+                            role: &input.role,
+                            status: &input.status,
+                            verified_at,
+                        })
+                        .returning(UserRecord::as_returning())
+                        .get_result(connection)
+                        .await?;
+                    created.push(user);
+                }
+                Ok(created)
+            })
+            .await
+            .context("failed to create managed users")
+    }
+
+    pub async fn password_reset_request_count(
+        &self,
+        user_id: Uuid,
+        since: DateTime<Utc>,
+    ) -> Result<i64> {
+        let mut connection = self.pool.get().await?;
+        password_reset_tokens::table
+            .filter(password_reset_tokens::user_id.eq(user_id))
+            .filter(password_reset_tokens::created_at.gt(since))
+            .select(count_star())
+            .first(&mut connection)
+            .await
+            .context("failed to count password reset requests")
+    }
+
+    pub async fn create_password_reset_token(
+        &self,
+        user_id: Uuid,
+        token_hash: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut connection = self.pool.get().await?;
+        connection
+            .transaction::<(), diesel::result::Error, _>(async |connection| {
+                diesel::update(
+                    password_reset_tokens::table
+                        .filter(password_reset_tokens::user_id.eq(user_id))
+                        .filter(password_reset_tokens::consumed_at.is_null()),
+                )
+                .set(password_reset_tokens::consumed_at.eq(diesel::dsl::now))
+                .execute(connection)
+                .await?;
+                diesel::insert_into(password_reset_tokens::table)
+                    .values(NewPasswordResetToken {
+                        id: Uuid::new_v4(),
+                        user_id,
+                        token_hash,
+                        expires_at,
+                    })
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+            .await
+            .context("failed to create password reset token")
+    }
+
+    pub async fn reset_password(
+        &self,
+        token_hash: &str,
+        password_hash: &str,
+    ) -> Result<Option<UserRecord>> {
+        let mut connection = self.pool.get().await?;
+        connection
+            .transaction::<Option<UserRecord>, diesel::result::Error, _>(async |connection| {
+                let token = password_reset_tokens::table
+                    .filter(password_reset_tokens::token_hash.eq(token_hash))
+                    .filter(password_reset_tokens::consumed_at.is_null())
+                    .filter(password_reset_tokens::expires_at.gt(diesel::dsl::now))
+                    .for_update()
+                    .select((password_reset_tokens::id, password_reset_tokens::user_id))
+                    .first::<(Uuid, Uuid)>(connection)
+                    .await
+                    .optional()?;
+                let Some(token) = token else {
+                    return Ok(None);
+                };
+                let user = diesel::update(users::table.find(token.1))
+                    .set(users::password_hash.eq(password_hash))
+                    .returning(UserRecord::as_returning())
+                    .get_result(connection)
+                    .await?;
+                diesel::update(password_reset_tokens::table.find(token.0))
+                    .set(password_reset_tokens::consumed_at.eq(diesel::dsl::now))
+                    .execute(connection)
+                    .await?;
+                diesel::delete(auth_sessions::table.filter(auth_sessions::user_id.eq(user.id)))
+                    .execute(connection)
+                    .await?;
+                Ok(Some(user))
+            })
+            .await
+            .context("failed to reset password")
     }
 
     pub async fn create_auth_session(
@@ -885,7 +1067,12 @@ impl Database {
 
         let mut count_query = users::table.into_boxed();
         if let Some(search) = search {
-            count_query = count_query.filter(users::username.ilike(format!("%{search}%")));
+            let pattern = format!("%{search}%");
+            count_query = count_query.filter(
+                users::username
+                    .ilike(pattern.clone())
+                    .or(users::email.ilike(pattern)),
+            );
         }
         if let Some(status) = status {
             count_query = count_query.filter(users::status.eq(status));
@@ -900,7 +1087,12 @@ impl Database {
 
         let mut query = users::table.into_boxed();
         if let Some(search) = search {
-            query = query.filter(users::username.ilike(format!("%{search}%")));
+            let pattern = format!("%{search}%");
+            query = query.filter(
+                users::username
+                    .ilike(pattern.clone())
+                    .or(users::email.ilike(pattern)),
+            );
         }
         if let Some(status) = status {
             query = query.filter(users::status.eq(status));
@@ -951,6 +1143,7 @@ impl Database {
             items.push(AdminUserSummary {
                 id: user.id,
                 username: user.username,
+                email: user.email,
                 role: user.role,
                 status: user.status,
                 verified_at: user.verified_at,
@@ -971,6 +1164,7 @@ impl Database {
         user_id: Uuid,
         role: &str,
         status: &str,
+        email: Option<&str>,
     ) -> Result<Option<UserRecord>> {
         let mut connection = self.pool.get().await?;
         let current = users::table
@@ -987,8 +1181,10 @@ impl Database {
         } else {
             current.verified_at
         };
+        let email = email.or(current.email.as_deref());
         let updated = diesel::update(users::table.find(user_id))
             .set((
+                users::email.eq(email),
                 users::role.eq(role),
                 users::status.eq(status),
                 users::verified_at.eq(verified_at),
@@ -1186,12 +1382,14 @@ mod database_setup_tests {
 mod asr;
 mod authority;
 mod history;
+mod tts;
 
 pub use asr::AsrSystemSetting;
 pub use authority::{
     AuthorityInstanceRecord, AuthorityInstanceSummary, AuthorityTenantRecord,
     AuthorityTenantSummary, AuthorityTokenContext,
 };
+pub use tts::TtsSystemSetting;
 
 pub use history::{
     NewUtteranceAttempt, RefinementUpdate, TranscriptUpdate, TranslationUpdate,

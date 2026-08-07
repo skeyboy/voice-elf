@@ -2,12 +2,13 @@ import { loadAppConfig, saveAppConfig } from '../app-config';
 import {
   createVoiceReference,
   deleteVoiceReference,
+  listTtsVoices,
   listVoiceReferences,
+  type TtsVoiceCatalog,
   type User,
   type VoiceReference,
 } from '../api';
 import { refreshIcons } from '../components/icons';
-import { voiceOptions, voices } from '../shared/languages';
 import { isCustomVoice, loadPreferences, savePreferences } from '../shared/preferences';
 import {
   defaultSubtitlePreferences,
@@ -29,6 +30,7 @@ export class SettingsPage implements Page {
   private subtitleSavedTimer = 0;
   private unsubscribeSubtitlePreferences = () => {};
   private voiceReferences: VoiceReference[] = [];
+  private ttsVoiceCatalog: TtsVoiceCatalog | null = null;
   private pendingVoiceReference: PreparedVoiceReference | null = null;
   private pendingVoiceReferenceUrl = '';
   private mediaRecorder: MediaRecorder | null = null;
@@ -71,7 +73,7 @@ export class SettingsPage implements Page {
           <section class="settings-form" aria-label="个人与应用设置">
           <div class="settings-category-heading" id="user-settings"><span>用户设置</span><h2>语音与播报</h2></div>
           <div class="settings-section-heading"><i data-lucide="volume-2"></i><div><strong>翻译播报</strong><span>选择播报声音并设置自动播放</span></div></div>
-          <label class="settings-field"><span>播报人</span><select class="settings-voice">${voiceOptions()}</select><small class="voice-preview"></small></label>
+          <label class="settings-field"><span>播报人</span><select class="settings-voice"><option value="">正在加载可用音色...</option></select><small class="voice-preview"></small></label>
           <section class="voice-reference-settings" aria-labelledby="voice-reference-title">
             <div class="voice-reference-heading"><div><strong id="voice-reference-title">我的声音</strong><small>录制或上传 3–15 秒的人声参考</small></div><span class="voice-reference-count">0 / 5</span></div>
             <label class="voice-reference-name-field"><span>音色名称</span><input class="voice-reference-name" maxlength="32" autocomplete="off" placeholder="例如：我的会议声线" required></label>
@@ -95,8 +97,18 @@ export class SettingsPage implements Page {
           <div class="settings-category-heading" id="general-settings"><span>通用设置</span><h2>设备与采集</h2></div>
           <div class="settings-section-heading"><i data-lucide="audio-waveform"></i><div><strong>音频采集</strong><span>控制当前设备的浏览器人声检测方式</span></div></div>
           <label class="toggle-field">
-            <span><strong>增强人声过滤</strong><small>过滤持续低频嗡声、宽带噪声和短促非人声</small></span>
+            <span><strong>增强分段过滤</strong><small>过滤持续低频嗡声、宽带噪声和短促非人声触发</small></span>
             <input class="settings-voice-filter" type="checkbox" role="switch">
+            <span class="toggle-track" aria-hidden="true"></span>
+          </label>
+          <label class="toggle-field">
+            <span><strong>系统降噪</strong><small>抑制风扇、空调等持续背景噪声；外置声卡已降噪时可关闭</small></span>
+            <input class="settings-noise-suppression" type="checkbox" role="switch">
+            <span class="toggle-track" aria-hidden="true"></span>
+          </label>
+          <label class="toggle-field">
+            <span><strong>回声消除</strong><small>减少扬声器声音被麦克风再次采集；使用耳机时可关闭</small></span>
+            <input class="settings-echo-cancellation" type="checkbox" role="switch">
             <span class="toggle-track" aria-hidden="true"></span>
           </label>
           <div class="settings-divider"></div>
@@ -162,15 +174,19 @@ export class SettingsPage implements Page {
     const voice = root.querySelector<HTMLSelectElement>('.settings-voice')!;
     const autoplay = root.querySelector<HTMLInputElement>('.settings-autoplay')!;
     const enhancedVoiceFilter = root.querySelector<HTMLInputElement>('.settings-voice-filter')!;
-    voice.value = preferences.voice in voices ? preferences.voice : 'F1';
+    const noiseSuppression = root.querySelector<HTMLInputElement>('.settings-noise-suppression')!;
+    const echoCancellation = root.querySelector<HTMLInputElement>('.settings-echo-cancellation')!;
+    voice.value = '';
     autoplay.checked = preferences.autoplay;
     enhancedVoiceFilter.checked = preferences.enhancedVoiceFilter;
+    noiseSuppression.checked = preferences.noiseSuppression;
+    echoCancellation.checked = preferences.echoCancellation;
     const renderVoiceDescription = () => {
       const custom = this.voiceReferences.find(
         (reference) => customVoiceValue(reference.id) === voice.value,
       );
       root.querySelector('.voice-preview')!.textContent =
-        voices[voice.value]?.description ??
+        this.ttsVoiceCatalog?.voices.find((item) => item.id === voice.value)?.description ??
         (custom ? `${custom.name} · 我的参考声` : '正在加载我的声音');
     };
     const persist = () => {
@@ -178,6 +194,8 @@ export class SettingsPage implements Page {
         voice: voice.value,
         autoplay: autoplay.checked,
         enhancedVoiceFilter: enhancedVoiceFilter.checked,
+        noiseSuppression: noiseSuppression.checked,
+        echoCancellation: echoCancellation.checked,
       });
       renderVoiceDescription();
       const saved = root.querySelector('.playback-saved')!;
@@ -189,6 +207,8 @@ export class SettingsPage implements Page {
     voice.addEventListener('change', persist);
     autoplay.addEventListener('change', persist);
     enhancedVoiceFilter.addEventListener('change', persist);
+    noiseSuppression.addEventListener('change', persist);
+    echoCancellation.addEventListener('change', persist);
     renderVoiceDescription();
     refreshIcons(root);
     void this.mountVoiceReferences(root, voice, preferences.voice, persist, renderVoiceDescription);
@@ -206,6 +226,7 @@ export class SettingsPage implements Page {
     this.pendingVoiceReferenceUrl = '';
     this.pendingVoiceReference = null;
     this.voiceReferences = [];
+    this.ttsVoiceCatalog = null;
   }
 
   private async mountVoiceReferences(
@@ -265,8 +286,11 @@ export class SettingsPage implements Page {
     });
 
     try {
-      this.voiceReferences = await listVoiceReferences();
+      const [catalog, references] = await Promise.all([listTtsVoices(), listVoiceReferences()]);
       if (this.root !== root) return;
+      this.ttsVoiceCatalog = catalog;
+      this.voiceReferences = references;
+      this.renderProviderVoiceOptions(voice);
       const selected = this.renderVoiceReferenceOptions(voice, preferredVoice);
       this.renderVoiceReferenceList(root, voice, persist);
       renderVoiceDescription();
@@ -279,9 +303,40 @@ export class SettingsPage implements Page {
     }
   }
 
+  private renderProviderVoiceOptions(voice: HTMLSelectElement) {
+    voice.replaceChildren();
+    const catalog = this.ttsVoiceCatalog;
+    if (!catalog?.voices.length) {
+      const option = document.createElement('option');
+      option.value = '';
+      option.textContent = '当前 TTS 没有可用音色';
+      option.disabled = true;
+      voice.append(option);
+      return;
+    }
+    const groups = new Map<string, typeof catalog.voices>();
+    for (const item of catalog.voices) {
+      const group = groups.get(item.group) ?? [];
+      group.push(item);
+      groups.set(item.group, group);
+    }
+    for (const [label, items] of groups) {
+      const group = document.createElement('optgroup');
+      group.label = label;
+      for (const item of items) {
+        const option = document.createElement('option');
+        option.value = item.id;
+        option.textContent = item.display_name;
+        option.title = item.description;
+        group.append(option);
+      }
+      voice.append(group);
+    }
+  }
+
   private renderVoiceReferenceOptions(voice: HTMLSelectElement, selectedValue: string) {
     voice.querySelector('optgroup[data-custom-voices]')?.remove();
-    if (this.voiceReferences.length) {
+    if (this.voiceReferences.length && this.ttsVoiceCatalog?.supports_custom_voices) {
       const group = document.createElement('optgroup');
       group.label = '我的声音';
       group.dataset.customVoices = '';
@@ -294,9 +349,11 @@ export class SettingsPage implements Page {
       voice.append(group);
     }
     const exists =
-      selectedValue in voices ||
-      this.voiceReferences.some((reference) => customVoiceValue(reference.id) === selectedValue);
-    voice.value = exists ? selectedValue : 'F1';
+      this.ttsVoiceCatalog?.voices.some((item) => item.id === selectedValue) ||
+      (this.ttsVoiceCatalog?.supports_custom_voices &&
+        this.voiceReferences.some((reference) => customVoiceValue(reference.id) === selectedValue));
+    const fallback = this.ttsVoiceCatalog?.voices[0]?.id ?? '';
+    voice.value = exists ? selectedValue : fallback;
     return exists;
   }
 
@@ -373,8 +430,8 @@ export class SettingsPage implements Page {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
+          echoCancellation: loadPreferences(this.user.id).echoCancellation,
+          noiseSuppression: loadPreferences(this.user.id).noiseSuppression,
           autoGainControl: false,
         },
       });

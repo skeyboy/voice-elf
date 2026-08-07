@@ -1,4 +1,5 @@
 mod fallback;
+mod index_tts;
 mod moss_nano;
 mod sherpa;
 
@@ -17,6 +18,7 @@ use tokio::sync::mpsc;
 use crate::config::TtsConfig;
 
 pub use fallback::FallbackTtsEngine;
+pub use index_tts::IndexTtsEngine;
 pub use moss_nano::MossNanoOnnxEngine;
 pub use sherpa::{KokoroEngine, SupertonicEngine};
 

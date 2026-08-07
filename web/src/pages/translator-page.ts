@@ -17,7 +17,7 @@ import type { ConnectionStatus } from '../components/topbar';
 import { VoiceSession } from '../controllers/voice-session';
 import type { PipelinePhase, ServerEvent, SessionConfig } from '../protocol';
 import { languageNames } from '../shared/languages';
-import { loadPreferences, subscribePreferences } from '../shared/preferences';
+import { loadPreferences, savePreferences, subscribePreferences } from '../shared/preferences';
 import type { Page } from './page';
 
 export class TranslatorPage implements Page {
@@ -37,6 +37,8 @@ export class TranslatorPage implements Page {
   private maxUtteranceSeconds = 20;
   private voice = 'F1';
   private enhancedVoiceFilter = true;
+  private noiseSuppression = true;
+  private echoCancellation = true;
   private readonly latencyIds = new Set<string>();
   private historySync: Promise<void> | null = null;
   private members: RoomMemberState[] = [];
@@ -78,6 +80,8 @@ export class TranslatorPage implements Page {
     const preferences = loadPreferences(this.userId);
     this.voice = preferences.voice;
     this.enhancedVoiceFilter = preferences.enhancedVoiceFilter;
+    this.noiseSuppression = preferences.noiseSuppression;
+    this.echoCancellation = preferences.echoCancellation;
     this.player.muted = !preferences.autoplay;
     root.innerHTML = this.template(detail.room);
     this.renderMembers();
@@ -100,6 +104,12 @@ export class TranslatorPage implements Page {
     this.unsubscribePreferences = subscribePreferences(this.userId, (next) => {
       this.voice = next.voice;
       this.enhancedVoiceFilter = next.enhancedVoiceFilter;
+      this.noiseSuppression = next.noiseSuppression;
+      this.echoCancellation = next.echoCancellation;
+      const noiseToggle = this.root?.querySelector<HTMLInputElement>('.capture-noise-suppression');
+      const echoToggle = this.root?.querySelector<HTMLInputElement>('.capture-echo-cancellation');
+      if (noiseToggle) noiseToggle.checked = next.noiseSuppression;
+      if (echoToggle) echoToggle.checked = next.echoCancellation;
       this.player.muted = !next.autoplay;
       this.voiceSession?.sendConfig();
     });
@@ -118,6 +128,8 @@ export class TranslatorPage implements Page {
       this.player,
       () => this.sessionConfig(),
       () => this.enhancedVoiceFilter,
+      () => this.noiseSuppression,
+      () => this.echoCancellation,
       {
         onEvent: (event) => this.handleEvent(event),
         onConnection: (status) => this.setConnection(status),
@@ -200,7 +212,22 @@ export class TranslatorPage implements Page {
                 <i data-lucide="arrow-left-right"></i>
                 <span class="language-target-label">${escapeHtml(languageNames[room.target_language] ?? room.target_language)}</span>
               </button>
-              <button class="record-button" type="button" aria-label="开始录音" title="开始录音" disabled><i data-lucide="mic"></i></button>
+              <div class="record-control">
+                <button class="record-button" type="button" aria-label="开始录音" title="开始录音" disabled><i data-lucide="mic"></i></button>
+                <span class="record-button-copy">开始录音</span>
+                <div class="capture-processing-options">
+                  <label class="capture-processing-option">
+                    <input class="capture-noise-suppression" type="checkbox" role="switch" ${this.noiseSuppression ? 'checked' : ''}>
+                    <span class="capture-processing-track" aria-hidden="true"></span>
+                    <span class="capture-processing-copy"><strong>系统降噪</strong><small>下次录音生效</small></span>
+                  </label>
+                  <label class="capture-processing-option">
+                    <input class="capture-echo-cancellation" type="checkbox" role="switch" ${this.echoCancellation ? 'checked' : ''}>
+                    <span class="capture-processing-track" aria-hidden="true"></span>
+                    <span class="capture-processing-copy"><strong>回声消除</strong><small>下次录音生效</small></span>
+                  </label>
+                </div>
+              </div>
               <div class="capture-readout"><strong class="capture-state">连接中</strong><span class="capture-time">00:00</span></div>
             </div>
           </section>
@@ -221,6 +248,20 @@ export class TranslatorPage implements Page {
         this.onError(error instanceof Error ? error.message : '无法访问麦克风'),
       ),
     );
+    this.root.querySelector<HTMLInputElement>('.capture-noise-suppression')?.addEventListener('change', (event) => {
+      const preferences = loadPreferences(this.userId);
+      savePreferences(this.userId, {
+        ...preferences,
+        noiseSuppression: (event.currentTarget as HTMLInputElement).checked,
+      });
+    });
+    this.root.querySelector<HTMLInputElement>('.capture-echo-cancellation')?.addEventListener('change', (event) => {
+      const preferences = loadPreferences(this.userId);
+      savePreferences(this.userId, {
+        ...preferences,
+        echoCancellation: (event.currentTarget as HTMLInputElement).checked,
+      });
+    });
     this.root.querySelector('.language-config-button')?.addEventListener('click', () =>
       this.languageDialog?.open(this.sourceLanguage, this.targetLanguage),
     );
@@ -378,6 +419,9 @@ export class TranslatorPage implements Page {
     const console = this.root.querySelector<HTMLElement>('.capture-console')!;
     const badge = this.root.querySelector<HTMLElement>('.capture-session-badge')!;
     button.classList.toggle('recording', recording);
+    this.root.querySelectorAll<HTMLInputElement>('.capture-processing-option input').forEach((toggle) => {
+      toggle.disabled = recording;
+    });
     console.classList.toggle('is-recording', recording);
     badge.classList.toggle('active', recording);
     this.root.querySelector('.translator-page')?.classList.toggle('is-recording', recording);
@@ -394,6 +438,10 @@ export class TranslatorPage implements Page {
     button.innerHTML = `<i data-lucide="${recording ? 'circle-stop' : 'mic'}"></i>`;
     button.title = recording ? '停止录音' : '开始录音';
     button.ariaLabel = button.title;
+    this.root.querySelector('.record-button-copy')!.textContent = button.title;
+    this.root.querySelectorAll('.capture-processing-copy small').forEach((description) => {
+      description.textContent = recording ? '停止后可切换' : '下次录音生效';
+    });
     refreshIcons(button);
     window.clearInterval(this.timer);
     if (recording) {

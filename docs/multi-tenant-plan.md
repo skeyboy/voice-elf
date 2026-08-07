@@ -52,6 +52,8 @@ VOICE_ELF_AUTHORITY_TIMEOUT_SECONDS=10
 
 这是机器到机器的授权，不代替租户本地用户认证。租户用户仍使用 Argon2 密码、HttpOnly 会话 Cookie 和现有人员状态管理；总线系统管理员也使用总线本地账号登录后操作授权管理页。
 
+租户实例内的管理员只管理本实例用户：创建或批量导入账号、补录邮箱、验证、停用、恢复、调整角色及发送密码重置链接。邮箱、密码哈希、一次性重置令牌和 SMTP 凭据均留在租户数据面，不同步到授权总线。每个租户可独立配置 `VOICE_ELF_SMTP_*`，因此邮件品牌、发件账号和公网重置地址可以随部署调整，租户前端仍使用同一套 `/api/auth/password/*` 流程。
+
 ## 到期、提醒与故障策略
 
 授权状态只有以下几类：
@@ -72,9 +74,12 @@ VOICE_ELF_AUTHORITY_TIMEOUT_SECONDS=10
 ```text
 authority_tenants
   name, slug, status, license_expires_at, grace_ends_at,
-  warning_days, offline_lease_minutes, asr_backend_id
+  warning_days, offline_lease_minutes, asr_backend_id, tts_backend_id
 
 asr_system_settings
+  backend_id, updated_by, updated_at
+
+tts_system_settings
   backend_id, updated_by, updated_at
 
 authority_instances
@@ -90,7 +95,11 @@ authority_audit_events
 
 总线的“系统管理 / 授权管理”页面提供租户搜索、状态过滤、排序、分页、创建、期限调整；租户详情中可签发实例、查看最近心跳、轮换密钥、撤销和恢复实例。凭据明文只在签发或轮换响应中出现一次。
 
-ASR 管理使用系统默认加租户覆盖。总线只保存稳定的 provider ID；租户覆盖为空时继承系统默认。租户后端在 entitlement check 响应中取得已解析的 provider ID 和配置来源，并在新建房间音频管线时应用。模型目录、云 ASR API Key 和其他 provider 参数只配置在租户自建服务端，不进入总线或浏览器。
+ASR 与 TTS 管理均使用系统默认加租户覆盖。总线只保存稳定的 provider ID；租户覆盖为空时继承系统默认。租户后端在 entitlement check 响应中取得已解析的 ASR/TTS provider ID 和配置来源，并在新建房间音频管线时应用。模型目录、参考音频、侧车地址、API Key 和其他 provider 参数只配置在租户自建服务端，不进入总线或浏览器。总线给租户分配 `index-tts2` 时，租户部署必须同时启用并启动自己的 IndexTTS2 侧车；缺失时后端明确拒绝新音频管线，不静默改用其他音色。
+
+TTS 音色目录同样由租户自建服务根据当前生效 provider 和本地配置生成，并通过租户后端认证接口提供给前端。用户偏好始终保存稳定的音色 ID，人工别名仅作为租户本地显示名称保存在 `tts_voice_aliases`，不改变合成参数，也不上传至总线。管理员可在 TTS 管理页修改或清空别名；切换 provider 后只展示该 provider 的音色目录和别名，从而避免不同引擎之间同名音色被错误复用。
+
+IndexTTS2 的模型安装、侧车进程和健康检查属于租户数据面的本地运维能力。租户管理员可在自己的 TTS 管理页执行安装、启动和停止，但不能借此覆盖总线下发的 provider 策略；总线只分配稳定 provider ID，不远程触发模型下载，也不能读取租户本地模型路径和运行日志。只有租户侧 `/health` 校验通过后，新的房间音频管线才允许使用 `index-tts2`。
 
 ## 安全边界
 
@@ -101,6 +110,7 @@ ASR 管理使用系统默认加租户覆盖。总线只保存稳定的 provider 
 - 租户和实例暂停或撤销、密钥轮换、授权和宽限期结束都由总线实时判定。
 - 生产环境仍应在反向代理增加令牌端点限速、失败告警、审计留存和密钥托管。
 - 租户实例未配置被分配的 ASR provider 时必须明确拒绝新音频管线，不能静默回退到 Demo。
+- 租户实例未配置被分配的 TTS provider 时必须明确拒绝新音频管线，不能静默切换音色或回退到其他引擎。
 
 ## 与共享数据库多租户的关系
 
@@ -111,10 +121,11 @@ ASR 管理使用系统默认加租户覆盖。总线只保存稳定的 provider 
 ## 上线与验证
 
 1. 先以 `bus` 模式部署总线并配置至少 16 位的 `VOICE_ELF_SETUP_TOKEN`。首次访问自动进入 `/setup`，完成环境检查、系统资料和平台管理员创建。
-2. 平台管理员在 ASR 管理页确认系统默认 provider，再在授权管理页创建租户、配置可选 ASR 覆盖并签发部署实例。
+2. 平台管理员在 ASR、TTS 管理页确认系统默认 provider，再在授权管理页创建租户、配置可选 ASR/TTS 覆盖并签发部署实例。
 3. 在租户后端注入实例凭据和独立的初始化口令，以 `tenant` 模式启动；通过租户自己的 `/setup` 创建本地系统资料及本地管理员。
-4. 分别验证即将到期、宽限期、总线断网但租约有效、租约失效、实例撤销、密钥轮换和租户暂停。
-5. 确认浏览器网络请求、日志和静态资源中不出现 `client_secret` 或总线 Bearer Token。
-6. 确认总线数据库及审计中不包含租户用户名、会议内容、字幕和媒体路径。
+4. 在租户后端配置 SMTP 授权码及公网地址，验证注册邮箱、管理员创建/导入、停用用户和一次性密码重置链接。
+5. 分别验证即将到期、宽限期、总线断网但租约有效、租约失效、实例撤销、密钥轮换和租户暂停。
+6. 确认浏览器网络请求、日志和静态资源中不出现 `client_secret`、SMTP 授权码或总线 Bearer Token。
+7. 确认总线数据库及审计中不包含租户用户名、邮箱、密码重置记录、会议内容、字幕和媒体路径。
 
 关键负向测试包括：伪造 `client_id`、错误密钥、过期令牌、已撤销实例、跨实例令牌、授权到期、超过离线租约、未登录或非管理员访问总线管理接口。

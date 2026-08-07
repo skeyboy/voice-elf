@@ -8,15 +8,18 @@ import {
   type AuthorityTenant,
   type InstanceAuthorization,
   type IssuedAuthorityCredential,
+  type MailStatus,
   type Paginated,
   type RoomDetail,
   type RoomSummary,
+  type TtsManagement,
+  type TtsProvider,
   type User,
 } from '../api';
 import { refreshIcons } from '../components/icons';
 import type { Page } from './page';
 
-type AdminSection = 'users' | 'rooms' | 'asr' | 'authority';
+type AdminSection = 'users' | 'rooms' | 'asr' | 'tts' | 'authority';
 type SortOrder = 'asc' | 'desc';
 
 const USER_STATUS = {
@@ -49,9 +52,13 @@ export class AdminPage implements Page {
   private pageSize = 20;
   private requestId = 0;
   private searchTimer = 0;
+  private ttsPollTimer = 0;
   private authorityEnabled = false;
   private asrManagement: AsrManagement | null = null;
+  private ttsManagement: TtsManagement | null = null;
   private tenants = new Map<string, AuthorityTenant>();
+  private users = new Map<string, AdminUser>();
+  private mailStatus: MailStatus | null = null;
 
   constructor(
     private readonly currentUser: User,
@@ -83,6 +90,7 @@ export class AdminPage implements Page {
             <button class="active" type="button" role="tab" data-section="users"><i data-lucide="users"></i><span>人员管理</span></button>
             <button type="button" role="tab" data-section="rooms"><i data-lucide="calendar-clock"></i><span>会议管理</span></button>
             <button type="button" role="tab" data-section="asr"><i data-lucide="audio-waveform"></i><span>ASR 管理</span></button>
+            <button type="button" role="tab" data-section="tts"><i data-lucide="speech"></i><span>TTS 管理</span></button>
             <button type="button" role="tab" data-section="authority" hidden><i data-lucide="key-round"></i><span>授权管理</span></button>
           </div>
 
@@ -113,7 +121,13 @@ export class AdminPage implements Page {
 
           <div class="admin-result-bar">
             <span class="admin-result-count" role="status" aria-live="polite"></span>
-            <span class="admin-result-actions"><button class="admin-create button-secondary" type="button" hidden><i data-lucide="plus"></i><span>创建租户</span></button><label><span>每页</span><select name="page_size"><option>10</option><option selected>20</option><option>50</option></select></label></span>
+            <span class="admin-result-actions">
+              <span class="admin-mail-state" hidden></span>
+              <button class="admin-import-users button-secondary" type="button" hidden><i data-lucide="file-up"></i><span>批量导入</span></button>
+              <button class="admin-create-user button-primary" type="button" hidden><i data-lucide="user-plus"></i><span>新建用户</span></button>
+              <button class="admin-create-tenant button-secondary" type="button" hidden><i data-lucide="plus"></i><span>创建租户</span></button>
+              <label><span>每页</span><select name="page_size"><option>10</option><option selected>20</option><option>50</option></select></label>
+            </span>
           </div>
           <div class="admin-table-shell" aria-live="polite" aria-busy="true"></div>
           <nav class="admin-pagination" aria-label="分页"></nav>
@@ -135,11 +149,12 @@ export class AdminPage implements Page {
     this.authorityEnabled = authorization?.mode === 'bus';
     const authorityTab = root.querySelector<HTMLButtonElement>('[data-section="authority"]');
     if (authorityTab) authorityTab.hidden = !this.authorityEnabled;
-    await Promise.all([this.loadOverview(), this.loadAsrManagement(), this.loadList()]);
+    await Promise.all([this.loadOverview(), this.loadAsrManagement(), this.loadTtsManagement(), this.loadMailStatus(), this.loadList()]);
   }
 
   destroy() {
     window.clearTimeout(this.searchTimer);
+    window.clearTimeout(this.ttsPollTimer);
     this.requestId += 1;
     this.root?.querySelector<HTMLDialogElement>('.admin-inspector')?.close();
     this.root = null;
@@ -225,16 +240,30 @@ export class AdminPage implements Page {
       if (systemAsr) void this.changeSystemAsr(systemAsr);
       const tenantAsr = (event.target as HTMLElement).closest<HTMLSelectElement>('[data-tenant-asr]');
       if (tenantAsr) void this.changeTenantAsr(tenantAsr);
+      const systemTts = (event.target as HTMLElement).closest<HTMLSelectElement>('[data-system-tts]');
+      if (systemTts) void this.changeSystemTts(systemTts);
+      const tenantTts = (event.target as HTMLElement).closest<HTMLSelectElement>('[data-tenant-tts]');
+      if (tenantTts) void this.changeTenantTts(tenantTts);
     });
     this.root.querySelector('.admin-table-shell')?.addEventListener('click', (event) => {
       const userAction = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-user-action]');
       if (userAction) void this.changeUserStatus(userAction);
+      const editUser = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-edit-user]');
+      if (editUser?.dataset.editUser) this.openUserEditor(this.users.get(editUser.dataset.editUser));
+      const resetUser = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-reset-user]');
+      if (resetUser?.dataset.resetUser) void this.sendUserPasswordReset(resetUser.dataset.resetUser, resetUser);
       const inspect = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-inspect-room]');
       if (inspect?.dataset.inspectRoom) void this.inspectRoom(inspect.dataset.inspectRoom);
       const tenant = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-inspect-tenant]');
       if (tenant?.dataset.inspectTenant) void this.inspectTenant(tenant.dataset.inspectTenant);
+      const saveVoiceAlias = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-save-voice-alias]');
+      if (saveVoiceAlias) void this.saveVoiceAlias(saveVoiceAlias);
+      const indexAction = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-index-tts-action]');
+      if (indexAction) void this.handleIndexTtsAction(indexAction);
     });
-    this.root.querySelector('.admin-create')?.addEventListener('click', () => this.openTenantEditor());
+    this.root.querySelector('.admin-create-user')?.addEventListener('click', () => this.openUserEditor());
+    this.root.querySelector('.admin-import-users')?.addEventListener('click', () => this.openUserImport());
+    this.root.querySelector('.admin-create-tenant')?.addEventListener('click', () => this.openTenantEditor());
     const dialog = this.root.querySelector<HTMLDialogElement>('.admin-inspector')!;
     dialog.querySelector('.inspector-close')?.addEventListener('click', () => dialog.close());
     dialog.addEventListener('click', (event) => {
@@ -245,6 +274,8 @@ export class AdminPage implements Page {
       if (copy?.dataset.copyValue) void this.copyCredential(copy.dataset.copyValue);
       const edit = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-edit-tenant]');
       if (edit?.dataset.editTenant) this.openTenantEditor(this.tenants.get(edit.dataset.editTenant));
+      const template = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-download-user-template]');
+      if (template) this.downloadUserTemplate();
     });
     dialog.addEventListener('close', () => {
       dialog.querySelector<HTMLElement>('.admin-inspector-body')?.replaceChildren();
@@ -254,6 +285,8 @@ export class AdminPage implements Page {
       const form = event.target as HTMLFormElement;
       if (form.matches('[data-tenant-form]')) void this.saveTenant(form);
       if (form.matches('[data-instance-form]')) void this.createInstance(form);
+      if (form.matches('[data-user-form]')) void this.saveUser(form);
+      if (form.matches('[data-user-import-form]')) void this.importUsers(form);
     });
   }
 
@@ -265,7 +298,7 @@ export class AdminPage implements Page {
       button.setAttribute('aria-selected', String(active));
     });
     const query = this.root.querySelector<HTMLInputElement>('[name="q"]')!;
-    const compact = this.section === 'asr';
+    const compact = this.section === 'asr' || this.section === 'tts';
     this.root.querySelector<HTMLFormElement>('.admin-filters')!.hidden = compact;
     this.root.querySelector<HTMLElement>('.admin-result-bar')!.hidden = compact;
     if (compact) this.root.querySelector<HTMLElement>('.admin-pagination')!.replaceChildren();
@@ -287,8 +320,11 @@ export class AdminPage implements Page {
         ? '<option value="updated_at">最近活动</option><option value="created_at">创建时间</option><option value="name">会议名称</option>'
         : '<option value="created_at">创建时间</option><option value="name">租户名称</option><option value="license_expires_at">授权到期</option>';
     sort.value = this.sort;
-    const create = this.root.querySelector<HTMLButtonElement>('.admin-create')!;
-    create.hidden = this.section !== 'authority';
+    this.root.querySelector<HTMLButtonElement>('.admin-create-user')!.hidden = this.section !== 'users';
+    this.root.querySelector<HTMLButtonElement>('.admin-import-users')!.hidden = this.section !== 'users';
+    this.root.querySelector<HTMLButtonElement>('.admin-create-tenant')!.hidden = this.section !== 'authority';
+    const mailState = this.root.querySelector<HTMLElement>('.admin-mail-state')!;
+    mailState.hidden = this.section !== 'users';
     this.updateOrderButton();
   }
 
@@ -326,6 +362,30 @@ export class AdminPage implements Page {
     }
   }
 
+  private async loadTtsManagement() {
+    try {
+      this.ttsManagement = await apiRequest<TtsManagement>('/api/admin/tts');
+    } catch (error) {
+      this.onError(error instanceof Error ? error.message : '无法加载 TTS 配置');
+    }
+  }
+
+  private async loadMailStatus() {
+    try {
+      this.mailStatus = await apiRequest<MailStatus>('/api/admin/email/status');
+      if (!this.root) return;
+      const state = this.root.querySelector<HTMLElement>('.admin-mail-state')!;
+      state.className = `admin-mail-state ${this.mailStatus.configured ? 'configured' : 'unconfigured'}`;
+      state.title = this.mailStatus.configured
+        ? `${this.mailStatus.host}:${this.mailStatus.port} · ${this.mailStatus.from_address}`
+        : '设置 VOICE_ELF_SMTP_PASSWORD 后重启服务';
+      state.innerHTML = `<i data-lucide="${this.mailStatus.configured ? 'mail-check' : 'mail-warning'}"></i><span>${this.mailStatus.configured ? 'SMTP 已配置' : 'SMTP 未配置'}</span>`;
+      refreshIcons(state);
+    } catch (error) {
+      this.onError(error instanceof Error ? error.message : '无法加载邮件配置状态');
+    }
+  }
+
   private async loadList() {
     if (!this.root) return;
     const requestId = ++this.requestId;
@@ -346,6 +406,7 @@ export class AdminPage implements Page {
       if (this.section === 'users') {
         const data = await apiRequest<Paginated<AdminUser>>(`/api/admin/users?${params}`);
         if (!this.root || requestId !== this.requestId) return;
+        this.users = new Map(data.items.map((user) => [user.id, user]));
         this.renderUsers(data);
       } else if (this.section === 'rooms') {
         const data = await apiRequest<Paginated<RoomSummary>>(`/api/admin/rooms?${params}`);
@@ -356,6 +417,11 @@ export class AdminPage implements Page {
         if (!this.root || requestId !== this.requestId) return;
         this.asrManagement = data;
         this.renderAsr(data);
+      } else if (this.section === 'tts') {
+        const data = await apiRequest<TtsManagement>('/api/admin/tts');
+        if (!this.root || requestId !== this.requestId) return;
+        this.ttsManagement = data;
+        this.renderTts(data);
       } else {
         const data = await apiRequest<Paginated<AuthorityTenant>>(`/api/admin/authority/tenants?${params}`);
         if (!this.root || requestId !== this.requestId) return;
@@ -409,9 +475,130 @@ export class AdminPage implements Page {
               </tr>`).join('')}</tbody>
           </table>
         </section>
+
       </section>
     `;
     refreshIcons(shell);
+  }
+
+  private renderTts(data: TtsManagement) {
+    if (!this.root) return;
+    const shell = this.root.querySelector<HTMLElement>('.admin-table-shell')!;
+    const effective = data.providers.find((provider) => provider.id === data.effective.backend_id);
+    const system = data.providers.find((provider) => provider.id === data.system_setting.backend_id);
+    const effectiveAvailable = effective?.available !== false;
+    const runtime = data.index_tts_runtime;
+    const runtimeBusy = Boolean(runtime.action) || ['installing', 'starting', 'stopping'].includes(runtime.phase);
+    const runtimeAction = !runtime.model_ready ? 'install' : runtime.running || runtime.healthy ? 'stop' : 'start';
+    const runtimeActionLabel = runtimeAction === 'install' ? '安装并启动' : runtimeAction === 'start' ? '启动服务' : '停止服务';
+    const runtimeActionIcon = runtimeAction === 'install' ? 'download' : runtimeAction === 'start' ? 'play' : 'square';
+    shell.innerHTML = `
+      <section class="asr-management">
+        <header class="asr-current">
+          <span class="asr-current-icon"><i data-lucide="speech"></i></span>
+          <div><span>当前生效</span><strong>${escapeHtml(effective?.name ?? data.effective.backend_id)}</strong><small>${data.effective.source === 'tenant' ? `租户策略 · ${escapeHtml(data.effective.tenant_name ?? '')}` : '系统默认策略'}</small></div>
+          <span class="asr-live-status ${effectiveAvailable ? '' : 'offline'}"><i></i>${effectiveAvailable ? '已启用' : '不可用'}</span>
+        </header>
+
+        <section class="asr-system-setting">
+          <div><span class="section-kicker">SYSTEM DEFAULT</span><h2>系统默认后端</h2></div>
+          <label>
+            <span>TTS Provider</span>
+            <select data-system-tts data-current-backend="${escapeAttribute(data.system_setting.backend_id)}" ${data.can_update_system ? '' : 'disabled'}>
+              ${this.ttsOptions(data.providers, data.system_setting.backend_id, false)}
+            </select>
+          </label>
+          <dl><div><dt>当前默认</dt><dd>${escapeHtml(system?.name ?? data.system_setting.backend_id)}</dd></div><div><dt>更新时间</dt><dd>${formatDate(data.system_setting.updated_at)}</dd></div><div><dt>生效范围</dt><dd>新建音频管线</dd></div></dl>
+        </section>
+
+        <section class="index-tts-runtime" data-phase="${escapeAttribute(runtime.phase)}">
+          <span class="index-tts-runtime-icon"><i data-lucide="sparkles"></i></span>
+          <div class="index-tts-runtime-copy">
+            <span class="section-kicker">INDEXTTS2 RUNTIME</span>
+            <strong>${runtime.healthy ? '模型服务可用' : runtime.model_ready ? '模型已安装' : '模型尚未安装'}</strong>
+            <small>${escapeHtml(runtime.message)}</small>
+          </div>
+          <dl>
+            <div><dt>模型</dt><dd>${runtime.model_ready ? '完整' : '未下载'}</dd></div>
+            <div><dt>进程</dt><dd>${runtime.running ? '运行中' : '已停止'}</dd></div>
+            <div><dt>健康检查</dt><dd>${runtime.healthy ? '通过' : '未通过'}</dd></div>
+          </dl>
+          <div class="index-tts-runtime-actions">
+            <button class="button-secondary" type="button" data-index-tts-action="refresh" ${runtimeBusy ? 'disabled' : ''}><i data-lucide="refresh-cw"></i><span>刷新状态</span></button>
+            <button class="button-primary" type="button" data-index-tts-action="${runtimeAction}" ${runtimeBusy || !runtime.script_available ? 'disabled' : ''}><i data-lucide="${runtimeBusy ? 'loader-circle' : runtimeActionIcon}"></i><span>${runtimeBusy ? '正在处理' : runtimeActionLabel}</span></button>
+          </div>
+          <small class="index-tts-runtime-path" title="${escapeAttribute(runtime.model_dir)}">模型目录：${escapeHtml(runtime.model_dir)}</small>
+        </section>
+
+        <section class="asr-provider-list">
+          <header><span class="section-kicker">PROVIDERS</span><h2>后端能力</h2></header>
+          <table class="admin-table asr-provider-table">
+            <thead><tr><th>Provider</th><th>引擎</th><th>用途</th><th>本机状态</th></tr></thead>
+            <tbody>${data.providers.map((provider) => `
+              <tr>
+                <td><span class="asr-provider-name"><i data-lucide="${provider.id === 'index-tts2' ? 'sparkles' : 'audio-lines'}"></i><span><strong>${escapeHtml(provider.name)}</strong><code>${escapeHtml(provider.id)}</code></span></span></td>
+                <td><strong>${escapeHtml(provider.engine)}</strong><small class="admin-cell-note">${provider.voice_clone ? '支持自定义音色' : '预置音色'}</small></td>
+                <td><span class="admin-cell-note">${escapeHtml(provider.description)}</span></td>
+                <td><span class="admin-status ${provider.available ? 'active' : 'suspended'}"><i></i>${provider.available ? '可用' : '不可用'}</span></td>
+              </tr>`).join('')}</tbody>
+          </table>
+        </section>
+
+        <section class="tts-voice-list">
+          <header><span class="section-kicker">VOICES</span><h2>音色与别名</h2><small>${escapeHtml(effective?.name ?? data.effective.backend_id)} · ${data.voices.length} 个可选音色</small></header>
+          <table class="admin-table tts-voice-table">
+            <thead><tr><th>音色</th><th>稳定 ID</th><th>支持语言</th><th>人工别名</th></tr></thead>
+            <tbody>${data.voices.map((voice) => `
+              <tr>
+                <td><strong>${escapeHtml(voice.display_name)}</strong><small class="admin-cell-note">默认：${escapeHtml(voice.default_name)}</small></td>
+                <td><code>${escapeHtml(voice.id)}</code><small class="admin-cell-note">${escapeHtml(voice.group)}</small></td>
+                <td><span class="tts-language-list">${voice.languages.map((language) => `<span>${escapeHtml(language.toUpperCase())}</span>`).join('')}</span><small class="admin-cell-note">${escapeHtml(voice.description)}</small></td>
+                <td><span class="tts-alias-editor"><input data-voice-alias maxlength="64" value="${escapeAttribute(voice.alias ?? '')}" placeholder="${escapeAttribute(voice.default_name)}" aria-label="${escapeAttribute(voice.default_name)} 的人工别名"><button class="icon-button" type="button" data-save-voice-alias="${escapeAttribute(voice.id)}" title="保存别名" aria-label="保存 ${escapeAttribute(voice.default_name)} 的别名"><i data-lucide="save"></i></button></span><small class="admin-cell-note">留空保存可恢复默认名称</small></td>
+              </tr>`).join('')}</tbody>
+          </table>
+        </section>
+      </section>
+    `;
+    refreshIcons(shell);
+    this.scheduleTtsRuntimePoll(runtime.phase);
+  }
+
+  private scheduleTtsRuntimePoll(phase: string) {
+    window.clearTimeout(this.ttsPollTimer);
+    if (!this.root || this.section !== 'tts' || !['installing', 'starting', 'stopping'].includes(phase)) return;
+    this.ttsPollTimer = window.setTimeout(() => void this.refreshTtsView(), 3_000);
+  }
+
+  private async refreshTtsView() {
+    if (!this.root || this.section !== 'tts') return;
+    try {
+      const data = await apiRequest<TtsManagement>('/api/admin/tts');
+      if (!this.root || this.section !== 'tts') return;
+      this.ttsManagement = data;
+      this.renderTts(data);
+    } catch (error) {
+      this.onError(error instanceof Error ? error.message : '无法刷新 IndexTTS2 状态');
+    }
+  }
+
+  private async handleIndexTtsAction(button: HTMLButtonElement) {
+    const action = button.dataset.indexTtsAction;
+    if (!action) return;
+    if (action === 'refresh') {
+      button.disabled = true;
+      await this.refreshTtsView();
+      return;
+    }
+    if (action === 'install' && !window.confirm('将下载约 5.9 GB 的 IndexTTS2 模型并安装独立运行环境，是否继续？')) return;
+    button.disabled = true;
+    try {
+      await apiRequest(`/api/admin/tts/index-tts/${action}`, { method: 'POST' });
+      this.onMessage(action === 'install' ? 'IndexTTS2 已开始后台安装' : action === 'start' ? 'IndexTTS2 正在启动' : 'IndexTTS2 正在停止');
+      await this.refreshTtsView();
+    } catch (error) {
+      this.onError(error instanceof Error ? error.message : 'IndexTTS2 操作失败');
+      await this.refreshTtsView();
+    }
   }
 
   private renderUsers(data: Paginated<AdminUser>) {
@@ -439,12 +626,12 @@ export class AdminPage implements Page {
     const actionIcon = user.status === 'active' ? 'user-x' : 'user-check';
     return `
       <tr>
-        <td><span class="admin-identity"><span class="admin-avatar">${escapeHtml(Array.from(user.username)[0]?.toUpperCase() ?? 'U')}</span><span><strong>${escapeHtml(user.username)}${isSelf ? '<small>当前账号</small>' : ''}</strong><code>${escapeHtml(shortId(user.id))}</code></span></span></td>
+        <td><span class="admin-identity"><span class="admin-avatar">${escapeHtml(Array.from(user.username)[0]?.toUpperCase() ?? 'U')}</span><span><strong>${escapeHtml(user.username)}${isSelf ? '<small>当前账号</small>' : ''}</strong><small class="admin-user-email">${escapeHtml(user.email ?? '未设置邮箱')}</small></span></span></td>
         <td><span class="admin-status ${statusClass}"><i></i>${statusLabel}</span><small class="admin-cell-note">${user.verified_at ? `验证于 ${formatDate(user.verified_at)}` : '尚未验证'}</small></td>
         <td><select class="admin-inline-select" data-user-role="${user.id}" data-user-status="${user.status}" ${isSelf ? 'disabled title="不能修改当前账号"' : ''}><option value="member" ${user.role === 'member' ? 'selected' : ''}>普通成员</option><option value="admin" ${user.role === 'admin' ? 'selected' : ''}>系统管理员</option></select></td>
         <td><span class="admin-usage"><span title="创建的会议"><i data-lucide="crown"></i>${user.owned_room_count}</span><span title="参加的会议"><i data-lucide="users"></i>${user.joined_room_count}</span><span title="发言记录"><i data-lucide="messages-square"></i>${user.utterance_count}</span></span></td>
         <td><strong class="admin-date">${formatDate(user.last_activity_at ?? user.last_login_at ?? user.created_at)}</strong><small class="admin-cell-note">注册于 ${formatDate(user.created_at)}</small></td>
-        <td class="admin-row-action"><button class="icon-button ${user.status === 'active' ? 'danger' : ''}" type="button" data-user-action="${user.id}" data-user-role="${user.role}" data-current-status="${user.status}" data-next-status="${nextStatus}" title="${actionLabel}" aria-label="${actionLabel}" ${isSelf ? 'disabled' : ''}><i data-lucide="${actionIcon}"></i></button></td>
+        <td class="admin-row-action"><span class="admin-row-buttons"><button class="icon-button" type="button" data-edit-user="${user.id}" title="编辑账号" aria-label="编辑 ${escapeAttribute(user.username)}"><i data-lucide="pencil"></i></button><button class="icon-button" type="button" data-reset-user="${user.id}" title="发送密码重置链接" aria-label="为 ${escapeAttribute(user.username)} 发送密码重置链接" ${!user.email || !this.mailStatus?.configured ? 'disabled' : ''}><i data-lucide="key-round"></i></button><button class="icon-button ${user.status === 'active' ? 'danger' : ''}" type="button" data-user-action="${user.id}" data-user-role="${user.role}" data-current-status="${user.status}" data-next-status="${nextStatus}" title="${actionLabel}" aria-label="${actionLabel}" ${isSelf ? 'disabled' : ''}><i data-lucide="${actionIcon}"></i></button></span></td>
       </tr>
     `;
   }
@@ -489,7 +676,7 @@ export class AdminPage implements Page {
     }
     shell.innerHTML = `
       <table class="admin-table admin-tenants-table">
-        <thead><tr><th>租户</th><th>状态</th><th>ASR 后端</th><th>授权期限</th><th>实例</th><th>最近校验</th><th aria-label="操作"></th></tr></thead>
+        <thead><tr><th>租户</th><th>状态</th><th>ASR 后端</th><th>TTS 后端</th><th>授权期限</th><th>实例</th><th>最近校验</th><th aria-label="操作"></th></tr></thead>
         <tbody>${data.items.map((tenant) => this.tenantRow(tenant)).join('')}</tbody>
       </table>
     `;
@@ -504,6 +691,7 @@ export class AdminPage implements Page {
         <td><span class="admin-room-name"><span><i data-lucide="building-2"></i></span><span><strong>${escapeHtml(tenant.name)}</strong><code>${escapeHtml(tenant.slug)}</code></span></span></td>
         <td><select class="admin-inline-select tenant-status-select ${className}" data-tenant-status="${tenant.id}" data-current-status="${tenant.status}"><option value="active" ${tenant.status === 'active' ? 'selected' : ''}>正常</option><option value="suspended" ${tenant.status === 'suspended' ? 'selected' : ''}>已暂停</option><option value="revoked" ${tenant.status === 'revoked' ? 'selected' : ''}>已撤销</option></select><small class="admin-cell-note">${label}</small></td>
         <td><select class="admin-inline-select tenant-asr-select" data-tenant-asr="${tenant.id}" data-current-backend="${escapeAttribute(tenant.asr_backend_id ?? '')}">${this.asrOptions(this.asrManagement?.providers ?? [], tenant.asr_backend_id ?? '', true)}</select><small class="admin-cell-note">${tenant.asr_backend_id ? '租户覆盖' : '继承系统默认'}</small></td>
+        <td><select class="admin-inline-select tenant-tts-select" data-tenant-tts="${tenant.id}" data-current-backend="${escapeAttribute(tenant.tts_backend_id ?? '')}">${this.ttsOptions(this.ttsManagement?.providers ?? [], tenant.tts_backend_id ?? '', true)}</select><small class="admin-cell-note">${tenant.tts_backend_id ? '租户覆盖' : '继承系统默认'}</small></td>
         <td><strong class="admin-date ${expiresSoon ? 'warning' : ''}">${formatDate(tenant.license_expires_at)}</strong><small class="admin-cell-note">宽限至 ${formatDate(tenant.grace_ends_at)}</small></td>
         <td><span class="admin-usage"><span title="部署实例"><i data-lucide="server"></i>${tenant.instance_count}</span><span title="离线租约"><i data-lucide="timer"></i>${formatLease(tenant.offline_lease_minutes)}</span></span></td>
         <td><strong class="admin-date">${tenant.last_seen_at ? formatDate(tenant.last_seen_at) : '尚未校验'}</strong><small class="admin-cell-note">提前 ${tenant.warning_days} 天提醒</small></td>
@@ -521,6 +709,18 @@ export class AdminPage implements Page {
       : '';
     return options + providers.map((provider) => `
       <option value="${escapeAttribute(provider.id)}" ${provider.id === selected ? 'selected' : ''} ${provider.available ? '' : 'disabled'}>${escapeHtml(provider.name)}${provider.production ? '' : ' · 非生产'}${provider.available ? '' : ' · 未配置'}</option>
+    `).join('');
+  }
+
+  private ttsOptions(providers: TtsProvider[], selected: string, includeInherited: boolean) {
+    const inherited = this.ttsManagement?.providers.find(
+      (provider) => provider.id === this.ttsManagement?.system_setting.backend_id,
+    );
+    const options = includeInherited
+      ? `<option value="" ${selected ? '' : 'selected'}>继承系统 · ${escapeHtml(inherited?.name ?? '默认后端')}</option>`
+      : '';
+    return options + providers.map((provider) => `
+      <option value="${escapeAttribute(provider.id)}" ${provider.id === selected ? 'selected' : ''} ${provider.available ? '' : 'disabled'}>${escapeHtml(provider.name)}${provider.available ? '' : ' · 不可用'}</option>
     `).join('');
   }
 
@@ -587,6 +787,124 @@ export class AdminPage implements Page {
     } catch (error) {
       this.onError(error instanceof Error ? error.message : '无法更新人员角色');
       await this.loadList();
+    }
+  }
+
+  private openUserEditor(user?: AdminUser) {
+    if (!this.root) return;
+    const dialog = this.root.querySelector<HTMLDialogElement>('.admin-inspector')!;
+    const body = dialog.querySelector<HTMLElement>('.admin-inspector-body')!;
+    const isSelf = user?.id === this.currentUser.id;
+    this.setInspectorHeading(user ? '编辑用户' : '新建用户', 'ACCOUNT MANAGEMENT', 'user-cog');
+    body.innerHTML = `
+      <form class="authority-form account-form" data-user-form data-user-id="${user?.id ?? ''}">
+        <div class="account-form-heading"><span><i data-lucide="${user ? 'user-cog' : 'user-plus'}"></i></span><div><strong>${user ? escapeHtml(user.username) : '创建本租户账号'}</strong><small>${user ? '更新邮箱、角色或账号状态' : '账号资料只保存在当前服务实例'}</small></div></div>
+        <div class="authority-form-grid">
+          <label><span>账号名称</span><input name="username" minlength="3" maxlength="32" pattern="[A-Za-z0-9_-]+" required autocomplete="off" value="${escapeAttribute(user?.username ?? '')}" ${user ? 'disabled' : ''}></label>
+          <label><span>邮箱地址</span><input name="email" type="email" maxlength="254" required autocomplete="off" value="${escapeAttribute(user?.email ?? '')}"></label>
+          ${user ? '' : '<label class="account-form-wide"><span>初始密码</span><input name="password" type="password" minlength="8" maxlength="128" required autocomplete="new-password"></label>'}
+          <label><span>角色</span><select name="role" ${isSelf ? 'disabled' : ''}><option value="member" ${!user || user.role === 'member' ? 'selected' : ''}>普通成员</option><option value="admin" ${user?.role === 'admin' ? 'selected' : ''}>系统管理员</option></select></label>
+          <label><span>状态</span><select name="status" ${isSelf ? 'disabled' : ''}><option value="active" ${!user || user.status === 'active' ? 'selected' : ''}>正常</option><option value="pending" ${user?.status === 'pending' ? 'selected' : ''}>待验证</option><option value="suspended" ${user?.status === 'suspended' ? 'selected' : ''}>已停用</option></select></label>
+        </div>
+        <p class="account-form-note"><i data-lucide="shield-check"></i><span>${user ? '修改邮箱后，后续密码重置链接将发送到新地址。' : '初始密码不会通过邮件发送；用户可在登录页使用邮箱自行重置。'}</span></p>
+        <footer class="authority-form-actions"><button type="button" class="button-secondary" onclick="this.closest('dialog').close()">取消</button><button type="submit" class="button-primary"><i data-lucide="save"></i><span>${user ? '保存账号' : '创建用户'}</span></button></footer>
+      </form>
+    `;
+    refreshIcons(body);
+    if (!dialog.open) dialog.showModal();
+  }
+
+  private async saveUser(form: HTMLFormElement) {
+    if (!form.reportValidity()) return;
+    const data = new FormData(form);
+    const userId = form.dataset.userId;
+    const current = userId ? this.users.get(userId) : undefined;
+    const submit = form.querySelector<HTMLButtonElement>('[type="submit"]')!;
+    const payload = userId
+      ? {
+          email: String(data.get('email') ?? ''),
+          role: String(data.get('role') ?? current?.role ?? 'member'),
+          status: String(data.get('status') ?? current?.status ?? 'active'),
+        }
+      : {
+          username: String(data.get('username') ?? ''),
+          email: String(data.get('email') ?? ''),
+          password: String(data.get('password') ?? ''),
+          role: String(data.get('role') ?? 'member'),
+          status: String(data.get('status') ?? 'active'),
+        };
+    submit.disabled = true;
+    try {
+      await apiRequest(userId ? `/api/admin/users/${encodeURIComponent(userId)}` : '/api/admin/users', {
+        method: userId ? 'PATCH' : 'POST',
+        body: JSON.stringify(payload),
+      });
+      this.root?.querySelector<HTMLDialogElement>('.admin-inspector')?.close();
+      this.onMessage(userId ? '账号资料已更新' : '用户已创建');
+      await Promise.all([this.loadOverview(), this.loadList()]);
+    } catch (error) {
+      submit.disabled = false;
+      this.onError(error instanceof Error ? error.message : '无法保存用户');
+    }
+  }
+
+  private openUserImport() {
+    if (!this.root) return;
+    const dialog = this.root.querySelector<HTMLDialogElement>('.admin-inspector')!;
+    const body = dialog.querySelector<HTMLElement>('.admin-inspector-body')!;
+    this.setInspectorHeading('批量导入用户', 'BULK IMPORT', 'file-spreadsheet');
+    body.innerHTML = `
+      <form class="authority-form account-import-form" data-user-import-form>
+        <div class="account-form-heading"><span><i data-lucide="file-spreadsheet"></i></span><div><strong>CSV 用户清单</strong><small>UTF-8 编码，首行为字段名称，单次最多 500 人</small></div></div>
+        <div class="account-import-columns"><code>username</code><code>email</code><code>password</code><code>role</code><code>status</code></div>
+        <label class="account-file-field"><span>选择 CSV 文件</span><input name="file" type="file" accept=".csv,text/csv" required></label>
+        <p class="account-form-note"><i data-lucide="circle-alert"></i><span>导入前会整批校验账号、邮箱、密码、角色和状态；任意一行错误时不会写入任何用户。</span></p>
+        <footer class="authority-form-actions"><button type="button" class="button-secondary" data-download-user-template><i data-lucide="download"></i><span>下载模板</span></button><span class="account-form-spacer"></span><button type="button" class="button-secondary" onclick="this.closest('dialog').close()">取消</button><button type="submit" class="button-primary"><i data-lucide="file-up"></i><span>开始导入</span></button></footer>
+      </form>
+    `;
+    refreshIcons(body);
+    if (!dialog.open) dialog.showModal();
+  }
+
+  private async importUsers(form: HTMLFormElement) {
+    if (!form.reportValidity()) return;
+    const submit = form.querySelector<HTMLButtonElement>('[type="submit"]')!;
+    submit.disabled = true;
+    try {
+      const result = await apiRequest<{ imported: number }>('/api/admin/users/import', {
+        method: 'POST',
+        body: new FormData(form),
+      });
+      this.root?.querySelector<HTMLDialogElement>('.admin-inspector')?.close();
+      this.onMessage(`已导入 ${result.imported} 个用户`);
+      await Promise.all([this.loadOverview(), this.loadList()]);
+    } catch (error) {
+      submit.disabled = false;
+      this.onError(error instanceof Error ? error.message : '无法导入用户');
+    }
+  }
+
+  private downloadUserTemplate() {
+    const content = '\uFEFFusername,email,password,role,status\nzhangsan,zhangsan@example.com,ChangeMe123,member,active\n';
+    const url = URL.createObjectURL(new Blob([content], { type: 'text/csv;charset=utf-8' }));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = 'voice-elf-users-template.csv';
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  private async sendUserPasswordReset(userId: string, button: HTMLButtonElement) {
+    const user = this.users.get(userId);
+    if (!user?.email) return;
+    if (!window.confirm(`向 ${user.email} 发送一次性密码重置链接？`)) return;
+    button.disabled = true;
+    try {
+      await apiRequest(`/api/admin/users/${encodeURIComponent(userId)}/password-reset`, { method: 'POST' });
+      this.onMessage(`重置链接已发送至 ${user.email}`);
+    } catch (error) {
+      button.disabled = false;
+      this.onError(error instanceof Error ? error.message : '无法发送密码重置链接');
     }
   }
 
@@ -680,12 +998,69 @@ export class AdminPage implements Page {
     }
   }
 
+  private async changeSystemTts(select: HTMLSelectElement) {
+    const previous = select.dataset.currentBackend ?? '';
+    if (!select.value || select.value === previous) return;
+    select.disabled = true;
+    try {
+      this.ttsManagement = await apiRequest<TtsManagement>('/api/admin/tts', {
+        method: 'PATCH',
+        body: JSON.stringify({ backend_id: select.value }),
+      });
+      this.onMessage('系统 TTS 默认后端已更新，新建音频管线将使用该配置');
+      this.renderTts(this.ttsManagement);
+    } catch (error) {
+      this.onError(error instanceof Error ? error.message : '无法更新系统 TTS 后端');
+      await this.loadList();
+    }
+  }
+
+  private async changeTenantTts(select: HTMLSelectElement) {
+    const tenantId = select.dataset.tenantTts;
+    const previous = select.dataset.currentBackend ?? '';
+    if (!tenantId || select.value === previous) return;
+    select.disabled = true;
+    try {
+      await apiRequest(`/api/admin/authority/tenants/${encodeURIComponent(tenantId)}/tts`, {
+        method: 'PATCH',
+        body: JSON.stringify({ backend_id: select.value || null }),
+      });
+      this.onMessage(select.value ? '租户 TTS 覆盖已更新' : '租户已恢复继承系统 TTS 默认配置');
+      await this.loadList();
+    } catch (error) {
+      this.onError(error instanceof Error ? error.message : '无法更新租户 TTS 后端');
+      await this.loadList();
+    }
+  }
+
+  private async saveVoiceAlias(button: HTMLButtonElement) {
+    const voiceId = button.dataset.saveVoiceAlias;
+    const input = button.closest('tr')?.querySelector<HTMLInputElement>('[data-voice-alias]');
+    if (!voiceId || !input || !this.ttsManagement) return;
+    button.disabled = true;
+    input.disabled = true;
+    try {
+      this.ttsManagement = await apiRequest<TtsManagement>(
+        `/api/admin/tts/voices/${encodeURIComponent(voiceId)}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ alias: input.value.trim() || null }),
+        },
+      );
+      this.onMessage(input.value.trim() ? '音色别名已更新' : '音色已恢复默认名称');
+      this.renderTts(this.ttsManagement);
+    } catch (error) {
+      button.disabled = false;
+      input.disabled = false;
+      this.onError(error instanceof Error ? error.message : '无法更新音色别名');
+    }
+  }
+
   private openTenantEditor(tenant?: AuthorityTenant) {
     if (!this.root) return;
     const dialog = this.root.querySelector<HTMLDialogElement>('.admin-inspector')!;
-    const title = dialog.querySelector<HTMLElement>('h2')!;
     const body = dialog.querySelector<HTMLElement>('.admin-inspector-body')!;
-    title.textContent = tenant ? '编辑租户' : '创建租户';
+    this.setInspectorHeading(tenant ? '编辑租户' : '创建租户', 'TENANT AUTHORITY', 'key-round');
     body.innerHTML = this.tenantForm(tenant);
     refreshIcons(dialog);
     if (!dialog.open) dialog.showModal();
@@ -744,9 +1119,8 @@ export class AdminPage implements Page {
     const tenant = this.tenants.get(tenantId);
     if (!tenant) return;
     const dialog = this.root.querySelector<HTMLDialogElement>('.admin-inspector')!;
-    const title = dialog.querySelector<HTMLElement>('h2')!;
     const body = dialog.querySelector<HTMLElement>('.admin-inspector-body')!;
-    title.textContent = '租户授权';
+    this.setInspectorHeading('租户授权', 'TENANT AUTHORITY', 'key-round');
     body.innerHTML = '<div class="admin-loading"><i data-lucide="loader-circle"></i><span>正在读取部署实例</span></div>';
     refreshIcons(body);
     if (!dialog.open) dialog.showModal();
@@ -860,6 +1234,7 @@ export class AdminPage implements Page {
     if (!this.root) return;
     const dialog = this.root.querySelector<HTMLDialogElement>('.admin-inspector')!;
     const body = dialog.querySelector<HTMLElement>('.admin-inspector-body')!;
+    this.setInspectorHeading('会议检查', 'STEALTH INSPECT', 'eye-off');
     body.innerHTML = '<div class="admin-loading"><i data-lucide="loader-circle"></i><span>正在读取会议</span></div>';
     refreshIcons(body);
     if (!dialog.open) dialog.showModal();
@@ -873,6 +1248,14 @@ export class AdminPage implements Page {
       refreshIcons(body);
       this.onError(error instanceof Error ? error.message : '无法读取会议');
     }
+  }
+
+  private setInspectorHeading(title: string, kicker: string, icon: string) {
+    if (!this.root) return;
+    const dialog = this.root.querySelector<HTMLDialogElement>('.admin-inspector')!;
+    dialog.querySelector<HTMLElement>('h2')!.textContent = title;
+    dialog.querySelector<HTMLElement>('.section-kicker')!.innerHTML = `<i data-lucide="${icon}"></i> ${kicker}`;
+    refreshIcons(dialog.querySelector<HTMLElement>('.admin-inspector-heading')!);
   }
 
   private inspectorContent(detail: RoomDetail) {

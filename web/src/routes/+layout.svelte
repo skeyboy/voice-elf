@@ -91,7 +91,8 @@
 
   $: if ($systemSetup?.initialized && $instanceAuthorization?.allowed && $currentUser !== undefined) {
     const loginRoute = $page.url.pathname === '/login';
-    if (!$currentUser && !loginRoute) void goto('/login', { replaceState: true });
+    const publicAuthRoute = loginRoute || $page.url.pathname === '/reset-password';
+    if (!$currentUser && !publicAuthRoute) void goto('/login', { replaceState: true });
     if ($currentUser && loginRoute) void goto('/rooms', { replaceState: true });
   }
 </script>

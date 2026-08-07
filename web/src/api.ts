@@ -3,6 +3,7 @@ import type { LatencyReport, TranscriptionSegment } from './protocol';
 export interface User {
   id: string;
   username: string;
+  email: string | null;
   role: 'admin' | 'member';
   status: 'pending' | 'active' | 'suspended';
   verified_at: string | null;
@@ -111,6 +112,8 @@ export interface InstanceAuthorization {
   instance_name: string | null;
   asr_backend_id: string | null;
   asr_config_source: 'system' | 'tenant' | null;
+  tts_backend_id: string | null;
+  tts_config_source: 'system' | 'tenant' | null;
   license_expires_at: string | null;
   grace_ends_at: string | null;
   lease_expires_at: string | null;
@@ -135,6 +138,7 @@ export interface SetupStatus {
   deployment_mode: 'standalone' | 'bus' | 'tenant';
   backend: string;
   authorization: InstanceAuthorization;
+  email_ready: boolean;
   profile: SystemProfile | null;
 }
 
@@ -144,6 +148,7 @@ export interface InitializeSystemInput {
   organization_name: string;
   public_url: string;
   admin_username: string;
+  admin_email: string;
   admin_password: string;
 }
 
@@ -162,6 +167,7 @@ export interface AuthorityTenant {
   warning_days: number;
   offline_lease_minutes: number;
   asr_backend_id: string | null;
+  tts_backend_id: string | null;
   created_at: string;
   updated_at: string;
   instance_count: number;
@@ -216,9 +222,52 @@ export interface AsrManagement {
   applies_to: 'new_room_pipelines';
 }
 
+export interface TtsProvider extends AsrProvider {
+  voice_clone: boolean;
+}
+
+export interface TtsVoice {
+  id: string;
+  default_name: string;
+  display_name: string;
+  alias: string | null;
+  group: string;
+  description: string;
+  languages: string[];
+}
+
+export interface TtsVoiceCatalog {
+  provider: TtsProvider;
+  voices: TtsVoice[];
+  supports_custom_voices: boolean;
+}
+
+export interface IndexTtsRuntimeStatus {
+  phase: 'unavailable' | 'not_installed' | 'installing' | 'stopped' | 'starting' | 'ready' | 'stopping' | 'error';
+  script_available: boolean;
+  model_ready: boolean;
+  running: boolean;
+  healthy: boolean;
+  action: string | null;
+  message: string;
+  model_dir: string;
+  log_path: string;
+}
+
+export interface TtsManagement {
+  providers: TtsProvider[];
+  system_setting: AsrSystemSetting;
+  effective: EffectiveAsrSelection;
+  can_update_system: boolean;
+  applies_to: 'new_room_pipelines';
+  voices: TtsVoice[];
+  index_tts_runtime: IndexTtsRuntimeStatus;
+}
+
 export interface AdminUser {
   id: string;
   username: string;
+  email: string | null;
   role: User['role'];
   status: User['status'];
   verified_at: string | null;
@@ -228,6 +277,21 @@ export interface AdminUser {
   joined_room_count: number;
   utterance_count: number;
   last_activity_at: string | null;
+}
+
+export interface MailStatus {
+  configured: boolean;
+  host: string;
+  port: number;
+  security: 'wrapper' | 'starttls' | 'none';
+  username: string;
+  from_address: string;
+  reset_expiry_minutes: number;
+}
+
+export interface PasswordResetStatus {
+  email_enabled: boolean;
+  reset_expiry_minutes: number;
 }
 
 export interface Paginated<T> {
@@ -272,4 +336,8 @@ export function createVoiceReference(name: string, audio: Blob) {
 
 export function deleteVoiceReference(id: string) {
   return apiRequest<void>(`/api/voice-references/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+export function listTtsVoices() {
+  return apiRequest<TtsVoiceCatalog>('/api/tts/voices');
 }

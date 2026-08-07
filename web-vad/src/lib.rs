@@ -19,6 +19,9 @@ pub const FLAG_FORCED_END: u32 = 1 << 4;
 pub const FLAG_FRAME_READY: u32 = 1 << 30;
 pub const FLAG_INVALID_INPUT: u32 = 1 << 31;
 
+const RESAMPLER_FILTER_TAPS: usize = 95;
+const RESAMPLER_CUTOFF_RATIO: f64 = 0.4;
+
 // Silero probability, signal level, and the learned noise floor jointly guard each start.
 const START_TRIGGER_FRAMES: u16 = 1;
 const ENHANCED_START_TRIGGER_FRAMES: u16 = 1;
@@ -137,6 +140,115 @@ struct AudioFrame {
     level: f32,
 }
 
+struct AntiAliasFilter {
+    coefficients: Vec<f32>,
+    history: Vec<f32>,
+    cursor: usize,
+}
+
+impl AntiAliasFilter {
+    fn new(input_sample_rate: u32) -> Self {
+        if input_sample_rate as usize <= SAMPLE_RATE {
+            return Self {
+                coefficients: vec![1.0],
+                history: vec![0.0],
+                cursor: 0,
+            };
+        }
+
+        let normalized_cutoff =
+            SAMPLE_RATE as f64 * RESAMPLER_CUTOFF_RATIO / input_sample_rate as f64;
+        let center = (RESAMPLER_FILTER_TAPS - 1) as f64 / 2.0;
+        let mut coefficients = (0..RESAMPLER_FILTER_TAPS)
+            .map(|index| {
+                let offset = index as f64 - center;
+                let sinc = if offset.abs() < f64::EPSILON {
+                    2.0 * normalized_cutoff
+                } else {
+                    (2.0 * std::f64::consts::PI * normalized_cutoff * offset).sin()
+                        / (std::f64::consts::PI * offset)
+                };
+                let phase =
+                    2.0 * std::f64::consts::PI * index as f64 / (RESAMPLER_FILTER_TAPS - 1) as f64;
+                let window = 0.42 - 0.5 * phase.cos() + 0.08 * (2.0 * phase).cos();
+                (sinc * window) as f32
+            })
+            .collect::<Vec<_>>();
+        let gain = coefficients.iter().sum::<f32>();
+        for coefficient in &mut coefficients {
+            *coefficient /= gain;
+        }
+
+        Self {
+            history: vec![0.0; coefficients.len()],
+            coefficients,
+            cursor: 0,
+        }
+    }
+
+    fn process(&mut self, sample: f32) -> f32 {
+        self.history[self.cursor] = sample;
+        let mut output = 0.0;
+        let mut history_index = self.cursor;
+        for coefficient in &self.coefficients {
+            output += coefficient * self.history[history_index];
+            history_index = if history_index == 0 {
+                self.history.len() - 1
+            } else {
+                history_index - 1
+            };
+        }
+        self.cursor = (self.cursor + 1) % self.history.len();
+        output
+    }
+
+    fn reset(&mut self) {
+        self.history.fill(0.0);
+        self.cursor = 0;
+    }
+}
+
+struct StreamingResampler {
+    anti_alias: AntiAliasFilter,
+    source: Vec<f32>,
+    position: f64,
+    ratio: f64,
+}
+
+impl StreamingResampler {
+    fn new(input_sample_rate: u32) -> Self {
+        Self {
+            anti_alias: AntiAliasFilter::new(input_sample_rate),
+            source: Vec::with_capacity(MAX_INPUT_SAMPLES + 8),
+            position: 0.0,
+            ratio: input_sample_rate as f64 / SAMPLE_RATE as f64,
+        }
+    }
+
+    fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
+        for sample in input {
+            let filtered = self.anti_alias.process(*sample);
+            self.source.push(filtered);
+        }
+        while self.position + 1.0 < self.source.len() as f64 {
+            let left = self.position.floor() as usize;
+            let fraction = (self.position - left as f64) as f32;
+            output.push(self.source[left] + (self.source[left + 1] - self.source[left]) * fraction);
+            self.position += self.ratio;
+        }
+
+        let consumed = (self.position.floor() as usize).min(self.source.len());
+        self.source.drain(..consumed);
+        self.position -= consumed as f64;
+    }
+
+    fn reset(&mut self) {
+        self.anti_alias.reset();
+        self.source.clear();
+        self.position = 0.0;
+    }
+}
+
 struct BrowserAudioVad {
     model: silerovad::SileroVad<'static>,
     workspace: silerovad::SileroVadWorkspace,
@@ -158,9 +270,8 @@ struct BrowserAudioVad {
     output: [i16; FRAME_SAMPLES],
     output_level: f32,
     input_level: f32,
-    resample_source: Vec<f32>,
-    resample_position: f64,
-    resample_ratio: f64,
+    resampler: StreamingResampler,
+    resampled: Vec<f32>,
     frame: [i16; FRAME_SAMPLES],
     frame_offset: usize,
     pre_roll: VecDeque<([i16; FRAME_SAMPLES], f32)>,
@@ -203,9 +314,8 @@ impl BrowserAudioVad {
             output: [0; FRAME_SAMPLES],
             output_level: 0.0,
             input_level: 0.0,
-            resample_source: Vec::with_capacity(MAX_INPUT_SAMPLES + 8),
-            resample_position: 0.0,
-            resample_ratio: input_sample_rate as f64 / SAMPLE_RATE as f64,
+            resampler: StreamingResampler::new(input_sample_rate),
+            resampled: Vec::with_capacity(MAX_INPUT_SAMPLES * 2),
             frame: [0; FRAME_SAMPLES],
             frame_offset: 0,
             pre_roll: VecDeque::with_capacity(
@@ -229,21 +339,12 @@ impl BrowserAudioVad {
         if sample_count == 0 || sample_count > MAX_INPUT_SAMPLES {
             return false;
         }
-        self.resample_source
-            .extend_from_slice(&self.input[..sample_count]);
-
-        while self.resample_position + 1.0 < self.resample_source.len() as f64 {
-            let left = self.resample_position.floor() as usize;
-            let fraction = (self.resample_position - left as f64) as f32;
-            let sample = self.resample_source[left]
-                + (self.resample_source[left + 1] - self.resample_source[left]) * fraction;
-            self.push_resampled(float_to_pcm16(sample));
-            self.resample_position += self.resample_ratio;
+        self.resampled.clear();
+        self.resampler
+            .process(&self.input[..sample_count], &mut self.resampled);
+        for index in 0..self.resampled.len() {
+            self.push_resampled(float_to_pcm16(self.resampled[index]));
         }
-
-        let consumed = (self.resample_position.floor() as usize).min(self.resample_source.len());
-        self.resample_source.drain(..consumed);
-        self.resample_position -= consumed as f64;
         true
     }
 
@@ -487,8 +588,8 @@ impl BrowserAudioVad {
         self.output.fill(0);
         self.output_level = 0.0;
         self.input_level = 0.0;
-        self.resample_source.clear();
-        self.resample_position = 0.0;
+        self.resampler.reset();
+        self.resampled.clear();
         self.frame.fill(0);
         self.frame_offset = 0;
         self.pre_roll.clear();
@@ -686,6 +787,54 @@ pub unsafe extern "C" fn voice_elf_audio_reset(instance: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resample_tone(frequency: f32, chunk_size: usize) -> Vec<f32> {
+        let input_rate = 48_000_u32;
+        let input = (0..input_rate as usize)
+            .map(|index| {
+                (index as f32 * 2.0 * std::f32::consts::PI * frequency / input_rate as f32).sin()
+            })
+            .collect::<Vec<_>>();
+        let mut resampler = StreamingResampler::new(input_rate);
+        let mut output = Vec::new();
+        for chunk in input.chunks(chunk_size) {
+            resampler.process(chunk, &mut output);
+        }
+        output
+    }
+
+    fn float_rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn resampler_preserves_speech_band_and_rejects_aliases() {
+        let pass_band = resample_tone(1_000.0, 128);
+        let stop_band = resample_tone(12_000.0, 128);
+        let settle = 256;
+        let pass_rms = float_rms(&pass_band[settle..]);
+        let stop_rms = float_rms(&stop_band[settle..]);
+
+        assert!(pass_rms > 0.65, "pass-band RMS was {pass_rms}");
+        assert!(
+            stop_rms < pass_rms * 0.02,
+            "aliased RMS {stop_rms} was not attenuated relative to {pass_rms}"
+        );
+    }
+
+    #[test]
+    fn resampler_output_is_independent_of_audio_worklet_chunking() {
+        let whole = resample_tone(1_500.0, 48_000);
+        let chunked = resample_tone(1_500.0, 128);
+
+        assert_eq!(whole.len(), chunked.len());
+        assert!(
+            whole
+                .iter()
+                .zip(&chunked)
+                .all(|(left, right)| (left - right).abs() < 1.0e-6)
+        );
+    }
 
     #[test]
     fn starts_after_a_stable_voiced_run() {
@@ -910,7 +1059,8 @@ mod tests {
         assert!(vad.process_input(1_536));
         assert_eq!(vad.frame_offset, 0);
         assert_eq!(vad.pre_roll.len(), 1);
-        assert!(vad.pre_roll.iter().all(|(frame, _)| frame[0] > 8_000));
+        let frame = &vad.pre_roll.front().unwrap().0;
+        assert!(frame[FRAME_SAMPLES - 1] > 8_000);
     }
 
     #[test]

@@ -25,9 +25,11 @@ use crate::{
     storage::{Database, RoomSummary, UserRecord, UtteranceHistory},
 };
 
+mod accounts;
 mod asr;
 mod authority;
 mod setup;
+mod tts;
 
 pub const AUTH_COOKIE: &str = "voice_elf_session";
 const SESSION_DAYS: i64 = 7;
@@ -40,7 +42,9 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .merge(authority::router())
         .merge(asr::router())
+        .merge(accounts::router())
         .merge(setup::router())
+        .merge(tts::router())
         .route("/auth/register", post(register))
         .route("/auth/login", post(login))
         .route("/auth/logout", delete(logout))
@@ -310,6 +314,7 @@ impl IntoResponse for ApiError {
 #[derive(Deserialize)]
 struct Credentials {
     username: String,
+    email: Option<String>,
     password: String,
 }
 
@@ -317,6 +322,7 @@ struct Credentials {
 pub struct UserResponse {
     pub id: Uuid,
     pub username: String,
+    pub email: Option<String>,
     pub role: String,
     pub status: String,
     pub verified_at: Option<chrono::DateTime<Utc>>,
@@ -329,6 +335,7 @@ impl From<UserRecord> for UserResponse {
         Self {
             id: user.id,
             username: user.username,
+            email: user.email,
             role: user.role,
             status: user.status,
             verified_at: user.verified_at,
@@ -347,6 +354,11 @@ async fn register(
     require_authority(&state).await?;
     let database = database(&state)?;
     let username = validate_username(&credentials.username)?;
+    let email = credentials
+        .email
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("请输入邮箱地址"))
+        .and_then(validate_email)?;
     validate_password(&credentials.password)?;
     if database
         .find_user_by_username(&username)
@@ -356,13 +368,21 @@ async fn register(
     {
         return Err(ApiError::conflict("账号名称已存在"));
     }
+    if database
+        .find_user_by_email(&email)
+        .await
+        .map_err(ApiError::internal)?
+        .is_some()
+    {
+        return Err(ApiError::conflict("邮箱地址已被使用"));
+    }
     let password = credentials.password;
     let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::internal)?;
     let user = database
-        .create_user(&username, &password_hash)
+        .create_user(&username, &email, &password_hash)
         .await
         .map_err(ApiError::internal)?;
     if user.status == "active" {
@@ -448,6 +468,7 @@ struct AdminListQuery {
 struct AdminUserInput {
     role: String,
     status: String,
+    email: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -510,17 +531,27 @@ async fn admin_update_user(
     Json(input): Json<AdminUserInput>,
 ) -> Result<Json<UserResponse>, ApiError> {
     let admin = require_admin(&state, &cookies).await?;
-    if admin.id == user_id {
-        return Err(ApiError::bad_request("不能在管理台修改自己的角色或状态"));
-    }
     validate_enum(&input.role, &["admin", "member"], "人员角色")?;
     validate_enum(
         &input.status,
         &["pending", "active", "suspended"],
         "人员状态",
     )?;
+    if admin.id == user_id && (input.role != admin.role || input.status != admin.status) {
+        return Err(ApiError::bad_request("不能在管理台修改自己的角色或状态"));
+    }
+    let email = input.email.as_deref().map(validate_email).transpose()?;
+    if let Some(email) = email.as_deref()
+        && database(&state)?
+            .find_user_by_email(email)
+            .await
+            .map_err(ApiError::internal)?
+            .is_some_and(|user| user.id != user_id)
+    {
+        return Err(ApiError::conflict("邮箱地址已被使用"));
+    }
     let user = database(&state)?
-        .update_admin_user(user_id, &input.role, &input.status)
+        .update_admin_user(user_id, &input.role, &input.status, email.as_deref())
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("人员不存在"))?;
@@ -990,6 +1021,14 @@ fn validate_password(password: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn validate_email(value: &str) -> Result<String, ApiError> {
+    let email = value.trim().to_ascii_lowercase();
+    if email.len() > 254 || email.parse::<lettre::Address>().is_err() {
+        return Err(ApiError::bad_request("请输入有效的邮箱地址"));
+    }
+    Ok(email)
+}
+
 fn validate_room(input: RoomInput) -> Result<(String, String, String, u32), ApiError> {
     let name = input.name.trim();
     if name.is_empty() || name.chars().count() > 120 {
@@ -1063,6 +1102,11 @@ mod tests {
         assert!(validate_username("voice_user-1").is_ok());
         assert!(validate_username("x").is_err());
         assert!(validate_password("12345678").is_ok());
+        assert_eq!(
+            validate_email(" Admin@Example.COM ").unwrap(),
+            "admin@example.com"
+        );
+        assert!(validate_email("not-an-email").is_err());
         assert!(
             validate_room(RoomInput {
                 name: "Daily room".to_owned(),

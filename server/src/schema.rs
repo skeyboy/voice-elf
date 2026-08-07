@@ -9,7 +9,27 @@ diesel::table! {
         warning_days -> Int4,
         offline_lease_minutes -> Int4,
         asr_backend_id -> Nullable<Varchar>,
+        tts_backend_id -> Nullable<Varchar>,
         created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    tts_system_settings (id) {
+        id -> Uuid,
+        backend_id -> Varchar,
+        updated_by -> Nullable<Uuid>,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    tts_voice_aliases (provider_id, voice_id) {
+        provider_id -> Varchar,
+        voice_id -> Varchar,
+        alias -> Varchar,
+        updated_by -> Nullable<Uuid>,
         updated_at -> Timestamptz,
     }
 }
@@ -75,11 +95,23 @@ diesel::table! {
     users (id) {
         id -> Uuid,
         username -> Varchar,
+        email -> Nullable<Varchar>,
         password_hash -> Text,
         role -> Varchar,
         status -> Varchar,
         verified_at -> Nullable<Timestamptz>,
         last_login_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    password_reset_tokens (id) {
+        id -> Uuid,
+        user_id -> Uuid,
+        token_hash -> Varchar,
+        expires_at -> Timestamptz,
+        consumed_at -> Nullable<Timestamptz>,
         created_at -> Timestamptz,
     }
 }
@@ -203,8 +235,11 @@ diesel::table! {
 
 diesel::joinable!(auth_sessions -> users (user_id));
 diesel::joinable!(asr_system_settings -> users (updated_by));
+diesel::joinable!(tts_system_settings -> users (updated_by));
+diesel::joinable!(tts_voice_aliases -> users (updated_by));
 diesel::joinable!(authority_access_tokens -> authority_instances (instance_id));
 diesel::joinable!(authority_instances -> authority_tenants (tenant_id));
+diesel::joinable!(password_reset_tokens -> users (user_id));
 diesel::joinable!(room_members -> rooms (room_id));
 diesel::joinable!(room_members -> users (user_id));
 diesel::joinable!(rooms -> users (owner_id));
@@ -219,10 +254,13 @@ diesel::joinable!(voice_utterances -> voice_sessions (session_id));
 diesel::allow_tables_to_appear_in_same_query!(
     auth_sessions,
     asr_system_settings,
+    tts_system_settings,
+    tts_voice_aliases,
     authority_access_tokens,
     authority_audit_events,
     authority_instances,
     authority_tenants,
+    password_reset_tokens,
     room_members,
     rooms,
     system_installations,

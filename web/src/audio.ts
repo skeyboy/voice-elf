@@ -185,6 +185,8 @@ export class MicrophoneCapture {
   async start(
     maxUtteranceSeconds: number,
     enhancedVoiceFilter: boolean,
+    noiseSuppression: boolean,
+    echoCancellation: boolean,
     onPcm: (pcm: ArrayBuffer) => void,
     onLevel: (level: number) => void,
     onBoundary: (boundary: VadBoundary) => void,
@@ -198,8 +200,8 @@ export class MicrophoneCapture {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
+        echoCancellation,
+        noiseSuppression,
         autoGainControl: false,
       },
     });

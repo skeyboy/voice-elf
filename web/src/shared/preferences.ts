@@ -1,15 +1,21 @@
-import { voices } from './languages';
-
 export interface PlaybackPreferences {
   voice: string;
   autoplay: boolean;
   enhancedVoiceFilter: boolean;
+  noiseSuppression: boolean;
+  echoCancellation: boolean;
 }
+
+type StoredPlaybackPreferences = Partial<PlaybackPreferences> & {
+  browserAudioProcessing?: boolean;
+};
 
 const defaults: PlaybackPreferences = {
   voice: 'F1',
   autoplay: false,
   enhancedVoiceFilter: true,
+  noiseSuppression: true,
+  echoCancellation: true,
 };
 const syncEvent = 'voice-elf:preferences-changed';
 const syncChannel = 'voice-elf:preferences-sync';
@@ -24,10 +30,17 @@ export function isCustomVoice(value: string) {
   );
 }
 
-function normalize(stored: Partial<PlaybackPreferences>): PlaybackPreferences {
+function isProviderVoice(value: string) {
+  return /^[a-z0-9][a-z0-9_-]{0,63}$/i.test(value);
+}
+
+function normalize(stored: StoredPlaybackPreferences): PlaybackPreferences {
+  const legacyAudioProcessing = typeof stored.browserAudioProcessing === 'boolean'
+    ? stored.browserAudioProcessing
+    : true;
   return {
     voice:
-      typeof stored.voice === 'string' && (stored.voice in voices || isCustomVoice(stored.voice))
+      typeof stored.voice === 'string' && (isProviderVoice(stored.voice) || isCustomVoice(stored.voice))
         ? stored.voice
         : defaults.voice,
     autoplay: typeof stored.autoplay === 'boolean' ? stored.autoplay : defaults.autoplay,
@@ -35,12 +48,20 @@ function normalize(stored: Partial<PlaybackPreferences>): PlaybackPreferences {
       typeof stored.enhancedVoiceFilter === 'boolean'
         ? stored.enhancedVoiceFilter
         : defaults.enhancedVoiceFilter,
+    noiseSuppression:
+      typeof stored.noiseSuppression === 'boolean'
+        ? stored.noiseSuppression
+        : legacyAudioProcessing,
+    echoCancellation:
+      typeof stored.echoCancellation === 'boolean'
+        ? stored.echoCancellation
+        : legacyAudioProcessing,
   };
 }
 
 export function loadPreferences(userId: string): PlaybackPreferences {
   try {
-    const stored = JSON.parse(localStorage.getItem(storageKey(userId)) ?? '{}') as Partial<PlaybackPreferences>;
+    const stored = JSON.parse(localStorage.getItem(storageKey(userId)) ?? '{}') as StoredPlaybackPreferences;
     return normalize(stored);
   } catch {
     return { ...defaults };

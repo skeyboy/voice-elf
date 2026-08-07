@@ -38,6 +38,52 @@ pub struct AppConfig {
     pub inference_timeout: Duration,
     pub database_url: Option<String>,
     pub authority: AuthorityConfig,
+    pub mail: MailConfig,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SmtpSecurity {
+    Wrapper,
+    StartTls,
+    None,
+}
+
+#[derive(Clone)]
+pub struct MailConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub security: SmtpSecurity,
+    pub username: String,
+    pub password: Option<String>,
+    pub from_address: String,
+    pub from_name: String,
+    pub public_url: Option<String>,
+    pub reset_expiry: Duration,
+}
+
+impl MailConfig {
+    pub fn configured(&self) -> bool {
+        self.enabled && self.password.is_some() && !self.username.trim().is_empty()
+    }
+}
+
+impl std::fmt::Debug for MailConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MailConfig")
+            .field("enabled", &self.enabled)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("security", &self.security)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("from_address", &self.from_address)
+            .field("from_name", &self.from_name)
+            .field("public_url", &self.public_url)
+            .field("reset_expiry", &self.reset_expiry)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,6 +171,7 @@ pub struct TtsConfig {
     pub supertonic_model_dir: PathBuf,
     pub threads: usize,
     pub moss_nano: MossNanoTtsConfig,
+    pub index_tts: IndexTtsConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +182,21 @@ pub struct MossNanoTtsConfig {
     pub default_demo_id: String,
     pub voice_map: HashMap<String, String>,
     pub cpu_threads: usize,
+    pub connect_timeout: Duration,
+    pub timeout: Duration,
+    pub retry_backoff: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct IndexTtsConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub manager_script: PathBuf,
+    pub model_dir: PathBuf,
+    pub runtime_dir: PathBuf,
+    pub default_voice_id: String,
+    pub voice_map: HashMap<String, String>,
     pub connect_timeout: Duration,
     pub timeout: Duration,
     pub retry_backoff: Duration,
@@ -155,6 +217,7 @@ impl AppConfig {
             .unwrap_or(120);
 
         let authority = authority_config_from_env()?;
+        let mail = mail_config_from_env()?;
 
         Ok(Self {
             bind,
@@ -274,10 +337,51 @@ impl AppConfig {
                             .unwrap_or(30),
                     ),
                 },
+                index_tts: IndexTtsConfig {
+                    enabled: env_flag("TTS_INDEX_ENABLED"),
+                    base_url: env::var("TTS_INDEX_BASE_URL")
+                        .unwrap_or_else(|_| "http://127.0.0.1:18084/".to_owned()),
+                    api_key: env::var("TTS_INDEX_API_KEY")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty()),
+                    manager_script: env::var("TTS_INDEX_MANAGER_SCRIPT")
+                        .map(resolve_workspace_path)
+                        .unwrap_or_else(|_| resolve_workspace_path("scripts/index-tts.sh")),
+                    model_dir: env::var("TTS_INDEX_MODEL_DIR")
+                        .map(resolve_workspace_path)
+                        .unwrap_or_else(|_| resolve_workspace_path(".local/models/tts/index-tts2")),
+                    runtime_dir: env::var("TTS_INDEX_RUNTIME_DIR")
+                        .map(resolve_workspace_path)
+                        .unwrap_or_else(|_| resolve_workspace_path(".local/run/index-tts")),
+                    default_voice_id: env::var("TTS_INDEX_DEFAULT_VOICE_ID")
+                        .unwrap_or_else(|_| "F1".to_owned()),
+                    voice_map: parse_key_value_map(
+                        &env::var("TTS_INDEX_VOICE_MAP").unwrap_or_default(),
+                    ),
+                    connect_timeout: Duration::from_secs(
+                        env::var("TTS_INDEX_CONNECT_TIMEOUT_SECONDS")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(3),
+                    ),
+                    timeout: Duration::from_secs(
+                        env::var("TTS_INDEX_TIMEOUT_SECONDS")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(300),
+                    ),
+                    retry_backoff: Duration::from_secs(
+                        env::var("TTS_INDEX_RETRY_BACKOFF_SECONDS")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(30),
+                    ),
+                },
             },
             inference_timeout: Duration::from_secs(timeout_seconds),
             database_url: env::var("DATABASE_URL").ok().filter(|url| !url.is_empty()),
             authority,
+            mail,
         })
     }
 
@@ -303,6 +407,65 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+fn mail_config_from_env() -> Result<MailConfig> {
+    let security = match env::var("VOICE_ELF_SMTP_SECURITY")
+        .unwrap_or_else(|_| "wrapper".to_owned())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "wrapper" | "tls" | "ssl" => SmtpSecurity::Wrapper,
+        "starttls" => SmtpSecurity::StartTls,
+        "none" => SmtpSecurity::None,
+        value => anyhow::bail!(
+            "VOICE_ELF_SMTP_SECURITY must be 'wrapper', 'starttls', or 'none', got '{value}'"
+        ),
+    };
+    let username =
+        env::var("VOICE_ELF_SMTP_USERNAME").unwrap_or_else(|_| "lylapp@163.com".to_owned());
+    let from_address = env::var("VOICE_ELF_SMTP_FROM_ADDRESS").unwrap_or_else(|_| username.clone());
+    let public_url = env::var("VOICE_ELF_PUBLIC_URL")
+        .ok()
+        .map(|value| value.trim_end_matches('/').to_owned())
+        .filter(|value| !value.is_empty());
+    if let Some(value) = &public_url {
+        let url = Url::parse(value).context("VOICE_ELF_PUBLIC_URL must be a valid URL")?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host().is_none()
+            || url.username() != ""
+            || url.password().is_some()
+        {
+            anyhow::bail!("VOICE_ELF_PUBLIC_URL must be an HTTP(S) origin without credentials");
+        }
+    }
+    Ok(MailConfig {
+        enabled: env_flag_default("VOICE_ELF_SMTP_ENABLED", true),
+        host: env::var("VOICE_ELF_SMTP_HOST").unwrap_or_else(|_| "smtp.163.com".to_owned()),
+        port: env::var("VOICE_ELF_SMTP_PORT")
+            .ok()
+            .map(|value| value.parse())
+            .transpose()
+            .context("VOICE_ELF_SMTP_PORT must be a valid port")?
+            .unwrap_or(465),
+        security,
+        username,
+        password: env::var("VOICE_ELF_SMTP_PASSWORD")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        from_address,
+        from_name: env::var("VOICE_ELF_SMTP_FROM_NAME").unwrap_or_else(|_| "Voice Elf".to_owned()),
+        public_url,
+        reset_expiry: Duration::from_secs(
+            env::var("VOICE_ELF_PASSWORD_RESET_MINUTES")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(30)
+                .clamp(5, 1440)
+                * 60,
+        ),
+    })
 }
 
 fn parse_backend_mode(value: Option<String>) -> Result<BackendMode> {

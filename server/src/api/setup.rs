@@ -10,7 +10,7 @@ use url::Url;
 
 use super::{
     ApiError, UserResponse, database, hash_password, issue_session, require_authority,
-    validate_password, validate_username,
+    validate_email, validate_password, validate_username,
 };
 use crate::{
     AppState,
@@ -32,6 +32,7 @@ struct SetupStatus {
     deployment_mode: String,
     backend: String,
     authorization: InstanceAuthorization,
+    email_ready: bool,
     profile: Option<SystemInstallation>,
 }
 
@@ -57,6 +58,7 @@ async fn setup_status(State(state): State<AppState>) -> Result<Json<SetupStatus>
         deployment_mode: state.authority.mode().as_str().to_owned(),
         backend,
         authorization,
+        email_ready: state.mail.configured(),
         profile,
     }))
 }
@@ -68,6 +70,7 @@ struct InitializeInput {
     organization_name: String,
     public_url: String,
     admin_username: String,
+    admin_email: String,
     admin_password: String,
 }
 
@@ -100,6 +103,7 @@ async fn initialize(
     let organization_name = validate_text(&input.organization_name, 120, "组织名称")?;
     let public_url = validate_public_url(&input.public_url)?;
     let username = validate_username(&input.admin_username)?;
+    let email = validate_email(&input.admin_email)?;
     validate_password(&input.admin_password)?;
     let password = input.admin_password;
     let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
@@ -114,6 +118,7 @@ async fn initialize(
             Some(&public_url),
             state.authority.mode().as_str(),
             &username,
+            &email,
             &password_hash,
         )
         .await

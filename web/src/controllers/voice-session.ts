@@ -39,6 +39,8 @@ export class VoiceSession {
     private readonly player: PcmPlayer,
     private readonly config: () => SessionConfig,
     private readonly enhancedVoiceFilter: () => boolean,
+    private readonly noiseSuppression: () => boolean,
+    private readonly echoCancellation: () => boolean,
     private readonly callbacks: VoiceSessionCallbacks,
   ) {
     this.waveform = new Waveform(canvas);
@@ -128,6 +130,8 @@ export class VoiceSession {
       await this.microphone.start(
         this.config().max_utterance_seconds,
         this.activeEnhancedVoiceFilter,
+        this.noiseSuppression(),
+        this.echoCancellation(),
         (pcm) => {
           if (this.activeTcId && this.socket?.readyState === WebSocket.OPEN) {
             this.socket.send(pcm);

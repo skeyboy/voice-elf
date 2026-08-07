@@ -26,6 +26,7 @@ pub struct AuthorityTenantRecord {
     pub warning_days: i32,
     pub offline_lease_minutes: i32,
     pub asr_backend_id: Option<String>,
+    pub tts_backend_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -205,6 +206,24 @@ impl Database {
             .await
             .optional()
             .context("failed to update authority tenant ASR backend")
+    }
+
+    pub async fn update_authority_tenant_tts(
+        &self,
+        tenant_id: Uuid,
+        backend_id: Option<&str>,
+    ) -> Result<Option<AuthorityTenantRecord>> {
+        let mut connection = self.pool.get().await?;
+        diesel::update(authority_tenants::table.find(tenant_id))
+            .set((
+                authority_tenants::tts_backend_id.eq(backend_id),
+                authority_tenants::updated_at.eq(diesel::dsl::now),
+            ))
+            .returning(AuthorityTenantRecord::as_returning())
+            .get_result(&mut connection)
+            .await
+            .optional()
+            .context("failed to update authority tenant TTS backend")
     }
 
     pub async fn get_authority_tenant(

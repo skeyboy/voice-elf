@@ -23,6 +23,7 @@
   let organizationName = '';
   let publicUrl = '';
   let adminUsername = '';
+  let adminEmail = '';
   let setupToken = '';
   let adminPassword = '';
   let passwordConfirmation = '';
@@ -74,6 +75,7 @@
           organization_name: organizationName,
           public_url: publicUrl,
           admin_username: adminUsername,
+          admin_email: adminEmail,
           admin_password: adminPassword,
         }),
       });
@@ -145,6 +147,10 @@
                   <dt><i data-lucide="cpu"></i><span>语音后端</span></dt>
                   <dd>{$systemSetup.backend}</dd>
                 </div>
+                <div class:ready={$systemSetup.email_ready}>
+                  <dt><i data-lucide="mail-check"></i><span>密码找回邮件</span></dt>
+                  <dd>{$systemSetup.email_ready ? 'SMTP 已配置' : '尚未配置，可稍后启用'}</dd>
+                </div>
               </dl>
               {#if !$systemSetup.initialization_allowed}
                 <div class="setup-blocker" role="alert">
@@ -179,6 +185,10 @@
                 <span>管理员账号</span>
                 <input bind:value={adminUsername} name="admin_username" minlength="3" maxlength="32" pattern="[A-Za-z0-9_-]+" required autocomplete="username">
               </label>
+              <label class="setup-wide-field">
+                <span>管理员邮箱</span>
+                <input bind:value={adminEmail} name="admin_email" type="email" maxlength="254" required autocomplete="email" placeholder="用于找回密码">
+              </label>
               <label>
                 <span>管理员密码</span>
                 <input bind:value={adminPassword} on:input={syncPasswordConfirmation} name="admin_password" type="password" minlength="8" maxlength="128" required autocomplete="new-password">
@@ -198,6 +208,7 @@
                 <div><dt>部署模式</dt><dd>{modeLabel($systemSetup.deployment_mode)}</dd></div>
                 <div><dt>访问地址</dt><dd>{publicUrl}</dd></div>
                 <div><dt>首个管理员</dt><dd>{adminUsername}</dd></div>
+                <div><dt>管理员邮箱</dt><dd>{adminEmail}</dd></div>
                 <div><dt>账号策略</dt><dd>后续注册由管理员验证</dd></div>
               </dl>
               <p><i data-lucide="info"></i><span>完成后系统立即启用，并以首个管理员身份登录。</span></p>

@@ -9,31 +9,6 @@ pub(super) fn normalize_config(
     const LANGUAGES: &[&str] = &[
         "auto", "zh", "en", "ja", "ko", "fr", "de", "es", "it", "pt", "ru",
     ];
-    const VOICES: &[&str] = &[
-        "f1",
-        "zh_gentle",
-        "zh_taiwan",
-        "m1",
-        "zh_lecture",
-        "zh_monologue",
-        "en_moss",
-        "en_lecture",
-        "en_news",
-        "en_gentle",
-        "en_expressive",
-        "en_narration",
-        "ja_news",
-        // Accepted for clients created before the MOSS reference-voice migration.
-        "serena",
-        "vivian",
-        "unclefu",
-        "ryan",
-        "aiden",
-        "onoanna",
-        "sohee",
-        "eric",
-        "dylan",
-    ];
     if !LANGUAGES.contains(&config.source_language.as_str()) {
         return Err(format!(
             "Unsupported source language: {}",
@@ -50,7 +25,13 @@ pub(super) fn normalize_config(
         .voice
         .strip_prefix("custom:")
         .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
-    if !custom_voice && !VOICES.contains(&config.voice.as_str()) {
+    let provider_voice = !config.voice.is_empty()
+        && config.voice.len() <= 64
+        && config
+            .voice
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'));
+    if !custom_voice && !provider_voice {
         return Err(format!("Unsupported voice: {}", config.voice));
     }
     if !(5..=20).contains(&config.max_utterance_seconds) {

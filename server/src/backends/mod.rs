@@ -18,12 +18,14 @@ pub use moss::MossTranscribeEngine;
 pub use translator::{DemoTranslator, LlamaCppTranslator, LocalLlmTranslator};
 #[cfg(test)]
 pub use tts::DemoSynthesizer;
-pub use tts::{TtsChunkSink, TtsEngine, TtsRequest, build_tts_engine};
+pub use tts::{IndexTtsEngine, TtsChunkSink, TtsEngine, TtsRequest, build_tts_engine};
 
 pub use crate::protocol::TranscriptionSegment;
 
 pub const QWEN_LOCAL_ASR_ID: &str = "qwen-local";
 pub const DEMO_ASR_ID: &str = "demo";
+pub const LOCAL_TTS_ID: &str = "local-fallback";
+pub const INDEX_TTS_ID: &str = "index-tts2";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AsrBackendInfo {
@@ -134,6 +136,291 @@ impl AsrBackendRegistry {
             services.with_transcriber(transcriber, entry.info.id),
         ))
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TtsBackendInfo {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub engine: &'static str,
+    pub description: &'static str,
+    pub available: bool,
+    pub production: bool,
+    pub voice_clone: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TtsVoiceInfo {
+    pub id: String,
+    pub name: String,
+    pub group: String,
+    pub description: String,
+    pub languages: Vec<String>,
+}
+
+#[derive(Clone)]
+struct TtsBackendEntry {
+    info: TtsBackendInfo,
+    synthesizer: Option<Arc<dyn TtsEngine>>,
+    voices: Vec<TtsVoiceInfo>,
+}
+
+#[derive(Clone)]
+pub struct TtsBackendRegistry {
+    entries: Arc<HashMap<&'static str, TtsBackendEntry>>,
+    default_backend_id: &'static str,
+}
+
+impl TtsBackendRegistry {
+    pub fn from_config(config: &AppConfig, local: Arc<dyn TtsEngine>) -> Result<Self> {
+        let mut entries = HashMap::new();
+        let local_voice_clone = local.supports_voice_clone();
+        entries.insert(
+            LOCAL_TTS_ID,
+            TtsBackendEntry {
+                info: TtsBackendInfo {
+                    id: LOCAL_TTS_ID,
+                    name: "本地自动回退",
+                    engine: "MOSS Nano / Kokoro / Supertonic",
+                    description: "按语言和音色能力自动选择当前本机已配置的 TTS 引擎",
+                    available: true,
+                    production: true,
+                    voice_clone: local_voice_clone,
+                },
+                synthesizer: Some(local),
+                voices: local_tts_voices(config),
+            },
+        );
+        // Keep the HTTP adapter registered so an administrator can install and
+        // start the local sidecar without restarting the main service.
+        let index = Some(
+            Arc::new(IndexTtsEngine::new(config.tts.index_tts.clone())?) as Arc<dyn TtsEngine>
+        );
+        entries.insert(
+            INDEX_TTS_ID,
+            TtsBackendEntry {
+                info: TtsBackendInfo {
+                    id: INDEX_TTS_ID,
+                    name: "IndexTTS2",
+                    engine: "Bilibili IndexTTS2",
+                    description: "通过参考音频执行中英文零样本音色克隆与高表现力语音合成",
+                    available: false,
+                    production: true,
+                    voice_clone: true,
+                },
+                synthesizer: index,
+                voices: index_tts_voices(config),
+            },
+        );
+        Ok(Self {
+            entries: Arc::new(entries),
+            default_backend_id: LOCAL_TTS_ID,
+        })
+    }
+
+    pub fn default_backend_id(&self) -> &'static str {
+        self.default_backend_id
+    }
+
+    pub fn providers(&self) -> Vec<TtsBackendInfo> {
+        let mut providers = self
+            .entries
+            .values()
+            .map(|entry| entry.info.clone())
+            .collect::<Vec<_>>();
+        providers.sort_by_key(|provider| provider.name);
+        providers
+    }
+
+    pub fn services_for(
+        &self,
+        services: &AppServices,
+        backend_id: &str,
+    ) -> Option<Arc<AppServices>> {
+        let entry = self.entries.get(backend_id)?;
+        let synthesizer = entry.synthesizer.as_ref()?.clone();
+        Some(Arc::new(services.with_synthesizer(synthesizer)))
+    }
+
+    pub fn voices_for(&self, backend_id: &str) -> Option<Vec<TtsVoiceInfo>> {
+        self.entries
+            .get(backend_id)
+            .map(|entry| entry.voices.clone())
+    }
+}
+
+fn local_tts_voices(config: &AppConfig) -> Vec<TtsVoiceInfo> {
+    const VOICES: &[(&str, &str, &str, &str, &[&str])] = &[
+        (
+            "F1",
+            "模思中文",
+            "中文参考声",
+            "清晰自然的中文参考声",
+            &["zh"],
+        ),
+        (
+            "ZH_GENTLE",
+            "温柔晚安",
+            "中文参考声",
+            "温柔舒缓的中文女声",
+            &["zh"],
+        ),
+        (
+            "ZH_TAIWAN",
+            "台湾腔",
+            "中文参考声",
+            "轻松自然的台湾口语",
+            &["zh"],
+        ),
+        (
+            "M1",
+            "京味胡同",
+            "中文参考声",
+            "具有京味特征的中文男声",
+            &["zh"],
+        ),
+        (
+            "ZH_LECTURE",
+            "文化讲述",
+            "中文参考声",
+            "适合正式内容的讲述声",
+            &["zh"],
+        ),
+        (
+            "ZH_MONOLOGUE",
+            "沉稳独白",
+            "中文参考声",
+            "沉稳自然的独白声",
+            &["zh"],
+        ),
+        (
+            "EN_MOSS",
+            "OpenMOSS English",
+            "English voices",
+            "Clear English presentation voice",
+            &["en"],
+        ),
+        (
+            "EN_LECTURE",
+            "English Lecture",
+            "English voices",
+            "Measured English lecture voice",
+            &["en"],
+        ),
+        (
+            "EN_NEWS",
+            "English News",
+            "English voices",
+            "English broadcast news voice",
+            &["en"],
+        ),
+        (
+            "EN_GENTLE",
+            "Gentle English",
+            "English voices",
+            "Gentle English reminder voice",
+            &["en"],
+        ),
+        (
+            "EN_EXPRESSIVE",
+            "Expressive English",
+            "English voices",
+            "Expressive English speech voice",
+            &["en"],
+        ),
+        (
+            "EN_NARRATION",
+            "English Narration",
+            "English voices",
+            "Calm English narration voice",
+            &["en"],
+        ),
+        (
+            "JA_NEWS",
+            "ニュース",
+            "日本語音声",
+            "ニュース読みの日本語参考音声",
+            &["ja"],
+        ),
+    ];
+    let configured = &config.tts.moss_nano.voice_map;
+    let mut voices = VOICES
+        .iter()
+        .filter(|(id, ..)| !config.tts.moss_nano.enabled || configured.contains_key(*id))
+        .map(|(id, name, group, description, languages)| TtsVoiceInfo {
+            id: (*id).to_owned(),
+            name: (*name).to_owned(),
+            group: (*group).to_owned(),
+            description: (*description).to_owned(),
+            languages: languages.iter().map(|value| (*value).to_owned()).collect(),
+        })
+        .collect::<Vec<_>>();
+    if config.tts.moss_nano.enabled {
+        for id in configured.keys() {
+            if voices.iter().any(|voice| voice.id.eq_ignore_ascii_case(id)) {
+                continue;
+            }
+            voices.push(TtsVoiceInfo {
+                id: id.clone(),
+                name: humanize_voice_id(id),
+                group: "MOSS Nano 自定义映射".to_owned(),
+                description: "通过 TTS_MOSS_NANO_VOICE_MAP 配置的参考音色".to_owned(),
+                languages: ["zh", "en", "ja", "ko", "fr", "de", "es", "it", "pt", "ru"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            });
+        }
+    }
+    voices.sort_by(|left, right| {
+        left.group
+            .cmp(&right.group)
+            .then(left.name.cmp(&right.name))
+    });
+    voices
+}
+
+fn index_tts_voices(config: &AppConfig) -> Vec<TtsVoiceInfo> {
+    let mut ids = config
+        .tts
+        .index_tts
+        .voice_map
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    if !ids
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case(&config.tts.index_tts.default_voice_id))
+    {
+        ids.push(config.tts.index_tts.default_voice_id.clone());
+    }
+    ids.sort();
+    ids.into_iter()
+        .map(|id| TtsVoiceInfo {
+            name: humanize_voice_id(&id),
+            id,
+            group: "IndexTTS2 参考声".to_owned(),
+            description: "IndexTTS2 零样本参考音色，支持中文与 English".to_owned(),
+            languages: vec!["zh".to_owned(), "en".to_owned()],
+        })
+        .collect()
+}
+
+fn humanize_voice_id(id: &str) -> String {
+    id.split(['_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            match characters.next() {
+                Some(first) => first
+                    .to_uppercase()
+                    .chain(characters.flat_map(char::to_lowercase))
+                    .collect(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Clone, Debug)]
@@ -400,6 +687,16 @@ impl AppServices {
             translator: self.translator.clone(),
             synthesizer: self.synthesizer.clone(),
             backend_name,
+        }
+    }
+
+    fn with_synthesizer(&self, synthesizer: Arc<dyn TtsEngine>) -> Self {
+        Self {
+            transcriber: self.transcriber.clone(),
+            refinement_engines: self.refinement_engines.clone(),
+            translator: self.translator.clone(),
+            synthesizer,
+            backend_name: self.backend_name,
         }
     }
 }
