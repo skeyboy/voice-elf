@@ -71,10 +71,12 @@ VOICE_ELF_APP_SERVER_URL=https://voice.example.com npm run app:android:build
 
 | 平台 | 工程/配置 | 关键处理 |
 | --- | --- | --- |
-| macOS | `src-tauri/Info.plist` | 麦克风用途说明、本机网络、`.app` 打包 |
+| macOS | `src-tauri/Info.plist` | 麦克风、屏幕录制与系统音频用途说明，本机网络、`.app` 打包 |
 | Windows | Tauri Cargo/config | WebView2 宿主、ICO/Appx 图标；必须在 Windows 产出 MSI/NSIS |
-| Android | `src-tauri/gen/android` | API 24、INTERNET、RECORD_AUDIO、回环 HTTP、NDK 28 的 16 KB page 支持 |
-| iOS | `src-tauri/gen/apple` | iOS 14、麦克风用途说明、本机网络、设备签名由环境注入 |
+| Android | `src-tauri/gen/android` | API 24、INTERNET、RECORD_AUDIO、前台一次性 MediaProjection、回环 HTTP、NDK 28 的 16 KB page 支持 |
+| iOS | `src-tauri/gen/apple` | iOS 14、麦克风与屏幕采集用途说明、本机网络、设备签名由环境注入 |
+
+会话采集在共享 Web 层支持麦克风、系统音频或两者混流。系统内录入口只在 WebView 暴露 `getDisplayMedia` 时可选，并且启动后还要检查系统选择器是否实际返回音轨。这个双重检测避免把桌面 WebView 的能力错误外推到旧版 Android/iOS WebView。移动端若需要在 WebView 不提供显示采集时仍强制支持内录，应增加平台原生 ScreenCaptureKit/MediaProjection 插件和 Tauri Channel PCM 桥接，不能通过增加 manifest 权限绕过系统采集 API。
 
 Tauri 移动入口使用 `#[cfg_attr(mobile, tauri::mobile_entry_point)]`，crate 同时输出 `staticlib`、`cdylib` 和 `rlib`。这让 Android/iOS 原生宿主调用同一 Rust `run()`，桌面端则由小型 `main.rs` 调用它。
 

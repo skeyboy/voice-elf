@@ -4,7 +4,9 @@ const FLAG_SPEECH_ENDED = 1 << 2;
 const FLAG_FORCED_END = 1 << 4;
 const FLAG_FRAME_READY = 1 << 30;
 const FLAG_INVALID_INPUT = 1 << 31;
-const MIN_CONFIRMED_SPEECH_FRAMES = 10;
+// Three Silero-confirmed 32 ms frames preserve brief acknowledgements such as
+// "嗯" while the model, energy, and speech-shape gates still reject meter-only noise.
+const MIN_CONFIRMED_SPEECH_FRAMES = 3;
 
 let wasm;
 let processor = 0;

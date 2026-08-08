@@ -1,3 +1,13 @@
+import {
+  decodeAndroidPcm,
+  isAndroidNativeShell,
+  markAndroidCaptureReady,
+  startAndroidCapture,
+  stopAndroidCapture,
+  subscribeAndroidNative,
+  supportsAndroidSystemAudio,
+} from './android-native';
+
 interface CaptureMessage {
   type: 'samples';
   payload?: ArrayBuffer;
@@ -8,6 +18,13 @@ export type VadEndReason = 'silence' | 'max_duration' | 'manual';
 export type VadBoundary =
   | { type: 'speech_start' }
   | { type: 'speech_end'; reason: VadEndReason; speechFrames: number };
+
+export interface AudioCaptureOptions {
+  microphone: boolean;
+  systemAudio: boolean;
+  noiseSuppression: boolean;
+  echoCancellation: boolean;
+}
 
 interface VadMessage {
   type:
@@ -82,9 +99,57 @@ export function scheduleVadPreload() {
   };
 }
 
-export class MicrophoneCapture {
+export function supportsSystemAudioCapture() {
+  if (supportsAndroidSystemAudio()) return true;
+  return Boolean(
+    window.isSecureContext && navigator.mediaDevices?.getDisplayMedia,
+  );
+}
+
+async function assertMicrophonePermissionIsRequestable() {
+  if (!navigator.permissions?.query) return;
+  try {
+    const status = await navigator.permissions.query({
+      name: 'microphone' as PermissionName,
+    });
+    if (status.state === 'denied') {
+      throw new Error('麦克风权限已被拒绝，请在系统或浏览器设置中允许后重试');
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('麦克风权限已被拒绝')) throw error;
+    // Safari and older WebViews do not expose microphone through Permissions API.
+  }
+}
+
+function captureError(error: unknown, source: 'microphone' | 'system') {
+  if (!(error instanceof DOMException)) {
+    return error instanceof Error ? error : new Error('无法启动音频采集');
+  }
+  if (error.name === 'NotAllowedError') {
+    return new Error(
+      source === 'system'
+        ? '未获得系统音频共享权限，已取消本次录音'
+        : '未获得麦克风权限，请在系统或浏览器设置中允许后重试',
+    );
+  }
+  if (error.name === 'NotFoundError') {
+    return new Error(source === 'system' ? '没有可共享的系统音频' : '未检测到可用麦克风');
+  }
+  if (error.name === 'NotReadableError') {
+    return new Error(
+      source === 'system' ? '系统音频正在被占用或无法读取' : '麦克风正在被其他应用占用',
+    );
+  }
+  return error;
+}
+
+export class AudioCapture {
   private context: AudioContext | null = null;
-  private stream: MediaStream | null = null;
+  private streams: MediaStream[] = [];
+  private sourceNodes: MediaStreamAudioSourceNode[] = [];
+  private gainNodes: GainNode[] = [];
+  private mixer: GainNode | null = null;
+  private limiter: DynamicsCompressorNode | null = null;
   private node: AudioWorkletNode | null = null;
   private vadWorker: Worker | null = null;
   private vadReady = false;
@@ -94,6 +159,9 @@ export class MicrophoneCapture {
   private onFatalError: ((error: Error) => void) | null = null;
   private flushResolver: (() => void) | null = null;
   private suppressed = false;
+  private stopping = false;
+  private androidCapture = false;
+  private unsubscribeAndroidPcm = () => {};
 
   private async prepareVad(
     maxUtteranceSeconds: number,
@@ -185,8 +253,7 @@ export class MicrophoneCapture {
   async start(
     maxUtteranceSeconds: number,
     enhancedVoiceFilter: boolean,
-    noiseSuppression: boolean,
-    echoCancellation: boolean,
+    options: AudioCaptureOptions,
     onPcm: (pcm: ArrayBuffer) => void,
     onLevel: (level: number) => void,
     onBoundary: (boundary: VadBoundary) => void,
@@ -194,17 +261,61 @@ export class MicrophoneCapture {
     onFatalError: (error: Error) => void,
   ) {
     if (this.context) return;
-    if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
-      throw new Error('当前访问地址不是浏览器安全上下文；局域网麦克风测试需要使用受信任的 HTTPS 地址');
+    const androidShell = isAndroidNativeShell();
+    if ((!window.isSecureContext || !navigator.mediaDevices) && !androidShell) {
+      throw new Error('当前访问地址不是浏览器安全上下文；音频采集需要使用受信任的 HTTPS 地址');
     }
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation,
-        noiseSuppression,
-        autoGainControl: false,
-      },
-    });
+    if (!options.microphone && !options.systemAudio) {
+      throw new Error('请至少选择麦克风或系统音频');
+    }
+    const streams: MediaStream[] = [];
+    if (androidShell) {
+      this.androidCapture = await startAndroidCapture(options.microphone, options.systemAudio);
+    }
+    if (options.systemAudio) {
+      if (!supportsSystemAudioCapture()) {
+        throw new Error('当前浏览器或设备不支持系统音频采集');
+      }
+      try {
+        if (androidShell) {
+          // MediaProjection audio arrives through the native bridge after VAD is ready.
+        } else {
+          const display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+          if (display.getAudioTracks().length === 0) {
+            display.getTracks().forEach((track) => track.stop());
+            throw new Error('所选共享来源没有系统音频，请选择带音频的标签页、窗口或屏幕');
+          }
+          streams.push(display);
+        }
+      } catch (error) {
+        if (this.androidCapture) stopAndroidCapture();
+        throw captureError(error, 'system');
+      }
+    }
+    if (options.microphone) {
+      if (!navigator.mediaDevices.getUserMedia) {
+        streams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
+        throw new Error('当前浏览器或设备不支持麦克风录音');
+      }
+      try {
+        await assertMicrophonePermissionIsRequestable();
+        streams.push(
+          await navigator.mediaDevices.getUserMedia({
+            audio: {
+              channelCount: 1,
+              echoCancellation: options.echoCancellation,
+              noiseSuppression: options.noiseSuppression,
+              autoGainControl: false,
+            },
+          }),
+        );
+      } catch (error) {
+        streams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
+        if (this.androidCapture) stopAndroidCapture();
+        throw captureError(error, 'microphone');
+      }
+    }
+
     const context = new AudioContext({ latencyHint: 'interactive' });
     this.onLevel = onLevel;
     this.onFatalError = onFatalError;
@@ -215,21 +326,41 @@ export class MicrophoneCapture {
       ]);
       await context.resume();
     } catch (error) {
-      stream.getTracks().forEach((track) => track.stop());
+      streams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
       await context.close();
       this.destroyVad();
       this.onLevel = null;
       this.onFatalError = null;
+      if (this.androidCapture) stopAndroidCapture();
+      this.androidCapture = false;
       throw error;
     }
-    const source = context.createMediaStreamSource(stream);
+    const audioStreams = streams.map(
+      (stream) => new MediaStream(stream.getAudioTracks()),
+    );
+    const sourceNodes = audioStreams.map((stream) => context.createMediaStreamSource(stream));
+    const gainNodes = sourceNodes.map(() => context.createGain());
+    const mixer = context.createGain();
+    mixer.channelCount = 1;
+    mixer.channelCountMode = 'explicit';
+    mixer.channelInterpretation = 'speakers';
+    const limiter = context.createDynamicsCompressor();
+    limiter.threshold.value = -3;
+    limiter.knee.value = 6;
+    limiter.ratio.value = 12;
+    limiter.attack.value = 0.003;
+    limiter.release.value = 0.12;
+    const inputGain = sourceNodes.length > 1 ? Math.SQRT1_2 : 1;
+    sourceNodes.forEach((source, index) => {
+      gainNodes[index].gain.value = inputGain;
+      source.connect(gainNodes[index]).connect(mixer);
+    });
     const node = new AudioWorkletNode(context, 'microphone-tap-processor');
     const silent = context.createGain();
     silent.gain.value = 0;
-    source.connect(node).connect(silent).connect(context.destination);
+    mixer.connect(limiter).connect(node).connect(silent).connect(context.destination);
     this.onPcm = onPcm;
     this.onBoundary = onBoundary;
-    onReady();
     node.port.onmessage = (event: MessageEvent<CaptureMessage>) => {
       if (
         event.data.type === 'samples' &&
@@ -244,15 +375,56 @@ export class MicrophoneCapture {
         );
       }
     };
-    this.stream = stream;
+    this.unsubscribeAndroidPcm = subscribeAndroidNative((event) => {
+      if (
+        event.type === 'audio-pcm'
+        && this.vadReady
+        && this.vadWorker
+        && !this.suppressed
+      ) {
+        const payload = decodeAndroidPcm(event.data);
+        this.vadWorker.postMessage({ type: 'samples', payload }, [payload]);
+      } else if (event.type === 'capture-stopped' && !this.stopping && this.context) {
+        this.onFatalError?.(new Error('Android 后台录音已停止'));
+      } else if (event.type === 'capture-error' && !this.stopping) {
+        this.onFatalError?.(new Error(event.message));
+      }
+    });
+    const displayStream = options.systemAudio && !androidShell ? streams[0] : null;
+    displayStream?.getAudioTracks().forEach((track) => {
+      track.addEventListener(
+        'ended',
+        () => {
+          if (!this.stopping && this.context) {
+            this.onFatalError?.(new Error('系统音频共享已停止'));
+          }
+        },
+        { once: true },
+      );
+    });
+    this.streams = streams;
+    this.sourceNodes = sourceNodes;
+    this.gainNodes = gainNodes;
+    this.mixer = mixer;
+    this.limiter = limiter;
     this.context = context;
     this.node = node;
+    if (this.androidCapture) markAndroidCaptureReady();
+    onReady();
   }
 
   async stop() {
+    this.stopping = true;
     this.node?.disconnect();
     if (this.node) this.node.port.onmessage = null;
-    this.stream?.getTracks().forEach((track) => track.stop());
+    this.sourceNodes.forEach((source) => source.disconnect());
+    this.gainNodes.forEach((gain) => gain.disconnect());
+    this.mixer?.disconnect();
+    this.limiter?.disconnect();
+    this.streams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
+    this.unsubscribeAndroidPcm();
+    this.unsubscribeAndroidPcm = () => {};
+    if (this.androidCapture) stopAndroidCapture();
     if (this.vadReady && this.vadWorker) {
       await new Promise<void>((resolve) => {
         const timeout = window.setTimeout(resolve, 1_000);
@@ -265,13 +437,19 @@ export class MicrophoneCapture {
     }
     await this.context?.close();
     this.node = null;
-    this.stream = null;
+    this.streams = [];
+    this.sourceNodes = [];
+    this.gainNodes = [];
+    this.mixer = null;
+    this.limiter = null;
     this.context = null;
+    this.androidCapture = false;
     this.onPcm = null;
     this.onLevel = null;
     this.onBoundary = null;
     this.onFatalError = null;
     this.vadReady = false;
+    this.stopping = false;
   }
 
   setSuppressed(suppressed: boolean) {

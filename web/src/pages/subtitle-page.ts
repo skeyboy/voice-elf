@@ -1,6 +1,7 @@
 import { ApiRequestError, apiRequest, type RoomDetail } from '../api';
 import { loadAppConfig } from '../app-config';
 import { refreshIcons } from '../components/icons';
+import { renderPageLoading } from '../components/page-loading';
 import type { ServerEvent, SpeakerIdentity } from '../protocol';
 import {
   loadSubtitlePreferences,
@@ -64,14 +65,17 @@ export class SubtitlePage implements Page {
     this.root = root;
     this.destroyed = false;
     document.body.classList.add('subtitle-route');
+    renderPageLoading(root, '正在打开字幕大屏', '同步房间配置与实时字幕', 'display');
     let detail: RoomDetail;
     try {
       detail = await this.getDetail();
     } catch (error) {
+      if (this.root !== root) return;
       this.onError(error instanceof Error ? error.message : '无法打开字幕大屏');
       this.onRooms();
       return;
     }
+    if (this.root !== root) return;
     this.mergeHistory(detail);
     root.innerHTML = this.template();
     root.querySelector('.subtitle-room-name')!.textContent = detail.room.name;

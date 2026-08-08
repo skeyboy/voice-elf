@@ -11,6 +11,7 @@ import type { ConnectionStatus } from '../components/topbar';
 export const currentUser = writable<User | null | undefined>(undefined);
 export const instanceAuthorization = writable<InstanceAuthorization | undefined>(undefined);
 export const systemSetup = writable<SetupStatus | undefined>(undefined);
+export const setupConnectionError = writable<string | null>(null);
 export const connectionStatus = writable<ConnectionStatus>('hidden');
 export type ToastKind = 'info' | 'warning' | 'error';
 export const toastMessages = writable<Array<{ id: number; message: string; kind: ToastKind }>>([]);
@@ -19,6 +20,13 @@ let sessionRequest: Promise<User | null> | null = null;
 let authorizationRequest: Promise<InstanceAuthorization> | null = null;
 let setupRequest: Promise<SetupStatus> | null = null;
 let nextToastId = 1;
+const BOOTSTRAP_TIMEOUT_MS = 7_000;
+
+function bootstrapSignal() {
+  const controller = new AbortController();
+  window.setTimeout(() => controller.abort(), BOOTSTRAP_TIMEOUT_MS);
+  return controller.signal;
+}
 
 export function loadSession() {
   if (!sessionRequest) {
@@ -70,8 +78,17 @@ export function loadAuthorization(force = false) {
 export function loadSetup(force = false) {
   if (force) setupRequest = null;
   if (!setupRequest) {
-    setupRequest = apiRequest<SetupStatus>('/api/setup/status')
-      .catch(() => ({
+    setupConnectionError.set(null);
+    setupRequest = apiRequest<SetupStatus>('/api/setup/status', { signal: bootstrapSignal() })
+      .catch((error) => {
+        const message =
+          error instanceof DOMException && error.name === 'AbortError'
+            ? '连接服务超时，请检查 API 地址和网络'
+            : error instanceof Error
+              ? error.message
+              : '无法连接初始化服务';
+        setupConnectionError.set(message);
+        return {
         initialized: false,
         database_ready: false,
         initialization_allowed: false,
@@ -98,7 +115,8 @@ export function loadSetup(force = false) {
           next_check_at: null,
         },
         profile: null,
-      }))
+        };
+      })
       .then((setup) => {
         systemSetup.set(setup);
         return setup;

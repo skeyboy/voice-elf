@@ -30,7 +30,6 @@ const END_SILENCE_FRAMES: u16 = 88;
 // Keep enough audio to cover Silero's onset latency without clipping short initials.
 const PRE_ROLL_FRAMES: usize = 16;
 const ENHANCED_PRE_ROLL_FRAMES: usize = 32;
-const ENHANCED_CALIBRATION_FRAMES: u16 = 32;
 const FORCED_CONTINUATION_FRAMES: u16 = 6;
 // Energy may bridge brief model dropouts, but must not hold a segment open on AGC noise.
 const ENERGY_HANGOVER_FRAMES: u16 = 6;
@@ -259,7 +258,6 @@ struct BrowserAudioVad {
     segment_model_frames: u32,
     completed_model_frames: u32,
     enhanced_voice_filter: bool,
-    enhanced_calibration_frames: u16,
     enhanced_hum_locked: bool,
     enhanced_hum_run: u16,
     enhanced_hum_clear_run: u16,
@@ -299,11 +297,6 @@ impl BrowserAudioVad {
             segment_model_frames: 0,
             completed_model_frames: 0,
             enhanced_voice_filter,
-            enhanced_calibration_frames: if enhanced_voice_filter {
-                ENHANCED_CALIBRATION_FRAMES
-            } else {
-                0
-            },
             enhanced_hum_locked: false,
             enhanced_hum_run: 0,
             enhanced_hum_clear_run: 0,
@@ -449,10 +442,6 @@ impl BrowserAudioVad {
                 self.segment_model_frames = 0;
             }
         }
-        if self.enhanced_calibration_frames > 0 {
-            self.enhanced_calibration_frames -= 1;
-            return false;
-        }
         if hum_frame {
             return false;
         }
@@ -574,11 +563,6 @@ impl BrowserAudioVad {
         self.model_silence_run = 0;
         self.segment_model_frames = 0;
         self.completed_model_frames = 0;
-        self.enhanced_calibration_frames = if self.enhanced_voice_filter {
-            ENHANCED_CALIBRATION_FRAMES
-        } else {
-            0
-        };
         self.enhanced_hum_locked = false;
         self.enhanced_hum_run = 0;
         self.enhanced_hum_clear_run = 0;
@@ -965,7 +949,7 @@ mod tests {
                     * 8_000.0) as i16;
         }
         let mut vad = BrowserAudioVad::new(20, 16_000, true).unwrap();
-        for _ in 0..ENHANCED_CALIBRATION_FRAMES {
+        for _ in 0..ENHANCED_HUM_LOCK_FRAMES {
             assert!(!vad.frame_is_speech_like(&hum, rms_level(&hum)));
         }
         assert!(vad.enhanced_hum_locked);
@@ -988,6 +972,31 @@ mod tests {
         let (voiced, model_voiced) = vad.classify_voiced(SPEECH_THRESHOLD + 0.5, 0.01, true, false);
         assert!(!voiced);
         assert!(!model_voiced);
+    }
+
+    #[test]
+    fn enhanced_filter_accepts_speech_immediately_after_start_and_reset() {
+        let mut speech = [0_i16; FRAME_SAMPLES];
+        for (index, sample) in speech.iter_mut().enumerate() {
+            *sample = ((index as f32 * 2.0 * std::f32::consts::PI * 300.0 / SAMPLE_RATE as f32)
+                .sin()
+                * 8_000.0) as i16;
+        }
+        let mut vad = BrowserAudioVad::new(20, 16_000, true).unwrap();
+
+        for _ in 0..2 {
+            let speech_like = vad.frame_is_speech_like(&speech, rms_level(&speech));
+            let (voiced, confirmed) = vad.classify_voiced(
+                SPEECH_THRESHOLD + 0.5,
+                rms_level(&speech),
+                speech_like,
+                false,
+            );
+            assert!(speech_like);
+            assert!(voiced);
+            assert!(confirmed);
+            vad.reset();
+        }
     }
 
     #[test]

@@ -7,18 +7,39 @@ import {
   type RoomSummary,
 } from '../api';
 import { loadAppConfig } from '../app-config';
-import { PcmPlayer } from '../audio';
+import {
+  isAndroidNativeShell,
+  isAndroidSubtitleOverlayVisible,
+  showAndroidSubtitleOverlay,
+  subscribeAndroidNative,
+  updateAndroidSubtitleOverlay,
+  type AndroidSubtitlePayload,
+} from '../android-native';
+import { PcmPlayer, supportsSystemAudioCapture } from '../audio';
+import { CaptureOptions, type CaptureOptionValues } from '../components/capture-options';
 import { ConversationView } from '../components/conversation-view';
 import { LanguageDialog } from '../components/language-dialog';
 import { refreshIcons } from '../components/icons';
 import { LatencyMonitor } from '../components/latency-monitor';
+import { renderPageLoading } from '../components/page-loading';
 import { RoomEditor } from '../components/room-editor';
 import type { ConnectionStatus } from '../components/topbar';
 import { VoiceSession } from '../controllers/voice-session';
 import type { PipelinePhase, ServerEvent, SessionConfig } from '../protocol';
 import { languageNames } from '../shared/languages';
 import { loadPreferences, savePreferences, subscribePreferences } from '../shared/preferences';
+import {
+  loadSubtitlePreferences,
+  subscribeSubtitlePreferences,
+} from '../shared/subtitle-preferences';
 import type { Page } from './page';
+
+interface TranslatorViewState {
+  query: string;
+  scrollTop: number;
+}
+
+const translatorViewStates = new Map<string, TranslatorViewState>();
 
 export class TranslatorPage implements Page {
   private root: HTMLElement | null = null;
@@ -28,6 +49,7 @@ export class TranslatorPage implements Page {
   private voiceSession: VoiceSession | null = null;
   private roomEditor: RoomEditor | null = null;
   private languageDialog: LanguageDialog | null = null;
+  private captureOptions: CaptureOptions | null = null;
   private player = new PcmPlayer();
   private timer = 0;
   private startedAt = 0;
@@ -37,6 +59,8 @@ export class TranslatorPage implements Page {
   private maxUtteranceSeconds = 20;
   private voice = 'F1';
   private enhancedVoiceFilter = true;
+  private microphoneCapture = true;
+  private systemAudioCapture = false;
   private noiseSuppression = true;
   private echoCancellation = true;
   private readonly latencyIds = new Set<string>();
@@ -46,6 +70,11 @@ export class TranslatorPage implements Page {
   private connectionStatus: ConnectionStatus = 'offline';
   private isAppShell = false;
   private unsubscribePreferences = () => {};
+  private unsubscribeSubtitlePreferences = () => {};
+  private unsubscribeAndroidNative = () => {};
+  private androidOverlayActive = false;
+  private readonly androidCaptions = new Map<string, { source: string; translation: string }>();
+  private androidCaptionOrder: string[] = [];
 
   constructor(
     private readonly userId: string,
@@ -58,14 +87,18 @@ export class TranslatorPage implements Page {
 
   async mount(root: HTMLElement) {
     this.root = root;
+    renderPageLoading(root, '正在进入实时会话', '同步会议、成员和最近字幕');
+    const savedView = translatorViewStates.get(this.roomId);
     let detail: RoomDetail;
     try {
-      detail = await this.getDetail();
+      detail = await this.getDetail(savedView?.query);
     } catch (error) {
+      if (this.root !== root) return;
       this.onError(error instanceof Error ? error.message : '无法进入房间');
       this.onRooms();
       return;
     }
+    if (this.root !== root) return;
     this.room = detail.room;
     void loadAppConfig().then((config) => {
       this.isAppShell = Boolean(config);
@@ -80,6 +113,8 @@ export class TranslatorPage implements Page {
     const preferences = loadPreferences(this.userId);
     this.voice = preferences.voice;
     this.enhancedVoiceFilter = preferences.enhancedVoiceFilter;
+    this.microphoneCapture = preferences.microphoneCapture;
+    this.systemAudioCapture = preferences.systemAudioCapture && supportsSystemAudioCapture();
     this.noiseSuppression = preferences.noiseSuppression;
     this.echoCancellation = preferences.echoCancellation;
     this.player.muted = !preferences.autoplay;
@@ -91,7 +126,27 @@ export class TranslatorPage implements Page {
     this.monitor = new LatencyMonitor();
     root.querySelector('.conversation-mount')!.replaceWith(this.conversation.element);
     root.querySelector('.monitor-mount')!.replaceWith(this.monitor.element);
+    this.captureOptions = new CaptureOptions(
+      this.captureOptionValues(),
+      supportsSystemAudioCapture(),
+      (values) => this.updateCaptureOptions(values),
+      {
+        sourceLabel: languageNames[this.sourceLanguage] ?? this.sourceLanguage,
+        targetLabel: languageNames[this.targetLanguage] ?? this.targetLanguage,
+        editable: detail.room.is_owner,
+        onOpen: () => this.languageDialog?.open(this.sourceLanguage, this.targetLanguage),
+      },
+    );
+    root.querySelector('.capture-options-mount')!.replaceWith(this.captureOptions.element);
     this.conversation.renderHistory(detail);
+    const search = root.querySelector<HTMLInputElement>('.record-search input');
+    if (search) search.value = savedView?.query ?? '';
+    if (savedView?.scrollTop) {
+      requestAnimationFrame(() => {
+        const list = this.root?.querySelector<HTMLElement>('.conversation-list');
+        if (list) list.scrollTop = savedView.scrollTop;
+      });
+    }
     this.resetLatency(detail);
     this.bindEvents();
     this.roomEditor = new RoomEditor((saved) => this.applyRoom(saved));
@@ -104,19 +159,28 @@ export class TranslatorPage implements Page {
     this.unsubscribePreferences = subscribePreferences(this.userId, (next) => {
       this.voice = next.voice;
       this.enhancedVoiceFilter = next.enhancedVoiceFilter;
+      this.microphoneCapture = next.microphoneCapture;
+      this.systemAudioCapture = next.systemAudioCapture && supportsSystemAudioCapture();
       this.noiseSuppression = next.noiseSuppression;
       this.echoCancellation = next.echoCancellation;
-      const noiseToggle = this.root?.querySelector<HTMLInputElement>('.capture-noise-suppression');
-      const echoToggle = this.root?.querySelector<HTMLInputElement>('.capture-echo-cancellation');
-      if (noiseToggle) noiseToggle.checked = next.noiseSuppression;
-      if (echoToggle) echoToggle.checked = next.echoCancellation;
+      this.captureOptions?.setValues(this.captureOptionValues());
+      this.syncRecordButton();
       this.player.muted = !next.autoplay;
       this.voiceSession?.sendConfig();
     });
+    this.unsubscribeSubtitlePreferences = subscribeSubtitlePreferences(this.userId, () => {
+      this.pushAndroidSubtitle();
+    });
+    this.unsubscribeAndroidNative = subscribeAndroidNative((event) => {
+      if (event.type === 'overlay-opened') this.androidOverlayActive = true;
+      if (event.type === 'overlay-closed') this.androidOverlayActive = false;
+      if (event.type === 'overlay-error') this.onError(event.message);
+    });
+    this.androidOverlayActive = isAndroidSubtitleOverlayVisible();
+    this.pushAndroidSubtitle();
     if (detail.room.status !== 'active') {
       root.querySelector<HTMLButtonElement>('.record-button')!.disabled = true;
-      root.querySelector<HTMLElement>('.capture-state')!.textContent = '会议已结束';
-      root.querySelector<HTMLElement>('.session-badge-text')!.textContent = '仅查看记录';
+      this.setCaptureStatus('会议已结束', 'neutral');
       root.querySelector<HTMLButtonElement>('.open-subtitles')!.disabled = true;
       this.onConnection('hidden');
       return;
@@ -128,8 +192,7 @@ export class TranslatorPage implements Page {
       this.player,
       () => this.sessionConfig(),
       () => this.enhancedVoiceFilter,
-      () => this.noiseSuppression,
-      () => this.echoCancellation,
+      () => this.captureOptionValues(),
       {
         onEvent: (event) => this.handleEvent(event),
         onConnection: (status) => this.setConnection(status),
@@ -141,9 +204,16 @@ export class TranslatorPage implements Page {
   }
 
   async destroy() {
+    const query = this.root?.querySelector<HTMLInputElement>('.record-search input')?.value ?? '';
+    const scrollTop = this.root?.querySelector<HTMLElement>('.conversation-list')?.scrollTop ?? 0;
+    translatorViewStates.set(this.roomId, { query, scrollTop });
     window.clearInterval(this.timer);
     this.unsubscribePreferences();
     this.unsubscribePreferences = () => {};
+    this.unsubscribeSubtitlePreferences();
+    this.unsubscribeSubtitlePreferences = () => {};
+    this.unsubscribeAndroidNative();
+    this.unsubscribeAndroidNative = () => {};
     await this.voiceSession?.destroy();
     this.voiceSession = null;
     this.conversation?.destroy();
@@ -154,6 +224,8 @@ export class TranslatorPage implements Page {
     this.roomEditor = null;
     this.languageDialog?.destroy();
     this.languageDialog = null;
+    this.captureOptions?.destroy();
+    this.captureOptions = null;
     this.player.stop();
     this.onConnection('hidden');
     this.root = null;
@@ -199,36 +271,24 @@ export class TranslatorPage implements Page {
             <div class="panel-heading">
               <div><span class="section-kicker"><i data-lucide="radio"></i> LIVE SESSION</span><h1>实时对话</h1></div>
               <div class="panel-actions">
-                <span class="capture-session-badge"><span class="session-dot"></span><span class="session-badge-text">${this.canPublish ? '等待录音' : '已被禁言'}</span></span>
                 <div class="monitor-mount"></div>
                 <button class="icon-button refresh-history" type="button" title="刷新记录" aria-label="刷新记录"><i data-lucide="refresh-cw"></i></button>
               </div>
             </div>
             <div class="conversation-mount"></div>
             <div class="capture-console">
-              <canvas id="waveform" aria-hidden="true"></canvas>
-              <button class="language-config-button" type="button" title="选择翻译语言" ${room.is_owner ? '' : 'disabled'}>
-                <span class="language-source-label">${escapeHtml(languageNames[room.source_language] ?? room.source_language)}</span>
-                <i data-lucide="arrow-left-right"></i>
-                <span class="language-target-label">${escapeHtml(languageNames[room.target_language] ?? room.target_language)}</span>
-              </button>
               <div class="record-control">
-                <button class="record-button" type="button" aria-label="开始录音" title="开始录音" disabled><i data-lucide="mic"></i></button>
-                <span class="record-button-copy">开始录音</span>
-                <div class="capture-processing-options">
-                  <label class="capture-processing-option">
-                    <input class="capture-noise-suppression" type="checkbox" role="switch" ${this.noiseSuppression ? 'checked' : ''}>
-                    <span class="capture-processing-track" aria-hidden="true"></span>
-                    <span class="capture-processing-copy"><strong>系统降噪</strong><small>下次录音生效</small></span>
-                  </label>
-                  <label class="capture-processing-option">
-                    <input class="capture-echo-cancellation" type="checkbox" role="switch" ${this.echoCancellation ? 'checked' : ''}>
-                    <span class="capture-processing-track" aria-hidden="true"></span>
-                    <span class="capture-processing-copy"><strong>回声消除</strong><small>下次录音生效</small></span>
-                  </label>
+                <div class="record-primary-actions">
+                  <button class="record-button" type="button" aria-label="开始麦克风录音" title="开始麦克风录音" disabled><i data-lucide="mic"></i></button>
+                  <div class="capture-options-mount"></div>
                 </div>
+                <span class="record-button-copy">开始录音</span>
+                <div class="capture-readout" data-tone="processing">
+                  <span class="capture-status-line"><i class="capture-status-dot" aria-hidden="true"></i><strong class="capture-state">连接中</strong></span>
+                  <span class="capture-time">00:00</span>
+                </div>
+                <canvas id="waveform" aria-hidden="true"></canvas>
               </div>
-              <div class="capture-readout"><strong class="capture-state">连接中</strong><span class="capture-time">00:00</span></div>
             </div>
           </section>
           <aside class="member-panel" aria-label="房间成员">
@@ -245,25 +305,8 @@ export class TranslatorPage implements Page {
     this.root.querySelector('.room-back')?.addEventListener('click', this.onRooms);
     this.root.querySelector('.record-button')?.addEventListener('click', () =>
       void this.voiceSession?.toggleRecording().catch((error) =>
-        this.onError(error instanceof Error ? error.message : '无法访问麦克风'),
+        this.onError(error instanceof Error ? error.message : '无法启动录音'),
       ),
-    );
-    this.root.querySelector<HTMLInputElement>('.capture-noise-suppression')?.addEventListener('change', (event) => {
-      const preferences = loadPreferences(this.userId);
-      savePreferences(this.userId, {
-        ...preferences,
-        noiseSuppression: (event.currentTarget as HTMLInputElement).checked,
-      });
-    });
-    this.root.querySelector<HTMLInputElement>('.capture-echo-cancellation')?.addEventListener('change', (event) => {
-      const preferences = loadPreferences(this.userId);
-      savePreferences(this.userId, {
-        ...preferences,
-        echoCancellation: (event.currentTarget as HTMLInputElement).checked,
-      });
-    });
-    this.root.querySelector('.language-config-button')?.addEventListener('click', () =>
-      this.languageDialog?.open(this.sourceLanguage, this.targetLanguage),
     );
     this.root.querySelector('.refresh-history')?.addEventListener('click', () => void this.loadHistory());
     this.root.querySelector('.open-subtitles')?.addEventListener('click', () =>
@@ -271,7 +314,9 @@ export class TranslatorPage implements Page {
     );
     this.root.querySelector<HTMLFormElement>('.record-search')?.addEventListener('submit', (event) => {
       event.preventDefault();
-      void this.loadHistory(this.root?.querySelector<HTMLInputElement>('.record-search input')?.value ?? '');
+      const query = this.root?.querySelector<HTMLInputElement>('.record-search input')?.value ?? '';
+      translatorViewStates.set(this.roomId, { query, scrollTop: 0 });
+      void this.loadHistory(query);
     });
     this.root.querySelector('.edit-room')?.addEventListener('click', () => {
       if (this.room) this.roomEditor?.open(this.room);
@@ -290,6 +335,30 @@ export class TranslatorPage implements Page {
       voice: this.voice,
       max_utterance_seconds: this.maxUtteranceSeconds,
     };
+  }
+
+  private captureOptionValues(): CaptureOptionValues {
+    return {
+      microphone: this.microphoneCapture,
+      systemAudio: this.systemAudioCapture,
+      noiseSuppression: this.noiseSuppression,
+      echoCancellation: this.echoCancellation,
+    };
+  }
+
+  private updateCaptureOptions(values: CaptureOptionValues) {
+    this.microphoneCapture = values.microphone;
+    this.systemAudioCapture = values.systemAudio;
+    this.noiseSuppression = values.noiseSuppression;
+    this.echoCancellation = values.echoCancellation;
+    savePreferences(this.userId, {
+      ...loadPreferences(this.userId),
+      microphoneCapture: values.microphone,
+      systemAudioCapture: values.systemAudio,
+      noiseSuppression: values.noiseSuppression,
+      echoCancellation: values.echoCancellation,
+    });
+    this.syncRecordButton();
   }
 
   private handleEvent(event: ServerEvent) {
@@ -339,9 +408,11 @@ export class TranslatorPage implements Page {
           },
           true,
         );
+        this.ensureAndroidCaption(event.utterance_id);
         break;
       case 'utterance_discarded':
         this.conversation?.removeUtterance(event.utterance_id);
+        this.removeAndroidCaption(event.utterance_id);
         break;
       case 'utterance_speakers':
         this.conversation?.applySpeakers(event.utterance_id, event.speakers);
@@ -354,18 +425,26 @@ export class TranslatorPage implements Page {
         break;
       case 'transcript':
         this.conversation?.upsertTranscript(event, false);
+        this.setAndroidCaption(event.utterance_id, 'source', event.text);
         break;
       case 'transcript_delta':
         this.conversation?.applyTranscriptDelta(event);
+        this.setAndroidCaption(event.utterance_id, 'source', event.text);
         break;
       case 'transcript_refinement':
         this.conversation?.applyRefinement(event);
+        if (event.status === 'completed' && event.text) {
+          this.setAndroidCaption(event.utterance_id, 'source', event.text);
+        }
         break;
       case 'translation_delta':
         this.conversation?.applyTranslationDelta(event);
+        this.setAndroidCaption(event.utterance_id, 'translation', event.text);
         break;
       case 'translation':
         this.conversation?.applyTranslation(event);
+        this.setAndroidCaption(event.utterance_id, 'source', event.source_text);
+        this.setAndroidCaption(event.utterance_id, 'translation', event.translated_text);
         break;
       case 'media':
         this.conversation?.applyMedia(event);
@@ -391,9 +470,10 @@ export class TranslatorPage implements Page {
       synthesizing: '生成语音',
       playing: '正在播报',
     };
-    if (!this.recording || phase === 'listening' || phase === 'speech') {
-      this.root!.querySelector('.capture-state')!.textContent =
-        this.recording && phase === 'listening' ? '持续聆听' : labels[phase];
+    if (this.recording) {
+      this.setCaptureStatus(phase === 'speech' ? labels.speech : '持续聆听', 'recording');
+    } else {
+      this.setCaptureStatus(labels[phase], phase === 'listening' || phase === 'speech' ? 'recording' : 'processing');
     }
     this.monitor?.setPhase(phase);
   }
@@ -402,14 +482,10 @@ export class TranslatorPage implements Page {
     this.connectionStatus = status;
     this.onConnection(!this.canPublish && status === 'connected' ? 'viewer' : status);
     if (!this.root) return;
-    this.root.querySelector<HTMLButtonElement>('.record-button')!.disabled =
-      !this.canPublish || status !== 'connected';
-    if (status === 'connected') {
-      this.root.querySelector('.capture-state')!.textContent = this.canPublish ? '就绪' : '已被禁言';
-    } else {
-      this.root.querySelector('.capture-state')!.textContent =
-        status === 'connecting' ? '连接实时会话' : '连接已中断';
-    }
+    this.syncRecordButton();
+    if (this.recording) return;
+    if (status === 'connected') this.setCaptureStatus(this.canPublish ? '可以开始录音' : '已被禁言', this.canPublish ? 'ready' : 'neutral');
+    else this.setCaptureStatus(status === 'connecting' ? '连接实时会话' : '连接已中断', 'processing');
   }
 
   private setRecording(recording: boolean) {
@@ -417,32 +493,12 @@ export class TranslatorPage implements Page {
     this.recording = recording;
     const button = this.root.querySelector<HTMLButtonElement>('.record-button')!;
     const console = this.root.querySelector<HTMLElement>('.capture-console')!;
-    const badge = this.root.querySelector<HTMLElement>('.capture-session-badge')!;
     button.classList.toggle('recording', recording);
-    this.root.querySelectorAll<HTMLInputElement>('.capture-processing-option input').forEach((toggle) => {
-      toggle.disabled = recording;
-    });
+    this.captureOptions?.setRecording(recording);
     console.classList.toggle('is-recording', recording);
-    badge.classList.toggle('active', recording);
     this.root.querySelector('.translator-page')?.classList.toggle('is-recording', recording);
-    this.root.querySelector('.session-badge-text')!.textContent = recording
-      ? '连续录音中'
-      : this.canPublish
-        ? '等待录音'
-        : '已被禁言';
-    this.root.querySelector('.capture-state')!.textContent = recording
-      ? '持续聆听'
-      : this.canPublish
-        ? '就绪'
-        : '已被禁言';
-    button.innerHTML = `<i data-lucide="${recording ? 'circle-stop' : 'mic'}"></i>`;
-    button.title = recording ? '停止录音' : '开始录音';
-    button.ariaLabel = button.title;
-    this.root.querySelector('.record-button-copy')!.textContent = button.title;
-    this.root.querySelectorAll('.capture-processing-copy small').forEach((description) => {
-      description.textContent = recording ? '停止后可切换' : '下次录音生效';
-    });
-    refreshIcons(button);
+    this.setCaptureStatus(recording ? '持续聆听' : this.canPublish ? '可以开始录音' : '已被禁言', recording ? 'recording' : this.canPublish ? 'ready' : 'neutral');
+    this.syncRecordButton();
     window.clearInterval(this.timer);
     if (recording) {
       this.startedAt = Date.now();
@@ -452,10 +508,51 @@ export class TranslatorPage implements Page {
     }
   }
 
+  private syncRecordButton() {
+    if (!this.root) return;
+    const button = this.root.querySelector<HTMLButtonElement>('.record-button');
+    const copy = this.root.querySelector<HTMLElement>('.record-button-copy');
+    if (!button || !copy) return;
+    const visibleOptions = this.captureOptions?.values();
+    const microphone = visibleOptions?.microphone ?? this.microphoneCapture;
+    const systemAudio = visibleOptions?.systemAudio ?? this.systemAudioCapture;
+    const hasSource = microphone || systemAudio;
+    const mode = microphone && systemAudio
+      ? '混合录音'
+      : systemAudio
+        ? '系统内录'
+        : '麦克风录音';
+    const title = this.recording ? '停止录音' : hasSource ? `开始${mode}` : '选择音频来源';
+    const icon = this.recording
+      ? 'circle-stop'
+      : microphone && systemAudio
+        ? 'audio-lines'
+        : systemAudio
+          ? 'volume-2'
+          : microphone
+            ? 'mic'
+            : 'mic-off';
+    button.disabled = !this.recording && (!hasSource || !this.canPublish);
+    button.innerHTML = `<i data-lucide="${icon}"></i>`;
+    button.title = title;
+    button.ariaLabel = title;
+    copy.textContent = title;
+    refreshIcons(button);
+  }
+
   private updateTimer() {
     const seconds = Math.floor((Date.now() - this.startedAt) / 1000);
     this.root!.querySelector('.capture-time')!.textContent =
       `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+  }
+
+  private setCaptureStatus(label: string, tone: 'ready' | 'recording' | 'processing' | 'neutral') {
+    if (!this.root) return;
+    const readout = this.root.querySelector<HTMLElement>('.capture-readout');
+    const state = this.root.querySelector<HTMLElement>('.capture-state');
+    if (!readout || !state) return;
+    readout.dataset.tone = tone;
+    state.textContent = label;
   }
 
   private async persistLanguages(source: string, target: string) {
@@ -478,6 +575,16 @@ export class TranslatorPage implements Page {
 
   private async openSubtitleDisplay() {
     const path = `/rooms/${this.roomId}/subtitles`;
+    if (isAndroidNativeShell()) {
+      try {
+        await showAndroidSubtitleOverlay(this.androidSubtitlePayload());
+        this.androidOverlayActive = true;
+        this.pushAndroidSubtitle();
+      } catch (error) {
+        this.onError(error instanceof Error ? error.message : '无法创建字幕悬浮窗');
+      }
+      return;
+    }
     if (!this.isAppShell) {
       const display = window.open(
         path,
@@ -501,6 +608,50 @@ export class TranslatorPage implements Page {
     } catch (error) {
       this.onError(error instanceof Error ? error.message : '无法创建字幕悬浮窗');
     }
+  }
+
+  private ensureAndroidCaption(id: string) {
+    let caption = this.androidCaptions.get(id);
+    if (!caption) {
+      caption = { source: '', translation: '' };
+      this.androidCaptions.set(id, caption);
+      this.androidCaptionOrder = [...this.androidCaptionOrder.filter((item) => item !== id), id].slice(-3);
+    }
+    return caption;
+  }
+
+  private setAndroidCaption(id: string, kind: 'source' | 'translation', text: string) {
+    this.ensureAndroidCaption(id)[kind] = text;
+    this.pushAndroidSubtitle();
+  }
+
+  private removeAndroidCaption(id: string) {
+    this.androidCaptions.delete(id);
+    this.androidCaptionOrder = this.androidCaptionOrder.filter((item) => item !== id);
+    this.pushAndroidSubtitle();
+  }
+
+  private androidSubtitlePayload(): AndroidSubtitlePayload {
+    const latest = [...this.androidCaptionOrder]
+      .reverse()
+      .map((id) => this.androidCaptions.get(id))
+      .find((caption) => caption?.source || caption?.translation);
+    const preferences = loadSubtitlePreferences(this.userId);
+    return {
+      roomId: this.roomId,
+      roomName: this.room?.name ?? '实时字幕',
+      source: latest?.source ?? '',
+      translation: latest?.translation ?? '',
+      sourceVisible: preferences.displayMode !== 'translation',
+      translationVisible: preferences.displayMode !== 'source',
+      backgroundColor: preferences.backgroundColor,
+      sourceColor: preferences.sourceColor,
+      translationColor: preferences.translationColor,
+    };
+  }
+
+  private pushAndroidSubtitle() {
+    if (this.androidOverlayActive) updateAndroidSubtitleOverlay(this.androidSubtitlePayload());
   }
 
   private async loadHistory(search = '') {
@@ -563,27 +714,25 @@ export class TranslatorPage implements Page {
   }
 
   private updateLanguageButton() {
-    if (!this.root) return;
-    this.root.querySelector('.language-source-label')!.textContent =
-      languageNames[this.sourceLanguage] ?? this.sourceLanguage;
-    this.root.querySelector('.language-target-label')!.textContent =
-      languageNames[this.targetLanguage] ?? this.targetLanguage;
+    this.captureOptions?.setLanguages(
+      languageNames[this.sourceLanguage] ?? this.sourceLanguage,
+      languageNames[this.targetLanguage] ?? this.targetLanguage,
+      Boolean(this.room?.is_owner),
+    );
   }
 
   private updatePublishPermission(canPublish: boolean) {
     this.canPublish = canPublish;
     this.voiceSession?.setCanPublish(canPublish);
     if (!this.root) return;
-    const button = this.root.querySelector<HTMLButtonElement>('.record-button')!;
-    button.disabled = !canPublish || this.connectionStatus !== 'connected';
+    this.syncRecordButton();
     const role = this.root.querySelector<HTMLElement>('.room-role');
     if (role && !this.room?.is_owner) {
       role.textContent = canPublish ? '成员发言' : '已被禁言';
       role.classList.toggle('muted', !canPublish);
     }
     if (!this.recording && this.connectionStatus === 'connected') {
-      this.root.querySelector('.capture-state')!.textContent = canPublish ? '就绪' : '已被禁言';
-      this.root.querySelector('.session-badge-text')!.textContent = canPublish ? '等待录音' : '已被禁言';
+      this.setCaptureStatus(canPublish ? '可以开始录音' : '已被禁言', canPublish ? 'ready' : 'neutral');
     }
   }
 

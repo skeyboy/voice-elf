@@ -180,6 +180,10 @@ async fn main() -> Result<()> {
             HeaderName::from_static("cross-origin-opener-policy"),
             HeaderValue::from_static("same-origin"),
         ))
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("permissions-policy"),
+            HeaderValue::from_static("microphone=(self), display-capture=(self)"),
+        ))
         .layer(CookieManagerLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state);

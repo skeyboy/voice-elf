@@ -1,8 +1,14 @@
-import { MicrophoneCapture, PcmPlayer, Waveform, type VadBoundary } from '../audio';
+import {
+  AudioCapture,
+  PcmPlayer,
+  Waveform,
+  type AudioCaptureOptions,
+  type VadBoundary,
+} from '../audio';
 import type { ServerEvent, SessionConfig } from '../protocol';
 import type { ConnectionStatus } from '../components/topbar';
 
-const MIN_VALID_SPEECH_FRAMES = 10;
+const MIN_VALID_SPEECH_FRAMES = 3;
 const PLAYBACK_TAIL_GUARD_MS = 300;
 
 interface VoiceSessionCallbacks {
@@ -13,7 +19,7 @@ interface VoiceSessionCallbacks {
 }
 
 export class VoiceSession {
-  private readonly microphone = new MicrophoneCapture();
+  private readonly audioCapture = new AudioCapture();
   private readonly waveform: Waveform;
   private socket: WebSocket | null = null;
   private socketVersion = 0;
@@ -39,8 +45,7 @@ export class VoiceSession {
     private readonly player: PcmPlayer,
     private readonly config: () => SessionConfig,
     private readonly enhancedVoiceFilter: () => boolean,
-    private readonly noiseSuppression: () => boolean,
-    private readonly echoCancellation: () => boolean,
+    private readonly captureOptions: () => AudioCaptureOptions,
     private readonly callbacks: VoiceSessionCallbacks,
   ) {
     this.waveform = new Waveform(canvas);
@@ -84,7 +89,12 @@ export class VoiceSession {
   async toggleRecording() {
     if (!this.canPublish) return;
     if (this.recording) await this.stopRecording();
-    else await this.startRecording();
+    else {
+      if (this.socket?.readyState !== WebSocket.OPEN) {
+        throw new Error('实时会话尚未连接，请稍后重试');
+      }
+      await this.startRecording();
+    }
   }
 
   setMuted(muted: boolean) {
@@ -104,7 +114,7 @@ export class VoiceSession {
     this.playbackReleaseTimers.clear();
     this.playbackHolds.clear();
     this.disconnect();
-    this.microphone.dispose();
+    this.audioCapture.dispose();
     this.waveform.destroy();
   }
 
@@ -120,18 +130,16 @@ export class VoiceSession {
 
   private async startRecording() {
     if (!this.canPublish) return;
-    if (this.socket?.readyState !== WebSocket.OPEN) return;
-    await this.player.unlock();
     this.activeEnhancedVoiceFilter = this.enhancedVoiceFilter();
     this.activeTcId = null;
     this.activeSampleCount = 0;
     this.segmentsStarted = 0;
     try {
-      await this.microphone.start(
+      // getDisplayMedia must be invoked before any awaited work consumes the click gesture.
+      const capture = this.audioCapture.start(
         this.config().max_utterance_seconds,
         this.activeEnhancedVoiceFilter,
-        this.noiseSuppression(),
-        this.echoCancellation(),
+        this.captureOptions(),
         (pcm) => {
           if (this.activeTcId && this.socket?.readyState === WebSocket.OPEN) {
             this.socket.send(pcm);
@@ -145,6 +153,8 @@ export class VoiceSession {
         },
         (error) => void this.handleCaptureFailure(error),
       );
+      const playbackUnlock = this.player.unlock();
+      await Promise.all([capture, playbackUnlock]);
     } catch (error) {
       throw error;
     }
@@ -157,7 +167,7 @@ export class VoiceSession {
   private async stopRecording() {
     this.recording = false;
     this.syncPlaybackSuppression();
-    await this.microphone.stop();
+    await this.audioCapture.stop();
     if (this.activeTcId) {
       this.finishVadSegment('manual');
     }
@@ -258,7 +268,7 @@ export class VoiceSession {
   }
 
   private syncPlaybackSuppression() {
-    this.microphone.setSuppressed(this.recording && this.playbackHolds.size > 0);
+    this.audioCapture.setSuppressed(this.recording && this.playbackHolds.size > 0);
   }
 
   private handleMessage(message: MessageEvent) {

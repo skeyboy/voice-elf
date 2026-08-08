@@ -7,10 +7,12 @@
     type SetupStatus,
   } from '../../api';
   import { refreshIcons } from '../../components/icons';
+  import { loadAppConfig, saveAppConfig } from '../../app-config';
   import {
     loadAuthorization,
     loadSetup,
     resetSession,
+    setupConnectionError,
     systemSetup,
   } from '$lib/session';
 
@@ -29,10 +31,19 @@
   let passwordConfirmation = '';
   let error = '';
   let submitting = false;
+  let appConfigAvailable = false;
+  let appApiUrl = '';
+  let appConfigStatus = '';
+  let savingAppConfig = false;
 
   onMount(() => {
     publicUrl = window.location.origin;
     if (!$systemSetup) void loadSetup();
+    void loadAppConfig().then((config) => {
+      if (!config) return;
+      appConfigAvailable = true;
+      appApiUrl = config.api_url;
+    });
   });
 
   afterUpdate(() => {
@@ -93,6 +104,28 @@
   function modeLabel(mode: SetupStatus['deployment_mode']) {
     return mode === 'bus' ? '授权总线' : mode === 'tenant' ? '租户自建服务' : '独立运行';
   }
+
+  async function saveServerAndRetry() {
+    appConfigStatus = '';
+    const apiUrl = appApiUrl.trim();
+    if (!apiUrl) {
+      appConfigStatus = '请输入 API 地址';
+      return;
+    }
+    savingAppConfig = true;
+    try {
+      const saved = await saveAppConfig(apiUrl);
+      appApiUrl = saved.api_url;
+      appConfigStatus = '地址已保存，正在重新连接';
+      const setup = await loadSetup(true);
+      if (setup.initialized) await loadAuthorization(true);
+      if ($setupConnectionError) appConfigStatus = $setupConnectionError;
+    } catch (reason) {
+      appConfigStatus = reason instanceof Error ? reason.message : '无法保存 API 地址';
+    } finally {
+      savingAppConfig = false;
+    }
+  }
 </script>
 
 <svelte:head>
@@ -129,7 +162,24 @@
         <div class="setup-content">
           {#if step === 0}
             <section class="setup-environment" aria-label="部署环境">
-              <p>确认服务端运行条件后，继续创建系统资料和首个管理员。</p>
+              <p>{$setupConnectionError ? '当前无法连接 Voice Elf 服务，请检查服务地址后重试。' : '确认服务端运行条件后，继续创建系统资料和首个管理员。'}</p>
+              {#if $setupConnectionError && appConfigAvailable}
+                <div class="setup-server-recovery" role="alert">
+                  <div>
+                    <i data-lucide="server-off"></i>
+                    <span><strong>服务连接失败</strong><small>{$setupConnectionError}</small></span>
+                  </div>
+                  <label>
+                    <span>API 地址</span>
+                    <input bind:value={appApiUrl} type="url" inputmode="url" autocomplete="url" autocapitalize="none" spellcheck="false" placeholder="http://192.168.1.4:3001">
+                  </label>
+                  <button type="button" class="button-primary" disabled={savingAppConfig} on:click={saveServerAndRetry}>
+                    <i data-lucide={savingAppConfig ? 'loader-circle' : 'refresh-cw'}></i>
+                    <span>{savingAppConfig ? '正在连接' : '保存并重试'}</span>
+                  </button>
+                  {#if appConfigStatus}<p class:error={$setupConnectionError}>{appConfigStatus}</p>{/if}
+                </div>
+              {/if}
               <dl>
                 <div class:ready={$systemSetup.database_ready}>
                   <dt><i data-lucide="database"></i><span>PostgreSQL</span></dt>
@@ -152,7 +202,7 @@
                   <dd>{$systemSetup.email_ready ? 'SMTP 已配置' : '尚未配置，可稍后启用'}</dd>
                 </div>
               </dl>
-              {#if !$systemSetup.initialization_allowed}
+              {#if !$systemSetup.initialization_allowed && !$setupConnectionError}
                 <div class="setup-blocker" role="alert">
                   <i data-lucide="triangle-alert"></i>
                   <span>请先在服务端完成数据库与授权配置，然后重新检查。</span>

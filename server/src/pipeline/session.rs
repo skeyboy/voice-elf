@@ -26,8 +26,8 @@ use super::{
 
 const CLIENT_FRAME_SAMPLES: usize = 512;
 const CLIENT_PRE_ROLL_SAMPLES: usize = CLIENT_FRAME_SAMPLES * 32;
-const MIN_CLIENT_UTTERANCE_SAMPLES: usize = INPUT_SAMPLE_RATE as usize / 5;
-const MIN_CLIENT_SPEECH_FRAMES: usize = 10;
+const MIN_CLIENT_SPEECH_FRAMES: usize = 3;
+const MIN_CLIENT_UTTERANCE_SAMPLES: usize = CLIENT_FRAME_SAMPLES * MIN_CLIENT_SPEECH_FRAMES;
 
 struct ActiveSegment {
     tc_id: Uuid,
@@ -420,7 +420,7 @@ async fn finish_segment(
         let reason = if is_silent_vad {
             "VAD 判定为静音，分段未进入识别"
         } else if segment.audio.len() < MIN_CLIENT_UTTERANCE_SAMPLES {
-            "有效语音不足 200ms，分段未进入识别"
+            "有效语音不足 96ms，分段未进入识别"
         } else {
             tracing::info!(
                 tc_id = %segment.tc_id,

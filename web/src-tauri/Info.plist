@@ -4,6 +4,10 @@
 <dict>
   <key>NSMicrophoneUsageDescription</key>
   <string>Voice Elf uses the microphone to capture speech for realtime translation.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Voice Elf captures audio from a screen, window, or app you choose for realtime translation.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Voice Elf captures system audio you explicitly choose for realtime translation.</string>
   <key>NSAppTransportSecurity</key>
   <dict>
     <key>NSAllowsLocalNetworking</key>

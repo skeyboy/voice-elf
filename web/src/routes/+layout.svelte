@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { goto } from '$app/navigation';
+  import { afterNavigate, beforeNavigate, goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
   import TopBarHost from '$lib/TopBarHost.svelte';
@@ -18,6 +18,39 @@
   } from '$lib/session';
   import '../styles/index.css';
 
+  let routeNavigating = false;
+  let routeDestination = '';
+  let navigationTimer = 0;
+  const routeScrollPositions = new Map<string, number>();
+
+  beforeNavigate(({ from, to }) => {
+    if (!to?.url || from?.url.pathname === to.url.pathname) return;
+    if (from?.url) routeScrollPositions.set(from.url.pathname, window.scrollY);
+    window.clearTimeout(navigationTimer);
+    routeDestination = routeLabel(to.url.pathname);
+    routeNavigating = true;
+  });
+
+  afterNavigate(({ to }) => {
+    if (to?.url) {
+      const scrollTop = routeScrollPositions.get(to.url.pathname);
+      if (scrollTop !== undefined) requestAnimationFrame(() => window.scrollTo({ top: scrollTop }));
+    }
+    navigationTimer = window.setTimeout(() => {
+      routeNavigating = false;
+    }, 180);
+  });
+
+  function routeLabel(pathname: string) {
+    if (pathname === '/rooms') return '会议目录';
+    if (pathname.startsWith('/rooms/') && pathname.endsWith('/subtitles')) return '字幕大屏';
+    if (pathname.startsWith('/rooms/')) return '实时会话';
+    if (pathname === '/admin') return '系统管理';
+    if (pathname === '/me' || pathname === '/settings') return '个人设置';
+    if (pathname === '/login') return '登录';
+    return '页面';
+  }
+
   const refreshAuthorization = async (force = false) => {
     const authorization = await loadAuthorization(force);
     if (authorization.allowed) void loadSession();
@@ -25,6 +58,7 @@
   };
 
   onMount(() => {
+    document.getElementById('voice-elf-boot')?.remove();
     const cancelVadPreload = scheduleVadPreload();
     void loadSetup().then((setup) => {
       if (setup.initialized) void refreshAuthorization();
@@ -74,6 +108,7 @@
     return () => {
       cancelVadPreload();
       window.clearTimeout(quitPromptTimer);
+      window.clearTimeout(navigationTimer);
       window.clearInterval(authorizationTimer);
       window.removeEventListener('voice-elf:native-quit-requested', handleQuitRequest);
       window.removeEventListener('voice-elf:native-toast', handleNativeToast);
@@ -100,8 +135,10 @@
 {#if !$systemSetup}
   <main class="license-state-page">
     <section class="license-state-panel license-state-loading" aria-live="polite">
-      <span class="license-state-icon" aria-hidden="true">...</span>
+      <span class="license-state-icon" aria-hidden="true"><i></i></span>
       <h1>正在检查系统状态</h1>
+      <small>连接本地服务并读取部署信息</small>
+      <span class="initialization-progress" aria-hidden="true"><i></i></span>
     </section>
   </main>
 {:else if !$systemSetup.initialized}
@@ -110,16 +147,20 @@
   {:else}
     <main class="license-state-page">
       <section class="license-state-panel license-state-loading" aria-live="polite">
-        <span class="license-state-icon" aria-hidden="true">...</span>
+        <span class="license-state-icon" aria-hidden="true"><i></i></span>
         <h1>正在进入初始化向导</h1>
+        <small>准备首次运行配置</small>
+        <span class="initialization-progress" aria-hidden="true"><i></i></span>
       </section>
     </main>
   {/if}
 {:else if !$instanceAuthorization}
   <main class="license-state-page">
     <section class="license-state-panel license-state-loading" aria-live="polite">
-      <span class="license-state-icon" aria-hidden="true">...</span>
+      <span class="license-state-icon" aria-hidden="true"><i></i></span>
       <h1>正在验证实例</h1>
+      <small>确认授权与服务可用状态</small>
+      <span class="initialization-progress" aria-hidden="true"><i></i></span>
     </section>
   </main>
 {:else if !$instanceAuthorization.allowed}
@@ -152,5 +193,11 @@
     />
   {/if}
   <slot />
+{/if}
+{#if routeNavigating}
+  <div class="route-transition-status" role="status" aria-live="polite">
+    <span aria-hidden="true"></span>
+    <strong>正在打开{routeDestination}</strong>
+  </div>
 {/if}
 <ToastRegion />

@@ -2,6 +2,8 @@ export interface PlaybackPreferences {
   voice: string;
   autoplay: boolean;
   enhancedVoiceFilter: boolean;
+  microphoneCapture: boolean;
+  systemAudioCapture: boolean;
   noiseSuppression: boolean;
   echoCancellation: boolean;
 }
@@ -14,6 +16,8 @@ const defaults: PlaybackPreferences = {
   voice: 'F1',
   autoplay: false,
   enhancedVoiceFilter: true,
+  microphoneCapture: true,
+  systemAudioCapture: false,
   noiseSuppression: true,
   echoCancellation: true,
 };
@@ -48,6 +52,14 @@ function normalize(stored: StoredPlaybackPreferences): PlaybackPreferences {
       typeof stored.enhancedVoiceFilter === 'boolean'
         ? stored.enhancedVoiceFilter
         : defaults.enhancedVoiceFilter,
+    microphoneCapture:
+      typeof stored.microphoneCapture === 'boolean'
+        ? stored.microphoneCapture
+        : defaults.microphoneCapture,
+    systemAudioCapture:
+      typeof stored.systemAudioCapture === 'boolean'
+        ? stored.systemAudioCapture
+        : defaults.systemAudioCapture,
     noiseSuppression:
       typeof stored.noiseSuppression === 'boolean'
         ? stored.noiseSuppression

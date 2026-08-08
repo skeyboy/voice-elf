@@ -11,7 +11,8 @@ const VOICE_HIGHPASS_HZ: f64 = 90.0;
 const MIN_AUDIBLE_FRAME_RMS: f32 = 0.01;
 const MIN_SPEECH_ZERO_CROSSING_RATE: f32 = 0.015;
 const MAX_SPEECH_ZERO_CROSSING_RATE: f32 = 0.32;
-const MIN_AUDIBLE_SPEECH_FRAMES: u32 = 12;
+// 3 * 32 ms is long enough to reject isolated impulses but keeps short replies.
+const MIN_AUDIBLE_SPEECH_FRAMES: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Biquad {
@@ -210,6 +211,17 @@ mod tests {
             quality.observe(&frame);
         }
         assert!(quality.accepts_asr(), "{}", quality.summary());
+    }
+
+    #[test]
+    fn accepts_brief_audible_speech_shaped_audio() {
+        let samples = (0..QUALITY_FRAME_SAMPLES * MIN_AUDIBLE_SPEECH_FRAMES as usize)
+            .map(|index| {
+                let phase = index as f32 * 2.0 * std::f32::consts::PI * 220.0 / 16_000.0;
+                (phase.sin() * 1_200.0) as i16
+            })
+            .collect::<Vec<_>>();
+        assert!(assess_speech_quality(&samples).accepts_asr());
     }
 
     #[test]

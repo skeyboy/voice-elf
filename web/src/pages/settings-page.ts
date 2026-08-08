@@ -191,6 +191,7 @@ export class SettingsPage implements Page {
     };
     const persist = () => {
       savePreferences(this.user.id, {
+        ...loadPreferences(this.user.id),
         voice: voice.value,
         autoplay: autoplay.checked,
         enhancedVoiceFilter: enhancedVoiceFilter.checked,

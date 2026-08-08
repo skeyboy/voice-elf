@@ -3,6 +3,7 @@ use std::{
     net::TcpListener as StdTcpListener,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -32,6 +33,7 @@ use tower_http::{compression::CompressionLayer, set_header::SetResponseHeaderLay
 use url::Url;
 
 const DEFAULT_UPSTREAM: &str = "http://192.168.0.63:3001";
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_PROXY_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const SETTINGS_FILE: &str = "app-settings.json";
 
@@ -107,6 +109,7 @@ pub(crate) fn start(app_handle: AppHandle, config_dir: PathBuf) -> Result<Server
     let state = ServerState {
         client: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
             .build()
             .context("failed to create the application proxy client")?,
         upstream: Arc::new(RwLock::new(upstream)),
@@ -223,6 +226,10 @@ fn router(state: ServerState) -> Router {
         .layer(SetResponseHeaderLayer::overriding(
             HeaderName::from_static("cross-origin-opener-policy"),
             HeaderValue::from_static("same-origin"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("permissions-policy"),
+            HeaderValue::from_static("microphone=(self), display-capture=(self)"),
         ))
         .with_state(state)
 }
@@ -793,7 +800,10 @@ mod tests {
 
     #[test]
     fn embedded_assets_include_the_spa_and_wasm() {
-        assert!(WebAssets::get("index.html").is_some());
+        let index = WebAssets::get("index.html").expect("embedded web index");
+        let index = String::from_utf8_lossy(index.data.as_ref());
+        assert!(index.contains("voice-elf-boot"));
+        assert!(index.contains("正在启动 Voice Elf"));
         assert!(WebAssets::get("wasm/manifest.json").is_some());
     }
 

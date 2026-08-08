@@ -9,6 +9,7 @@ export default defineConfig({
         server.middlewares.use((request, response, next) => {
           response.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
           response.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+          response.setHeader('Permissions-Policy', 'microphone=(self), display-capture=(self)');
           setVadCacheHeaders(request.url, response);
           next();
         });
@@ -17,6 +18,7 @@ export default defineConfig({
         server.middlewares.use((request, response, next) => {
           response.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
           response.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+          response.setHeader('Permissions-Policy', 'microphone=(self), display-capture=(self)');
           setVadCacheHeaders(request.url, response);
           next();
         });

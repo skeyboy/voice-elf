@@ -7,7 +7,17 @@ import type { Page } from './page';
 type MeetingScope = 'all' | 'owned' | 'joined';
 type DurationFilter = 'all' | 'short' | 'medium' | 'long';
 
+interface RoomsViewState {
+  scope: MeetingScope;
+  duration: DurationFilter;
+  query: string;
+  dateFrom: string;
+  dateTo: string;
+  scrollTop: number;
+}
+
 const MINUTE_MS = 60_000;
+const roomsViewStates = new Map<string, RoomsViewState>();
 
 export class RoomsPage implements Page {
   private root: HTMLElement | null = null;
@@ -23,7 +33,15 @@ export class RoomsPage implements Page {
     private readonly user: User,
     private readonly onSelect: (roomId: string) => void,
     private readonly onError: (message: string) => void,
-  ) {}
+  ) {
+    const saved = roomsViewStates.get(user.id);
+    if (!saved) return;
+    this.scope = saved.scope;
+    this.duration = saved.duration;
+    this.query = saved.query;
+    this.dateFrom = saved.dateFrom;
+    this.dateTo = saved.dateTo;
+  }
 
   async mount(root: HTMLElement) {
     this.root = root;
@@ -83,7 +101,12 @@ export class RoomsPage implements Page {
               <button type="button" data-scope="joined">我参加的</button>
             </div>
           </div>
-          <div class="meeting-list" aria-live="polite" aria-busy="true"></div>
+          <div class="meeting-list" aria-live="polite" aria-busy="true">
+            <div class="meeting-list-loading" role="status">
+              <span>正在同步会议</span>
+              <i></i><i></i><i></i>
+            </div>
+          </div>
         </section>
       </main>
     `;
@@ -115,11 +138,13 @@ export class RoomsPage implements Page {
       this.render();
     });
     root.querySelector('.reset-meeting-filters')?.addEventListener('click', () => this.resetFilters());
+    this.restoreControls();
     refreshIcons(root);
     await this.load();
   }
 
   destroy() {
+    this.persistState(window.scrollY);
     this.editor?.destroy();
     this.editor = null;
     this.root = null;
@@ -132,9 +157,11 @@ export class RoomsPage implements Page {
     try {
       this.rooms = await apiRequest<RoomSummary[]>('/api/rooms');
       this.render();
+      this.restoreScroll();
     } catch (error) {
       list.setAttribute('aria-busy', 'false');
       this.onError(error instanceof Error ? error.message : '无法加载会议');
+      this.restoreScroll();
     }
   }
 
@@ -147,6 +174,36 @@ export class RoomsPage implements Page {
     this.dateTo = '';
     this.root.querySelector<HTMLFormElement>('.meeting-filters')?.reset();
     this.render();
+  }
+
+  private restoreControls() {
+    if (!this.root) return;
+    this.root.querySelector<HTMLInputElement>('[name="query"]')!.value = this.query;
+    this.root.querySelector<HTMLInputElement>('[name="date_from"]')!.value = this.dateFrom;
+    this.root.querySelector<HTMLInputElement>('[name="date_to"]')!.value = this.dateTo;
+    this.root.querySelector<HTMLSelectElement>('[name="duration"]')!.value = this.duration;
+    this.root.querySelectorAll<HTMLButtonElement>('[data-scope]').forEach((button) => {
+      const active = button.dataset.scope === this.scope;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+  }
+
+  private persistState(scrollTop = roomsViewStates.get(this.user.id)?.scrollTop ?? 0) {
+    roomsViewStates.set(this.user.id, {
+      scope: this.scope,
+      duration: this.duration,
+      query: this.query,
+      dateFrom: this.dateFrom,
+      dateTo: this.dateTo,
+      scrollTop,
+    });
+  }
+
+  private restoreScroll() {
+    const scrollTop = roomsViewStates.get(this.user.id)?.scrollTop;
+    if (!scrollTop) return;
+    requestAnimationFrame(() => window.scrollTo({ top: scrollTop }));
   }
 
   private filteredRooms() {
@@ -180,6 +237,7 @@ export class RoomsPage implements Page {
 
   private render() {
     if (!this.root) return;
+    this.persistState();
     const owned = this.rooms.filter((room) => room.is_owner).length;
     const joined = this.rooms.length - owned;
     this.root.querySelector<HTMLElement>('[data-stat="all"]')!.textContent = String(this.rooms.length);
