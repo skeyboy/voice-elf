@@ -193,6 +193,27 @@ function processSamples(payload) {
   drainFrames();
 }
 
+function processAndroidPcm(payload) {
+  if (typeof payload !== 'string' || payload.length === 0) {
+    throw new Error('Android PCM payload is invalid');
+  }
+  const binary = atob(payload);
+  if (binary.length % 2 !== 0) throw new Error('Android PCM16 payload is misaligned');
+  const samplesPerBatch = Math.max(1, inputCapacity);
+  const pcmSamples = binary.length / 2;
+  for (let offset = 0; offset < pcmSamples; offset += samplesPerBatch) {
+    const count = Math.min(samplesPerBatch, pcmSamples - offset);
+    const samples = new Float32Array(count);
+    for (let index = 0; index < count; index += 1) {
+      const byteOffset = (offset + index) * 2;
+      let value = binary.charCodeAt(byteOffset) | (binary.charCodeAt(byteOffset + 1) << 8);
+      if (value >= 0x8000) value -= 0x10000;
+      samples[index] = value / 32768;
+    }
+    processSamples(samples.buffer);
+  }
+}
+
 self.onmessage = async (event) => {
   try {
     if (event.data.type === 'init') {
@@ -208,6 +229,8 @@ self.onmessage = async (event) => {
       postMessage({ type: 'preloaded' });
     } else if (event.data.type === 'samples') {
       processSamples(event.data.payload);
+    } else if (event.data.type === 'android_pcm') {
+      processAndroidPcm(event.data.payload);
     } else if (event.data.type === 'flush') {
       if (segmentActive && segmentAccepted) {
         postMessage({

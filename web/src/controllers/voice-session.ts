@@ -36,6 +36,8 @@ export class VoiceSession {
   private activeEnhancedVoiceFilter = false;
   private readonly playbackHolds = new Set<'stream' | 'media'>();
   private readonly playbackReleaseTimers = new Map<'stream' | 'media', number>();
+  private captureOptionsRevision = 0;
+  private captureReconfigurePromise: Promise<void> | null = null;
   private destroyed = false;
 
   constructor(
@@ -97,6 +99,35 @@ export class VoiceSession {
     }
   }
 
+  reconfigureCapture() {
+    this.captureOptionsRevision += 1;
+    if (!this.recording) return Promise.resolve();
+    this.captureReconfigurePromise ??= this.applyLatestCaptureOptions().finally(() => {
+      this.captureReconfigurePromise = null;
+    });
+    return this.captureReconfigurePromise;
+  }
+
+  private async applyLatestCaptureOptions() {
+    try {
+      while (this.recording) {
+        const revision = this.captureOptionsRevision;
+        const options = this.captureOptions();
+        if (!this.audioCapture.updateOptions(options)) {
+          await this.audioCapture.stop();
+          if (!this.recording) return;
+          await this.beginCapture(options);
+          this.syncPlaybackSuppression();
+        }
+        if (revision === this.captureOptionsRevision) return;
+      }
+    } catch (error) {
+      const captureError = error instanceof Error ? error : new Error('无法更新录音设置');
+      this.callbacks.onCaptureError(captureError.message);
+      if (this.recording) await this.stopRecording();
+    }
+  }
+
   setMuted(muted: boolean) {
     this.player.muted = muted;
     if (muted) this.player.stop();
@@ -136,23 +167,7 @@ export class VoiceSession {
     this.segmentsStarted = 0;
     try {
       // getDisplayMedia must be invoked before any awaited work consumes the click gesture.
-      const capture = this.audioCapture.start(
-        this.config().max_utterance_seconds,
-        this.activeEnhancedVoiceFilter,
-        this.captureOptions(),
-        (pcm) => {
-          if (this.activeTcId && this.socket?.readyState === WebSocket.OPEN) {
-            this.socket.send(pcm);
-            this.activeSampleCount += pcm.byteLength / Int16Array.BYTES_PER_ELEMENT;
-          }
-        },
-        (level) => this.waveform.push(level),
-        (boundary) => this.handleVadBoundary(boundary),
-        () => {
-          this.sendConfig();
-        },
-        (error) => void this.handleCaptureFailure(error),
-      );
+      const capture = this.beginCapture(this.captureOptions());
       const playbackUnlock = this.player.unlock();
       await Promise.all([capture, playbackUnlock]);
     } catch (error) {
@@ -162,6 +177,24 @@ export class VoiceSession {
     this.syncPlaybackSuppression();
     this.waveform.setActive(true);
     this.callbacks.onRecording(true);
+  }
+
+  private beginCapture(options: AudioCaptureOptions) {
+    return this.audioCapture.start(
+      this.config().max_utterance_seconds,
+      this.activeEnhancedVoiceFilter,
+      options,
+      (pcm) => {
+        if (this.activeTcId && this.socket?.readyState === WebSocket.OPEN) {
+          this.socket.send(pcm);
+          this.activeSampleCount += pcm.byteLength / Int16Array.BYTES_PER_ELEMENT;
+        }
+      },
+      (level) => this.waveform.push(level),
+      (boundary) => this.handleVadBoundary(boundary),
+      () => this.sendConfig(),
+      (error) => void this.handleCaptureFailure(error),
+    );
   }
 
   private async stopRecording() {

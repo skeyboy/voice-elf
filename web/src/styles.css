@@ -11,6 +11,10 @@
   --green-soft: #e5f0e9;
   --coral: #e76f51;
   --yellow: #e0aa3e;
+  --android-safe-top: 0px;
+  --android-safe-right: 0px;
+  --android-safe-bottom: 0px;
+  --android-safe-left: 0px;
 }
 
 * {
@@ -22,6 +26,14 @@ body {
   min-width: 320px;
   min-height: 100vh;
   background: #f4f5f1;
+}
+
+.android-native-platform body {
+  min-height: 100dvh;
+  padding-top: var(--android-safe-top);
+  padding-right: var(--android-safe-right);
+  padding-bottom: var(--android-safe-bottom);
+  padding-left: var(--android-safe-left);
 }
 
 button,
@@ -56,6 +68,14 @@ svg {
   border-bottom: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.94);
   backdrop-filter: blur(14px);
+}
+
+.android-native-platform .topbar {
+  top: var(--android-safe-top);
+}
+
+.android-native-platform .auth-screen {
+  inset: var(--android-safe-top) var(--android-safe-right) var(--android-safe-bottom) var(--android-safe-left);
 }
 
 .topbar-inner,

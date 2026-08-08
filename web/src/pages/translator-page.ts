@@ -1,10 +1,12 @@
 import {
   ApiRequestError,
   apiRequest,
+  type Paginated,
   type RoomDetail,
   type RoomInput,
   type RoomMemberState,
   type RoomSummary,
+  type UtteranceHistory,
 } from '../api';
 import { loadAppConfig } from '../app-config';
 import {
@@ -39,7 +41,16 @@ interface TranslatorViewState {
   scrollTop: number;
 }
 
+interface TranslatorCacheEntry {
+  detail: RoomDetail;
+  utterances: UtteranceHistory[];
+  historyPage: number;
+  historyTotal: number;
+  historyQuery: string;
+}
+
 const translatorViewStates = new Map<string, TranslatorViewState>();
+const translatorCache = new Map<string, TranslatorCacheEntry>();
 
 export class TranslatorPage implements Page {
   private root: HTMLElement | null = null;
@@ -65,6 +76,12 @@ export class TranslatorPage implements Page {
   private echoCancellation = true;
   private readonly latencyIds = new Set<string>();
   private historySync: Promise<void> | null = null;
+  private historyRequestVersion = 0;
+  private historyPage = 0;
+  private historyTotal = 0;
+  private historyQuery = '';
+  private pendingHistoryScroll: number | null = null;
+  private historyRecords: UtteranceHistory[] = [];
   private members: RoomMemberState[] = [];
   private canPublish = false;
   private connectionStatus: ConnectionStatus = 'offline';
@@ -87,11 +104,14 @@ export class TranslatorPage implements Page {
 
   async mount(root: HTMLElement) {
     this.root = root;
-    renderPageLoading(root, '正在进入实时会话', '同步会议、成员和最近字幕');
-    const savedView = translatorViewStates.get(this.roomId);
+    const savedView = translatorViewStates.get(this.cacheKey());
+    const cached = translatorCache.get(this.cacheKey());
+    if (!cached) renderPageLoading(root, '正在进入实时会话', '同步会议、成员和最近字幕');
+    this.historyQuery = savedView?.query ?? '';
+    this.pendingHistoryScroll = savedView?.scrollTop || null;
     let detail: RoomDetail;
     try {
-      detail = await this.getDetail(savedView?.query);
+      detail = cached?.detail ?? await this.getDetail(savedView?.query);
     } catch (error) {
       if (this.root !== root) return;
       this.onError(error instanceof Error ? error.message : '无法进入房间');
@@ -100,6 +120,13 @@ export class TranslatorPage implements Page {
     }
     if (this.root !== root) return;
     this.room = detail.room;
+    translatorCache.set(this.cacheKey(), cached ?? {
+      detail,
+      utterances: [],
+      historyPage: 0,
+      historyTotal: 0,
+      historyQuery: this.historyQuery,
+    });
     void loadAppConfig().then((config) => {
       this.isAppShell = Boolean(config);
     });
@@ -122,6 +149,7 @@ export class TranslatorPage implements Page {
     this.renderMembers();
     this.conversation = new ConversationView(this.player, this.onError, (active) =>
       this.voiceSession?.setExternalPlaybackActive(active),
+      () => void this.loadHistory(this.historyQuery, false),
     );
     this.monitor = new LatencyMonitor();
     root.querySelector('.conversation-mount')!.replaceWith(this.conversation.element);
@@ -138,16 +166,22 @@ export class TranslatorPage implements Page {
       },
     );
     root.querySelector('.capture-options-mount')!.replaceWith(this.captureOptions.element);
-    this.conversation.renderHistory(detail);
-    const search = root.querySelector<HTMLInputElement>('.record-search input');
-    if (search) search.value = savedView?.query ?? '';
-    if (savedView?.scrollTop) {
-      requestAnimationFrame(() => {
-        const list = this.root?.querySelector<HTMLElement>('.conversation-list');
-        if (list) list.scrollTop = savedView.scrollTop;
-      });
+    if (cached && cached.historyQuery === this.historyQuery) {
+      this.historyPage = cached.historyPage;
+      this.historyTotal = cached.historyTotal;
+      this.historyRecords = cached.utterances;
+      this.seedAndroidCaptions(cached.utterances);
+      this.conversation.renderUtterances(cached.utterances);
+      this.conversation.setHistoryPagination(
+        Math.min(cached.historyPage * 30, cached.historyTotal),
+        cached.historyTotal,
+        false,
+      );
+      this.resetLatency(cached.utterances);
     }
-    this.resetLatency(detail);
+    const search = root.querySelector<HTMLInputElement>('.record-search input');
+    if (search) search.value = this.historyQuery;
+    if (!cached) this.monitor.reset();
     this.bindEvents();
     this.roomEditor = new RoomEditor((saved) => this.applyRoom(saved));
     this.languageDialog = new LanguageDialog(
@@ -178,6 +212,7 @@ export class TranslatorPage implements Page {
     });
     this.androidOverlayActive = isAndroidSubtitleOverlayVisible();
     this.pushAndroidSubtitle();
+    window.setTimeout(() => void this.loadHistory(this.historyQuery, true), 0);
     if (detail.room.status !== 'active') {
       root.querySelector<HTMLButtonElement>('.record-button')!.disabled = true;
       this.setCaptureStatus('会议已结束', 'neutral');
@@ -206,7 +241,8 @@ export class TranslatorPage implements Page {
   async destroy() {
     const query = this.root?.querySelector<HTMLInputElement>('.record-search input')?.value ?? '';
     const scrollTop = this.root?.querySelector<HTMLElement>('.conversation-list')?.scrollTop ?? 0;
-    translatorViewStates.set(this.roomId, { query, scrollTop });
+    translatorViewStates.set(this.cacheKey(), { query, scrollTop });
+    this.cacheCurrentState();
     window.clearInterval(this.timer);
     this.unsubscribePreferences();
     this.unsubscribePreferences = () => {};
@@ -214,6 +250,7 @@ export class TranslatorPage implements Page {
     this.unsubscribeSubtitlePreferences = () => {};
     this.unsubscribeAndroidNative();
     this.unsubscribeAndroidNative = () => {};
+    this.historyRequestVersion += 1;
     await this.voiceSession?.destroy();
     this.voiceSession = null;
     this.conversation?.destroy();
@@ -232,21 +269,38 @@ export class TranslatorPage implements Page {
   }
 
   private async getDetail(search = '') {
-    const query = search.trim() ? `?q=${encodeURIComponent(search.trim())}` : '';
+    const query = `?include_history=false${search.trim() ? `&q=${encodeURIComponent(search.trim())}` : ''}`;
     try {
       return await apiRequest<RoomDetail>(`/api/rooms/${this.roomId}${query}`);
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 403 && !search) {
         await apiRequest(`/api/rooms/${this.roomId}/join`, { method: 'POST' });
-        return apiRequest<RoomDetail>(`/api/rooms/${this.roomId}`);
+        return apiRequest<RoomDetail>(`/api/rooms/${this.roomId}?include_history=false`);
       }
       throw error;
     }
   }
 
   private template(room: RoomSummary) {
+    const androidShell = isAndroidNativeShell();
+    const captureConsole = `
+      <div class="capture-console">
+        <div class="record-control">
+          <div class="record-primary-actions">
+            <button class="record-button" type="button" aria-label="开始麦克风录音" title="开始麦克风录音" disabled><i data-lucide="mic"></i></button>
+            <div class="capture-options-mount"></div>
+          </div>
+          <span class="record-button-copy">开始录音</span>
+          <div class="capture-readout" data-tone="processing">
+            <span class="capture-status-line"><i class="capture-status-dot" aria-hidden="true"></i><strong class="capture-state">连接中</strong></span>
+            <span class="capture-time">00:00</span>
+          </div>
+          <canvas id="waveform" aria-hidden="true"></canvas>
+        </div>
+      </div>
+    `;
     return `
-      <main class="translator-page app-shell">
+      <main class="translator-page app-shell${androidShell ? ' android-native-shell' : ''}">
         <section class="room-toolbar">
           <button class="room-back icon-button" type="button" title="返回房间目录" aria-label="返回房间目录"><i data-lucide="arrow-left"></i></button>
           <div class="room-identity-static">
@@ -254,17 +308,28 @@ export class TranslatorPage implements Page {
             <span><small>当前房间</small><strong class="room-name">${escapeHtml(room.name)}</strong></span>
             <span class="room-role${room.is_owner ? ' owner' : ''}">${room.status !== 'active' ? '会议已结束' : room.is_owner ? '房主控制' : this.canPublish ? '成员发言' : '已被禁言'}</span>
           </div>
-          <form class="record-search">
-            <i data-lucide="search"></i><input type="search" placeholder="检索转写或翻译记录" aria-label="检索房间记录"><button type="submit">检索</button>
-          </form>
-          <div class="room-display-actions">
-            <button class="icon-button open-subtitles" type="button" title="打开字幕大屏" aria-label="打开字幕大屏"><i data-lucide="captions"></i></button>
-            <div class="room-owner-actions" ${room.is_owner ? '' : 'hidden'}>
-              <button class="icon-button edit-room" type="button" title="编辑房间" aria-label="编辑房间"><i data-lucide="settings"></i></button>
-              <button class="icon-button danger delete-room" type="button" title="删除房间" aria-label="删除房间"><i data-lucide="trash-2"></i></button>
-            </div>
+          <div class="room-toolbar-actions" aria-label="会议操作">
+            <button class="room-command open-record-search" type="button"><i data-lucide="search"></i><span>记录</span></button>
+            <button class="room-command open-subtitles" type="button"><i data-lucide="captions"></i><span>字幕</span></button>
+            <button class="room-command open-room-management" type="button" ${room.is_owner ? '' : 'hidden'}><i data-lucide="settings-2"></i><span>管理</span></button>
           </div>
         </section>
+
+        <dialog class="room-action-dialog record-search-dialog">
+          <form class="record-search">
+            <header><div><small>TRANSCRIPTS</small><h2>检索会议记录</h2></div><button class="icon-button close-record-search" type="button" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button></header>
+            <label><span>原文或译文</span><span class="room-action-input"><i data-lucide="search"></i><input type="search" placeholder="输入关键词" aria-label="检索房间记录"></span></label>
+            <div class="room-action-footer"><button class="secondary-command clear-record-search" type="button">清除</button><button class="primary-command" type="submit">检索记录</button></div>
+          </form>
+        </dialog>
+
+        <dialog class="room-action-dialog room-management-dialog">
+          <section>
+            <header><div><small>ROOM CONTROL</small><h2>房间管理</h2></div><button class="icon-button close-room-management" type="button" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button></header>
+            <button class="room-action-item edit-room" type="button"><span class="room-action-icon"><i data-lucide="settings"></i></span><span><strong>会议设置</strong><small>名称、语言和断句时间</small></span><i data-lucide="chevron-right"></i></button>
+            <button class="room-action-item danger delete-room" type="button"><span class="room-action-icon"><i data-lucide="trash-2"></i></span><span><strong>删除会议</strong><small>从会议目录移除，历史数据仍保留</small></span><i data-lucide="chevron-right"></i></button>
+          </section>
+        </dialog>
 
         <div class="workspace-grid">
           <section class="conversation-panel">
@@ -276,26 +341,14 @@ export class TranslatorPage implements Page {
               </div>
             </div>
             <div class="conversation-mount"></div>
-            <div class="capture-console">
-              <div class="record-control">
-                <div class="record-primary-actions">
-                  <button class="record-button" type="button" aria-label="开始麦克风录音" title="开始麦克风录音" disabled><i data-lucide="mic"></i></button>
-                  <div class="capture-options-mount"></div>
-                </div>
-                <span class="record-button-copy">开始录音</span>
-                <div class="capture-readout" data-tone="processing">
-                  <span class="capture-status-line"><i class="capture-status-dot" aria-hidden="true"></i><strong class="capture-state">连接中</strong></span>
-                  <span class="capture-time">00:00</span>
-                </div>
-                <canvas id="waveform" aria-hidden="true"></canvas>
-              </div>
-            </div>
+            ${androidShell ? '' : captureConsole}
           </section>
           <aside class="member-panel" aria-label="房间成员">
             <div class="member-panel-heading"><div><span class="section-kicker"><i data-lucide="users"></i> PARTICIPANTS</span><h2>房间成员</h2></div><span class="member-count">0 人</span></div>
             <div class="member-list"></div>
           </aside>
         </div>
+        ${androidShell ? captureConsole : ''}
       </main>
     `;
   }
@@ -303,25 +356,50 @@ export class TranslatorPage implements Page {
   private bindEvents() {
     if (!this.root || !this.room) return;
     this.root.querySelector('.room-back')?.addEventListener('click', this.onRooms);
+    const searchDialog = this.root.querySelector<HTMLDialogElement>('.record-search-dialog')!;
+    const managementDialog = this.root.querySelector<HTMLDialogElement>('.room-management-dialog')!;
+    this.root.querySelector('.open-record-search')?.addEventListener('click', () => {
+      searchDialog.showModal();
+      searchDialog.querySelector<HTMLInputElement>('input')?.focus();
+    });
+    this.root.querySelector('.close-record-search')?.addEventListener('click', () => searchDialog.close());
+    this.root.querySelector('.clear-record-search')?.addEventListener('click', () => {
+      const input = searchDialog.querySelector<HTMLInputElement>('input');
+      if (input) input.value = '';
+      void this.loadHistory('', true);
+      searchDialog.close();
+    });
+    this.root.querySelector('.open-room-management')?.addEventListener('click', () => managementDialog.showModal());
+    this.root.querySelector('.close-room-management')?.addEventListener('click', () => managementDialog.close());
+    [searchDialog, managementDialog].forEach((dialog) => dialog.addEventListener('click', (event) => {
+      if (event.target === dialog) dialog.close();
+    }));
     this.root.querySelector('.record-button')?.addEventListener('click', () =>
       void this.voiceSession?.toggleRecording().catch((error) =>
         this.onError(error instanceof Error ? error.message : '无法启动录音'),
       ),
     );
-    this.root.querySelector('.refresh-history')?.addEventListener('click', () => void this.loadHistory());
+    this.root.querySelector('.refresh-history')?.addEventListener('click', () =>
+      void this.loadHistory(this.historyQuery, true),
+    );
     this.root.querySelector('.open-subtitles')?.addEventListener('click', () =>
       void this.openSubtitleDisplay(),
     );
     this.root.querySelector<HTMLFormElement>('.record-search')?.addEventListener('submit', (event) => {
       event.preventDefault();
       const query = this.root?.querySelector<HTMLInputElement>('.record-search input')?.value ?? '';
-      translatorViewStates.set(this.roomId, { query, scrollTop: 0 });
-      void this.loadHistory(query);
+      translatorViewStates.set(this.cacheKey(), { query, scrollTop: 0 });
+      void this.loadHistory(query, true);
+      searchDialog.close();
     });
     this.root.querySelector('.edit-room')?.addEventListener('click', () => {
+      managementDialog.close();
       if (this.room) this.roomEditor?.open(this.room);
     });
-    this.root.querySelector('.delete-room')?.addEventListener('click', () => void this.deleteRoom());
+    this.root.querySelector('.delete-room')?.addEventListener('click', () => {
+      managementDialog.close();
+      void this.deleteRoom();
+    });
     this.root.querySelector('.member-list')?.addEventListener('click', (event) => {
       const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-mute-user]');
       if (button) void this.toggleMemberMute(button);
@@ -359,6 +437,14 @@ export class TranslatorPage implements Page {
       echoCancellation: values.echoCancellation,
     });
     this.syncRecordButton();
+    if (!this.recording) return;
+    if (!values.microphone && !values.systemAudio) {
+      void this.voiceSession?.toggleRecording().catch((error) =>
+        this.onError(error instanceof Error ? error.message : '无法停止录音'),
+      );
+      return;
+    }
+    void this.voiceSession?.reconfigureCapture();
   }
 
   private handleEvent(event: ServerEvent) {
@@ -372,6 +458,7 @@ export class TranslatorPage implements Page {
       case 'room_members': {
         this.members = event.members;
         this.renderMembers();
+        this.cacheCurrentState();
         const self = event.members.find((member) => member.user_id === this.userId);
         this.updatePublishPermission(Boolean(self && (self.is_owner || !self.is_muted)));
         break;
@@ -571,6 +658,7 @@ export class TranslatorPage implements Page {
     this.maxUtteranceSeconds = this.room.max_utterance_seconds;
     this.updateLanguageButton();
     this.voiceSession?.sendConfig();
+    this.cacheCurrentState();
   }
 
   private async openSubtitleDisplay() {
@@ -631,6 +719,22 @@ export class TranslatorPage implements Page {
     this.pushAndroidSubtitle();
   }
 
+  private seedAndroidCaptions(utterances: UtteranceHistory[]) {
+    if (this.androidCaptionOrder.length > 0) return;
+    utterances
+      .filter((utterance) => utterance.source_text || utterance.translated_text)
+      .slice(0, 3)
+      .reverse()
+      .forEach((utterance) => {
+        this.androidCaptions.set(utterance.id, {
+          source: utterance.source_text,
+          translation: utterance.translated_text,
+        });
+        this.androidCaptionOrder.push(utterance.id);
+      });
+    this.pushAndroidSubtitle();
+  }
+
   private androidSubtitlePayload(): AndroidSubtitlePayload {
     const latest = [...this.androidCaptionOrder]
       .reverse()
@@ -654,49 +758,81 @@ export class TranslatorPage implements Page {
     if (this.androidOverlayActive) updateAndroidSubtitleOverlay(this.androidSubtitlePayload());
   }
 
-  private async loadHistory(search = '') {
-    try {
-      const detail = await this.getDetail(search);
-      this.members = detail.members;
-      this.renderMembers();
-      this.conversation?.renderHistory(detail);
-      this.resetLatency(detail);
-    } catch (error) {
-      this.onError(error instanceof Error ? error.message : '无法加载记录');
-    }
+  private loadHistory(search = '', reset = true) {
+    const normalizedSearch = search.trim();
+    if (this.historySync && normalizedSearch === this.historyQuery) return this.historySync;
+    const requestVersion = ++this.historyRequestVersion;
+    const page = reset || normalizedSearch !== this.historyQuery ? 1 : this.historyPage + 1;
+    this.conversation?.setHistoryPagination(this.historyPage * 30, this.historyTotal || 1, true);
+    const params = new URLSearchParams({ page: String(page), page_size: '30' });
+    if (normalizedSearch) params.set('q', normalizedSearch);
+    const sync = apiRequest<Paginated<UtteranceHistory>>(
+      `/api/rooms/${this.roomId}/utterances?${params}`,
+    )
+      .then((result) => {
+        if (requestVersion !== this.historyRequestVersion || !this.conversation) return;
+        this.historyQuery = normalizedSearch;
+        this.historyPage = result.page;
+        this.historyTotal = result.total;
+        if (page === 1) {
+          this.historyRecords = result.items;
+          if (!normalizedSearch) this.seedAndroidCaptions(result.items);
+          this.conversation.renderUtterances(result.items);
+          this.resetLatency(result.items);
+          if (this.pendingHistoryScroll !== null) {
+            const scrollTop = this.pendingHistoryScroll;
+            this.pendingHistoryScroll = null;
+            requestAnimationFrame(() => {
+              const list = this.root?.querySelector<HTMLElement>('.conversation-list');
+              if (list) list.scrollTop = scrollTop;
+            });
+          }
+        } else {
+          const known = new Set(this.historyRecords.map((utterance) => utterance.id));
+          this.historyRecords = [
+            ...this.historyRecords,
+            ...result.items.filter((utterance) => !known.has(utterance.id)),
+          ];
+          this.conversation.prependHistory(result.items);
+          result.items.forEach((utterance) => this.addLatency(utterance.id, utterance.latency));
+        }
+        this.conversation.setHistoryPagination(
+          Math.min(result.page * result.page_size, result.total),
+          result.total,
+          false,
+        );
+        this.cacheCurrentState();
+      })
+      .catch((error) => {
+        if (requestVersion !== this.historyRequestVersion) return;
+        this.conversation?.setHistoryPagination(
+          Math.min(this.historyPage * 30, this.historyTotal),
+          this.historyTotal,
+          false,
+        );
+        this.onError(error instanceof Error ? error.message : '无法加载记录');
+      })
+      .finally(() => {
+        if (this.historySync === sync) this.historySync = null;
+      });
+    this.historySync = sync;
+    return sync;
   }
 
   private reconcileHistory() {
-    if (this.historySync) return this.historySync;
-    this.historySync = this.getDetail()
-      .then((detail) => {
-        this.members = detail.members;
-        this.renderMembers();
-        this.conversation?.mergeHistory(detail);
-        detail.utterances
-          .slice()
-          .reverse()
-          .forEach((utterance) => this.addLatency(utterance.id, utterance.latency));
-      })
-      .catch((error) => {
-        this.onError(error instanceof Error ? error.message : '无法同步房间记录');
-      })
-      .finally(() => {
-        this.historySync = null;
-      });
-    return this.historySync;
+    return this.loadHistory(this.historyQuery, true);
   }
 
-  private resetLatency(detail: RoomDetail) {
+  private resetLatency(utterances: UtteranceHistory[]) {
     this.monitor?.reset();
     this.latencyIds.clear();
-    detail.utterances
+    utterances
       .slice()
       .reverse()
       .forEach((utterance) => this.addLatency(utterance.id, utterance.latency));
   }
 
-  private addLatency(utteranceId: string, latency: RoomDetail['utterances'][number]['latency']) {
+  private addLatency(utteranceId: string, latency: UtteranceHistory['latency']) {
     if (this.latencyIds.has(utteranceId)) return;
     this.latencyIds.add(utteranceId);
     this.monitor?.addLatency(latency);
@@ -711,6 +847,22 @@ export class TranslatorPage implements Page {
     this.root.querySelector('.room-name')!.textContent = room.name;
     this.updateLanguageButton();
     this.voiceSession?.sendConfig();
+    this.cacheCurrentState();
+  }
+
+  private cacheCurrentState() {
+    if (!this.room) return;
+    translatorCache.set(this.cacheKey(), {
+      detail: { room: this.room, members: this.members, utterances: [] },
+      utterances: this.historyRecords,
+      historyPage: this.historyPage,
+      historyTotal: this.historyTotal,
+      historyQuery: this.historyQuery,
+    });
+  }
+
+  private cacheKey() {
+    return `${this.userId}:${this.roomId}`;
   }
 
   private updateLanguageButton() {
@@ -793,6 +945,7 @@ export class TranslatorPage implements Page {
     ) return;
     try {
       await apiRequest(`/api/rooms/${this.room.id}`, { method: 'DELETE' });
+      translatorCache.delete(this.cacheKey());
       this.onDeleted();
     } catch (error) {
       this.onError(error instanceof Error ? error.message : '无法删除房间');

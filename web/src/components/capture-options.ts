@@ -20,7 +20,6 @@ export class CaptureOptions {
   readonly element: HTMLElement;
   private readonly popover: HTMLElement;
   private readonly popoverId = `capture-options-${++captureOptionsSequence}`;
-  private recording = false;
 
   constructor(
     initial: CaptureOptionValues,
@@ -114,9 +113,7 @@ export class CaptureOptions {
   }
 
   setRecording(recording: boolean) {
-    this.recording = recording;
-    this.element.querySelector<HTMLButtonElement>('button')!.disabled = recording;
-    if (recording) this.closePopover();
+    this.popover.classList.toggle('is-recording', recording);
     this.syncState();
   }
 
@@ -150,9 +147,9 @@ export class CaptureOptions {
 
   private syncState() {
     const values = this.values();
-    const microphoneProcessingDisabled = this.recording || !values.microphone;
-    this.input('microphone').disabled = this.recording;
-    this.input('systemAudio').disabled = this.recording || !this.systemAudioAvailable;
+    const microphoneProcessingDisabled = !values.microphone;
+    this.input('microphone').disabled = false;
+    this.input('systemAudio').disabled = !this.systemAudioAvailable;
     this.input('noiseSuppression').disabled = microphoneProcessingDisabled;
     this.input('echoCancellation').disabled = microphoneProcessingDisabled;
     const mode = values.microphone && values.systemAudio
@@ -179,7 +176,6 @@ export class CaptureOptions {
   };
 
   private openPopover() {
-    if (this.recording) return;
     this.popover.hidden = false;
     this.popover.style.maxHeight = '';
     const trigger = this.element.getBoundingClientRect();

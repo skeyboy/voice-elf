@@ -18,6 +18,7 @@ interface RoomsViewState {
 
 const MINUTE_MS = 60_000;
 const roomsViewStates = new Map<string, RoomsViewState>();
+const roomsCache = new Map<string, RoomSummary[]>();
 
 export class RoomsPage implements Page {
   private root: HTMLElement | null = null;
@@ -140,7 +141,15 @@ export class RoomsPage implements Page {
     root.querySelector('.reset-meeting-filters')?.addEventListener('click', () => this.resetFilters());
     this.restoreControls();
     refreshIcons(root);
-    await this.load();
+    const cached = roomsCache.get(this.user.id);
+    if (cached) {
+      this.rooms = cached;
+      this.render();
+      this.restoreScroll();
+      void this.load(true);
+      return;
+    }
+    await this.load(false);
   }
 
   destroy() {
@@ -150,18 +159,19 @@ export class RoomsPage implements Page {
     this.root = null;
   }
 
-  private async load() {
+  private async load(background: boolean) {
     if (!this.root) return;
     const list = this.root.querySelector<HTMLElement>('.meeting-list')!;
-    list.setAttribute('aria-busy', 'true');
+    if (!background) list.setAttribute('aria-busy', 'true');
     try {
       this.rooms = await apiRequest<RoomSummary[]>('/api/rooms');
+      roomsCache.set(this.user.id, this.rooms);
       this.render();
-      this.restoreScroll();
+      if (!background) this.restoreScroll();
     } catch (error) {
-      list.setAttribute('aria-busy', 'false');
+      if (!background) list.setAttribute('aria-busy', 'false');
       this.onError(error instanceof Error ? error.message : '无法加载会议');
-      this.restoreScroll();
+      if (!background) this.restoreScroll();
     }
   }
 

@@ -74,6 +74,7 @@ pub fn router() -> Router<AppState> {
             "/rooms/{room_id}",
             get(room_detail).patch(update_room).delete(delete_room),
         )
+        .route("/rooms/{room_id}/utterances", get(room_utterances))
         .route("/rooms/{room_id}/join", post(join_room))
         .route(
             "/rooms/{room_id}/members/{user_id}",
@@ -668,6 +669,19 @@ struct SearchQuery {
     q: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct RoomDetailQuery {
+    q: Option<String>,
+    include_history: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct UtteranceQuery {
+    q: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
 #[derive(Serialize)]
 struct RoomDetailResponse {
     room: RoomSummary,
@@ -749,7 +763,7 @@ async fn room_detail(
     State(state): State<AppState>,
     cookies: Cookies,
     Path(room_id): Path<Uuid>,
-    Query(query): Query<SearchQuery>,
+    Query(query): Query<RoomDetailQuery>,
 ) -> Result<Json<RoomDetailResponse>, ApiError> {
     let user = authenticate(&state, &cookies).await?;
     let database = database(&state)?;
@@ -772,10 +786,14 @@ async fn room_detail(
         .room_summary(&room, user.id)
         .await
         .map_err(ApiError::internal)?;
-    let utterances = database
-        .list_utterances(room_id, query.q.as_deref())
-        .await
-        .map_err(ApiError::internal)?;
+    let utterances = if query.include_history.unwrap_or(true) {
+        database
+            .list_utterances(room_id, query.q.as_deref())
+            .await
+            .map_err(ApiError::internal)?
+    } else {
+        Vec::new()
+    };
     let member_records = database
         .list_room_members(room_id)
         .await
@@ -786,6 +804,38 @@ async fn room_detail(
         members,
         utterances,
     }))
+}
+
+async fn room_utterances(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path(room_id): Path<Uuid>,
+    Query(query): Query<UtteranceQuery>,
+) -> Result<Json<crate::storage::Paginated<UtteranceHistory>>, ApiError> {
+    let user = authenticate(&state, &cookies).await?;
+    let database = database(&state)?;
+    let room = database
+        .get_room(room_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("房间不存在"))?;
+    if room.status == "archived" {
+        return Err(ApiError::not_found("房间不存在"));
+    }
+    if !database
+        .can_view_room(room_id, user.id)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::forbidden("请先加入房间"));
+    }
+    let (page, page_size) = pagination(query.page, query.page_size);
+    Ok(Json(
+        database
+            .list_utterances_page(room_id, query.q.as_deref(), page, page_size)
+            .await
+            .map_err(ApiError::internal)?,
+    ))
 }
 
 async fn update_room_member(

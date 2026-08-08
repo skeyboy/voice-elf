@@ -2,14 +2,26 @@ export type AndroidNativeEvent =
   | { type: 'capture-started'; systemAudio: boolean }
   | { type: 'capture-stopped' }
   | { type: 'capture-error'; message: string }
-  | { type: 'audio-pcm'; data: string }
+  | { type: 'audio-pcm'; data: string; sampleRate: number }
   | { type: 'overlay-opened' }
   | { type: 'overlay-closed' }
   | { type: 'overlay-error'; message: string };
 
 interface AndroidVoiceElfBridge {
   platform(): string;
-  startCapture(microphone: boolean, systemAudio: boolean): void;
+  safeAreaInsets(): string;
+  startCapture(
+    microphone: boolean,
+    systemAudio: boolean,
+    noiseSuppression: boolean,
+    echoCancellation: boolean,
+  ): void;
+  updateCapture(
+    microphone: boolean,
+    systemAudio: boolean,
+    noiseSuppression: boolean,
+    echoCancellation: boolean,
+  ): void;
   captureReady(): void;
   stopCapture(): void;
   showSubtitleOverlay(payload: string): void;
@@ -36,6 +48,31 @@ export function isAndroidNativeShell() {
 
 export function supportsAndroidSystemAudio() {
   return isAndroidNativeShell();
+}
+
+export interface AndroidSafeAreaInsets {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
+export function syncAndroidSafeArea() {
+  if (!isAndroidNativeShell()) return () => {};
+  const apply = (insets: AndroidSafeAreaInsets) => {
+    document.documentElement.classList.add('android-native-platform');
+    Object.entries(insets).forEach(([edge, value]) => {
+      document.documentElement.style.setProperty(`--android-safe-${edge}`, `${Math.max(0, value)}px`);
+    });
+  };
+  try {
+    apply(JSON.parse(window.VoiceElfAndroid!.safeAreaInsets()) as AndroidSafeAreaInsets);
+  } catch {
+    // Insets will be delivered by the native listener after the WebView attaches.
+  }
+  const listener = (event: Event) => apply((event as CustomEvent<AndroidSafeAreaInsets>).detail);
+  window.addEventListener('voice-elf:android-safe-area', listener);
+  return () => window.removeEventListener('voice-elf:android-safe-area', listener);
 }
 
 export function subscribeAndroidNative(
@@ -72,12 +109,33 @@ function waitForNativeResult(
   });
 }
 
-export async function startAndroidCapture(microphone: boolean, systemAudio: boolean) {
+export async function startAndroidCapture(
+  microphone: boolean,
+  systemAudio: boolean,
+  noiseSuppression: boolean,
+  echoCancellation: boolean,
+) {
   const bridge = window.VoiceElfAndroid;
   if (!bridge || !isAndroidNativeShell()) return false;
   const result = waitForNativeResult('capture-started', 'capture-error', 90_000);
-  bridge.startCapture(microphone, systemAudio);
+  bridge.startCapture(microphone, systemAudio, noiseSuppression, echoCancellation);
   await result;
+  return true;
+}
+
+export function updateAndroidCapture(
+  microphone: boolean,
+  systemAudio: boolean,
+  noiseSuppression: boolean,
+  echoCancellation: boolean,
+) {
+  if (!isAndroidNativeShell()) return false;
+  window.VoiceElfAndroid?.updateCapture(
+    microphone,
+    systemAudio,
+    noiseSuppression,
+    echoCancellation,
+  );
   return true;
 }
 
@@ -87,16 +145,6 @@ export function stopAndroidCapture() {
 
 export function markAndroidCaptureReady() {
   if (isAndroidNativeShell()) window.VoiceElfAndroid?.captureReady();
-}
-
-export function decodeAndroidPcm(base64: string) {
-  const binary = window.atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
-  const input = new Int16Array(bytes.buffer);
-  const samples = new Float32Array(input.length);
-  for (let index = 0; index < input.length; index += 1) samples[index] = input[index] / 32768;
-  return samples.buffer;
 }
 
 export interface AndroidSubtitlePayload {

@@ -1,4 +1,4 @@
-import type { RoomDetail, SpeakerIdentity } from '../api';
+import type { RoomDetail, SpeakerIdentity, UtteranceHistory } from '../api';
 import { PcmPlayer } from '../audio';
 import type { ServerEvent } from '../protocol';
 import { languageNames } from '../shared/languages';
@@ -25,6 +25,7 @@ export class ConversationView {
   private readonly list: HTMLElement;
   private readonly emptyState: HTMLElement;
   private readonly scrollButton: HTMLButtonElement;
+  private readonly historyButton: HTMLButtonElement;
   private readonly speakerDialog: HTMLDialogElement;
   private readonly rows = new Map<string, HTMLElement>();
   private readonly speakers = new Map<string, SpeakerIdentity[]>();
@@ -37,11 +38,13 @@ export class ConversationView {
   private autoFollow = true;
   private programmaticScroll = false;
   private scrollEndTimer = 0;
+  private mergingHistory = false;
 
   constructor(
     private readonly player: PcmPlayer,
     private readonly onError: (message: string) => void,
     private readonly onMediaPlaybackChange: (active: boolean) => void = () => {},
+    onLoadOlder: () => void = () => {},
   ) {
     this.element = document.createElement('div');
     this.element.className = 'conversation-scroll-region';
@@ -53,6 +56,7 @@ export class ConversationView {
           <span>16 kHz · PCM16 · MONO</span>
         </div>
       </div>
+      <button class="history-older" type="button" hidden><i data-lucide="clock-3"></i><span>加载更早记录</span></button>
       <button class="scroll-latest" type="button" hidden><i data-lucide="arrow-down"></i><span>最新记录</span></button>
       <dialog class="speaker-dialog">
         <div class="speaker-dialog-heading"><div><small>本条音频</small><strong>发言成员</strong></div><button class="icon-button speaker-dialog-close" type="button" aria-label="关闭" title="关闭"><i data-lucide="x"></i></button></div>
@@ -62,9 +66,11 @@ export class ConversationView {
     this.list = this.element.querySelector('.conversation-list')!;
     this.emptyState = this.element.querySelector('.empty-state')!;
     this.scrollButton = this.element.querySelector('.scroll-latest')!;
+    this.historyButton = this.element.querySelector('.history-older')!;
     this.speakerDialog = this.element.querySelector('.speaker-dialog')!;
     this.list.addEventListener('scroll', () => this.handleScroll(), { passive: true });
     this.scrollButton.addEventListener('click', () => this.scrollToBottom(true));
+    this.historyButton.addEventListener('click', onLoadOlder);
     this.speakerDialog.querySelector('.speaker-dialog-close')?.addEventListener('click', () =>
       this.speakerDialog.close(),
     );
@@ -94,6 +100,9 @@ export class ConversationView {
     this.programmaticScroll = false;
     window.clearTimeout(this.scrollEndTimer);
     this.scrollButton.hidden = true;
+    this.historyButton.hidden = true;
+    this.historyButton.disabled = false;
+    this.mergingHistory = false;
   }
 
   destroy() {
@@ -101,13 +110,62 @@ export class ConversationView {
   }
 
   renderHistory(detail: RoomDetail) {
+    this.renderUtterances(detail.utterances);
+  }
+
+  renderUtterances(utterances: UtteranceHistory[]) {
     this.reset();
-    this.mergeHistory(detail);
+    this.mergingHistory = true;
+    this.mergeUtterances(utterances);
+    this.mergingHistory = false;
     requestAnimationFrame(() => this.scrollToBottom(true));
   }
 
+  prependHistory(utterances: UtteranceHistory[]) {
+    if (utterances.length === 0) return;
+    const existing = new Set(this.rows.keys());
+    const anchor = this.list.querySelector('.conversation-item');
+    const previousHeight = this.list.scrollHeight;
+    const wasFollowing = this.autoFollow;
+    this.mergingHistory = true;
+    this.mergeUtterances(utterances);
+    this.mergingHistory = false;
+    const fragment = document.createDocumentFragment();
+    utterances
+      .slice()
+      .reverse()
+      .forEach((utterance) => {
+        if (!existing.has(utterance.id)) {
+          const row = this.rows.get(utterance.id);
+          if (row) fragment.append(row);
+        }
+      });
+    this.list.insertBefore(fragment, anchor);
+    this.autoFollow = wasFollowing;
+    this.list.scrollTop += this.list.scrollHeight - previousHeight;
+  }
+
+  setHistoryPagination(loaded: number, total: number, loading: boolean) {
+    const hasMore = loaded < total;
+    this.historyButton.hidden = !loading && !hasMore;
+    this.historyButton.disabled = loading;
+    this.historyButton.classList.toggle('loading', loading);
+    const label = this.historyButton.querySelector('span');
+    if (label) {
+      label.textContent = loading
+        ? '正在加载记录'
+        : `加载更早记录 · ${loaded}/${total}`;
+    }
+    this.historyButton.innerHTML = `<i data-lucide="${loading ? 'loader-circle' : 'clock-3'}"></i><span>${label?.textContent ?? ''}</span>`;
+    refreshIcons(this.historyButton);
+  }
+
   mergeHistory(detail: RoomDetail) {
-    detail.utterances
+    this.mergeUtterances(detail.utterances);
+  }
+
+  private mergeUtterances(utterances: UtteranceHistory[]) {
+    utterances
       .slice()
       .reverse()
       .forEach((utterance) => {
@@ -509,6 +567,7 @@ export class ConversationView {
   }
 
   private followIfEnabled() {
+    if (this.mergingHistory) return;
     if (!this.autoFollow) {
       this.scrollButton.hidden = false;
       return;

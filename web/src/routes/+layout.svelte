@@ -5,6 +5,7 @@
   import TopBarHost from '$lib/TopBarHost.svelte';
   import ToastRegion from '$lib/ToastRegion.svelte';
   import { scheduleVadPreload } from '../audio';
+  import { syncAndroidSafeArea } from '../android-native';
   import {
     currentUser,
     instanceAuthorization,
@@ -28,17 +29,19 @@
     if (from?.url) routeScrollPositions.set(from.url.pathname, window.scrollY);
     window.clearTimeout(navigationTimer);
     routeDestination = routeLabel(to.url.pathname);
-    routeNavigating = true;
+    routeNavigating = false;
+    navigationTimer = window.setTimeout(() => {
+      routeNavigating = true;
+    }, 240);
   });
 
   afterNavigate(({ to }) => {
+    window.clearTimeout(navigationTimer);
+    routeNavigating = false;
     if (to?.url) {
       const scrollTop = routeScrollPositions.get(to.url.pathname);
       if (scrollTop !== undefined) requestAnimationFrame(() => window.scrollTo({ top: scrollTop }));
     }
-    navigationTimer = window.setTimeout(() => {
-      routeNavigating = false;
-    }, 180);
   });
 
   function routeLabel(pathname: string) {
@@ -58,6 +61,7 @@
   };
 
   onMount(() => {
+    const unsubscribeAndroidSafeArea = syncAndroidSafeArea();
     document.getElementById('voice-elf-boot')?.remove();
     const cancelVadPreload = scheduleVadPreload();
     void loadSetup().then((setup) => {
@@ -106,6 +110,7 @@
     window.addEventListener('voice-elf:native-quit-requested', handleQuitRequest);
     window.addEventListener('voice-elf:native-toast', handleNativeToast);
     return () => {
+      unsubscribeAndroidSafeArea();
       cancelVadPreload();
       window.clearTimeout(quitPromptTimer);
       window.clearTimeout(navigationTimer);

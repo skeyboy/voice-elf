@@ -18,7 +18,7 @@ use crate::{
     },
 };
 
-use super::Database;
+use super::{Database, Paginated, paginated};
 
 pub struct NewUtteranceAttempt<'a> {
     pub id: Uuid,
@@ -496,12 +496,38 @@ impl Database {
         room_id: Uuid,
         search: Option<&str>,
     ) -> Result<Vec<UtteranceHistory>> {
+        Ok(self
+            .list_utterances_page(room_id, search, 1, 200)
+            .await?
+            .items)
+    }
+
+    pub async fn list_utterances_page(
+        &self,
+        room_id: Uuid,
+        search: Option<&str>,
+        page: i64,
+        page_size: i64,
+    ) -> Result<Paginated<UtteranceHistory>> {
         let mut connection = self.pool.get().await?;
+        let search = search.map(str::trim).filter(|value| !value.is_empty());
+        let mut count_query = voice_utterances::table
+            .filter(voice_utterances::room_id.eq(Some(room_id)))
+            .into_boxed();
+        if let Some(search) = search {
+            let pattern = format!("%{search}%");
+            count_query = count_query.filter(
+                voice_utterances::source_text
+                    .ilike(pattern.clone())
+                    .or(voice_utterances::translated_text.ilike(pattern)),
+            );
+        }
+        let total = count_query.count().get_result(&mut connection).await?;
         let mut query = voice_utterances::table
             .filter(voice_utterances::room_id.eq(Some(room_id)))
             .into_boxed();
-        if let Some(search) = search.filter(|value| !value.trim().is_empty()) {
-            let pattern = format!("%{}%", search.trim());
+        if let Some(search) = search {
+            let pattern = format!("%{search}%");
             query = query.filter(
                 voice_utterances::source_text
                     .ilike(pattern.clone())
@@ -510,7 +536,8 @@ impl Database {
         }
         let rows = query
             .order(voice_utterances::created_at.desc())
-            .limit(200)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
             .select(UtteranceHistoryRow::as_select())
             .load(&mut connection)
             .await?;
@@ -561,7 +588,7 @@ impl Database {
                     completed_at: refinement.completed_at,
                 });
         }
-        Ok(rows
+        let items = rows
             .into_iter()
             .map(|row| {
                 let row_id = row.id;
@@ -570,7 +597,8 @@ impl Database {
                 history.refinements = refinements_by_utterance.remove(&row_id).unwrap_or_default();
                 history
             })
-            .collect())
+            .collect();
+        Ok(paginated(items, page, page_size, total))
     }
 }
 

@@ -1,11 +1,11 @@
 import {
-  decodeAndroidPcm,
   isAndroidNativeShell,
   markAndroidCaptureReady,
   startAndroidCapture,
   stopAndroidCapture,
   subscribeAndroidNative,
   supportsAndroidSystemAudio,
+  updateAndroidCapture,
 } from './android-native';
 
 interface CaptureMessage {
@@ -161,6 +161,7 @@ export class AudioCapture {
   private suppressed = false;
   private stopping = false;
   private androidCapture = false;
+  private currentOptions: AudioCaptureOptions | null = null;
   private unsubscribeAndroidPcm = () => {};
 
   private async prepareVad(
@@ -270,7 +271,12 @@ export class AudioCapture {
     }
     const streams: MediaStream[] = [];
     if (androidShell) {
-      this.androidCapture = await startAndroidCapture(options.microphone, options.systemAudio);
+      this.androidCapture = await startAndroidCapture(
+        options.microphone,
+        options.systemAudio,
+        options.noiseSuppression,
+        options.echoCancellation,
+      );
     }
     if (options.systemAudio) {
       if (!supportsSystemAudioCapture()) {
@@ -292,7 +298,8 @@ export class AudioCapture {
         throw captureError(error, 'system');
       }
     }
-    if (options.microphone) {
+    const nativeMixedCapture = androidShell && options.systemAudio;
+    if (options.microphone && !nativeMixedCapture) {
       if (!navigator.mediaDevices.getUserMedia) {
         streams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
         throw new Error('当前浏览器或设备不支持麦克风录音');
@@ -322,7 +329,11 @@ export class AudioCapture {
     try {
       await Promise.all([
         context.audioWorklet.addModule('/audio-processor.js'),
-        this.prepareVad(maxUtteranceSeconds, context.sampleRate, enhancedVoiceFilter),
+        this.prepareVad(
+          maxUtteranceSeconds,
+          nativeMixedCapture ? 48_000 : context.sampleRate,
+          enhancedVoiceFilter,
+        ),
       ]);
       await context.resume();
     } catch (error) {
@@ -355,13 +366,17 @@ export class AudioCapture {
       gainNodes[index].gain.value = inputGain;
       source.connect(gainNodes[index]).connect(mixer);
     });
-    const node = new AudioWorkletNode(context, 'microphone-tap-processor');
-    const silent = context.createGain();
-    silent.gain.value = 0;
-    mixer.connect(limiter).connect(node).connect(silent).connect(context.destination);
+    const node = sourceNodes.length > 0
+      ? new AudioWorkletNode(context, 'microphone-tap-processor')
+      : null;
+    if (node) {
+      const silent = context.createGain();
+      silent.gain.value = 0;
+      mixer.connect(limiter).connect(node).connect(silent).connect(context.destination);
+    }
     this.onPcm = onPcm;
     this.onBoundary = onBoundary;
-    node.port.onmessage = (event: MessageEvent<CaptureMessage>) => {
+    if (node) node.port.onmessage = (event: MessageEvent<CaptureMessage>) => {
       if (
         event.data.type === 'samples' &&
         event.data.payload &&
@@ -382,8 +397,11 @@ export class AudioCapture {
         && this.vadWorker
         && !this.suppressed
       ) {
-        const payload = decodeAndroidPcm(event.data);
-        this.vadWorker.postMessage({ type: 'samples', payload }, [payload]);
+        if (event.sampleRate !== 48_000) {
+          this.onFatalError?.(new Error(`Android 内录采样率异常（${event.sampleRate} Hz）`));
+          return;
+        }
+        this.vadWorker.postMessage({ type: 'android_pcm', payload: event.data });
       } else if (event.type === 'capture-stopped' && !this.stopping && this.context) {
         this.onFatalError?.(new Error('Android 后台录音已停止'));
       } else if (event.type === 'capture-error' && !this.stopping) {
@@ -409,6 +427,7 @@ export class AudioCapture {
     this.limiter = limiter;
     this.context = context;
     this.node = node;
+    this.currentOptions = { ...options };
     if (this.androidCapture) markAndroidCaptureReady();
     onReady();
   }
@@ -444,12 +463,32 @@ export class AudioCapture {
     this.limiter = null;
     this.context = null;
     this.androidCapture = false;
+    this.currentOptions = null;
     this.onPcm = null;
     this.onLevel = null;
     this.onBoundary = null;
     this.onFatalError = null;
     this.vadReady = false;
     this.stopping = false;
+  }
+
+  updateOptions(options: AudioCaptureOptions) {
+    if (
+      !this.context
+      || !this.androidCapture
+      || !this.currentOptions?.systemAudio
+      || !options.systemAudio
+    ) {
+      return false;
+    }
+    updateAndroidCapture(
+      options.microphone,
+      options.systemAudio,
+      options.noiseSuppression,
+      options.echoCancellation,
+    );
+    this.currentOptions = { ...options };
+    return true;
   }
 
   setSuppressed(suppressed: boolean) {
@@ -560,6 +599,7 @@ export class PcmPlayer {
 export class Waveform {
   private values = Array.from({ length: 52 }, (_, index) => 0.05 + (index % 5) * 0.015);
   private frame = 0;
+  private lastDrawAt = 0;
   private active = false;
   private running = true;
 
@@ -591,8 +631,13 @@ export class Waveform {
     this.canvas.height = Math.max(1, Math.round(bounds.height * ratio));
   };
 
-  private draw = () => {
+  private draw = (timestamp = performance.now()) => {
     if (!this.running) return;
+    if (timestamp - this.lastDrawAt < 50) {
+      requestAnimationFrame(this.draw);
+      return;
+    }
+    this.lastDrawAt = timestamp;
     const context = this.canvas.getContext('2d');
     if (!context) return;
     const width = this.canvas.width;
