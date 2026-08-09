@@ -5,7 +5,11 @@ export type AndroidNativeEvent =
   | { type: 'audio-pcm'; data: string; sampleRate: number }
   | { type: 'overlay-opened' }
   | { type: 'overlay-closed' }
-  | { type: 'overlay-error'; message: string };
+  | { type: 'overlay-error'; message: string }
+  | { type: 'download-started'; fileName: string }
+  | { type: 'download-completed'; fileName: string }
+  | { type: 'download-cancelled' }
+  | { type: 'download-error'; message: string };
 
 interface AndroidVoiceElfBridge {
   platform(): string;
@@ -28,6 +32,7 @@ interface AndroidVoiceElfBridge {
   updateSubtitleOverlay(payload: string): void;
   hideSubtitleOverlay(): void;
   subtitleOverlayVisible(): boolean;
+  downloadFile(url: string, fileName: string, mimeType: string): void;
 }
 
 declare global {
@@ -184,4 +189,10 @@ export function isAndroidSubtitleOverlayVisible() {
   } catch {
     return false;
   }
+}
+
+export function downloadAndroidFile(url: string, fileName: string, mimeType: string) {
+  if (!isAndroidNativeShell()) return false;
+  window.VoiceElfAndroid?.downloadFile(url, fileName, mimeType);
+  return true;
 }

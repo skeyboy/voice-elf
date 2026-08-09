@@ -10,6 +10,7 @@ import {
 } from '../api';
 import { loadAppConfig } from '../app-config';
 import {
+  downloadAndroidFile,
   isAndroidNativeShell,
   isAndroidSubtitleOverlayVisible,
   showAndroidSubtitleOverlay,
@@ -47,6 +48,13 @@ interface TranslatorCacheEntry {
   historyPage: number;
   historyTotal: number;
   historyQuery: string;
+}
+
+interface RoomExportSelection {
+  sourceText: boolean;
+  translatedText: boolean;
+  sourceAudio: boolean;
+  translatedAudio: boolean;
 }
 
 const translatorViewStates = new Map<string, TranslatorViewState>();
@@ -209,6 +217,15 @@ export class TranslatorPage implements Page {
       if (event.type === 'overlay-opened') this.androidOverlayActive = true;
       if (event.type === 'overlay-closed') this.androidOverlayActive = false;
       if (event.type === 'overlay-error') this.onError(event.message);
+      if (event.type === 'download-started') this.setExportStatus('正在保存会议记录…', true);
+      if (event.type === 'download-completed') {
+        this.setExportStatus(`已保存 ${event.fileName}`, false);
+      }
+      if (event.type === 'download-cancelled') this.setExportStatus('已取消保存', false);
+      if (event.type === 'download-error') {
+        this.setExportStatus(event.message, false, true);
+        this.onError(event.message);
+      }
     });
     this.androidOverlayActive = isAndroidSubtitleOverlayVisible();
     this.pushAndroidSubtitle();
@@ -310,6 +327,7 @@ export class TranslatorPage implements Page {
           </div>
           <div class="room-toolbar-actions" aria-label="会议操作">
             <button class="room-command open-record-search" type="button"><i data-lucide="search"></i><span>记录</span></button>
+            <button class="room-command open-room-export" type="button"><i data-lucide="download"></i><span>导出</span></button>
             <button class="room-command open-subtitles" type="button"><i data-lucide="captions"></i><span>字幕</span></button>
             <button class="room-command open-room-management" type="button" ${room.is_owner ? '' : 'hidden'}><i data-lucide="settings-2"></i><span>管理</span></button>
           </div>
@@ -320,6 +338,22 @@ export class TranslatorPage implements Page {
             <header><div><small>TRANSCRIPTS</small><h2>检索会议记录</h2></div><button class="icon-button close-record-search" type="button" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button></header>
             <label><span>原文或译文</span><span class="room-action-input"><i data-lucide="search"></i><input type="search" placeholder="输入关键词" aria-label="检索房间记录"></span></label>
             <div class="room-action-footer"><button class="secondary-command clear-record-search" type="button">清除</button><button class="primary-command" type="submit">检索记录</button></div>
+          </form>
+        </dialog>
+
+        <dialog class="room-action-dialog room-export-dialog">
+          <form class="room-export-form">
+            <header><div><small>EXPORT RECORDS</small><h2>下载会议记录</h2></div><button class="icon-button close-room-export" type="button" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button></header>
+            <fieldset class="room-export-options">
+              <legend>选择要下载的内容，可任意组合</legend>
+              <label class="room-export-option"><input name="source_text" type="checkbox" checked><span class="room-action-icon"><i data-lucide="file-text"></i></span><span><strong>原文文字</strong><small>识别得到的发言文本</small></span></label>
+              <label class="room-export-option"><input name="translated_text" type="checkbox" checked><span class="room-action-icon"><i data-lucide="languages"></i></span><span><strong>译文文字</strong><small>会议实时翻译文本</small></span></label>
+              <label class="room-export-option"><input name="source_audio" type="checkbox"><span class="room-action-icon"><i data-lucide="mic"></i></span><span><strong>原始音频</strong><small>会议中收录的发言声音</small></span></label>
+              <label class="room-export-option"><input name="translated_audio" type="checkbox"><span class="room-action-icon"><i data-lucide="volume-2"></i></span><span><strong>译文音频</strong><small>已生成的翻译播报声音</small></span></label>
+            </fieldset>
+            <p class="room-export-summary">文字内容将生成 UTF-8 TXT 文件</p>
+            <p class="room-export-status" role="status" aria-live="polite"></p>
+            <div class="room-action-footer"><button class="secondary-command close-room-export-footer" type="button">取消</button><button class="primary-command submit-room-export" type="submit"><i data-lucide="download"></i><span>下载</span></button></div>
           </form>
         </dialog>
 
@@ -357,6 +391,7 @@ export class TranslatorPage implements Page {
     if (!this.root || !this.room) return;
     this.root.querySelector('.room-back')?.addEventListener('click', this.onRooms);
     const searchDialog = this.root.querySelector<HTMLDialogElement>('.record-search-dialog')!;
+    const exportDialog = this.root.querySelector<HTMLDialogElement>('.room-export-dialog')!;
     const managementDialog = this.root.querySelector<HTMLDialogElement>('.room-management-dialog')!;
     this.root.querySelector('.open-record-search')?.addEventListener('click', () => {
       searchDialog.showModal();
@@ -370,10 +405,24 @@ export class TranslatorPage implements Page {
       searchDialog.close();
     });
     this.root.querySelector('.open-room-management')?.addEventListener('click', () => managementDialog.showModal());
+    this.root.querySelector('.open-room-export')?.addEventListener('click', () => {
+      this.setExportStatus('', false);
+      this.updateExportSummary();
+      exportDialog.showModal();
+    });
+    this.root.querySelector('.close-room-export')?.addEventListener('click', () => exportDialog.close());
+    this.root.querySelector('.close-room-export-footer')?.addEventListener('click', () => exportDialog.close());
     this.root.querySelector('.close-room-management')?.addEventListener('click', () => managementDialog.close());
-    [searchDialog, managementDialog].forEach((dialog) => dialog.addEventListener('click', (event) => {
+    [searchDialog, exportDialog, managementDialog].forEach((dialog) => dialog.addEventListener('click', (event) => {
       if (event.target === dialog) dialog.close();
     }));
+    exportDialog.querySelectorAll<HTMLInputElement>('input[type="checkbox"]').forEach((input) => {
+      input.addEventListener('change', () => this.updateExportSummary());
+    });
+    exportDialog.querySelector<HTMLFormElement>('form')?.addEventListener('submit', (event) => {
+      event.preventDefault();
+      void this.exportRoomRecords();
+    });
     this.root.querySelector('.record-button')?.addEventListener('click', () =>
       void this.voiceSession?.toggleRecording().catch((error) =>
         this.onError(error instanceof Error ? error.message : '无法启动录音'),
@@ -949,6 +998,94 @@ export class TranslatorPage implements Page {
       this.onDeleted();
     } catch (error) {
       this.onError(error instanceof Error ? error.message : '无法删除房间');
+    }
+  }
+
+  private exportSelection(): RoomExportSelection {
+    const checked = (name: string) => Boolean(
+      this.root?.querySelector<HTMLInputElement>(`.room-export-dialog input[name="${name}"]`)?.checked,
+    );
+    return {
+      sourceText: checked('source_text'),
+      translatedText: checked('translated_text'),
+      sourceAudio: checked('source_audio'),
+      translatedAudio: checked('translated_audio'),
+    };
+  }
+
+  private updateExportSummary() {
+    const selection = this.exportSelection();
+    const hasText = selection.sourceText || selection.translatedText;
+    const hasAudio = selection.sourceAudio || selection.translatedAudio;
+    const submit = this.root?.querySelector<HTMLButtonElement>('.submit-room-export');
+    const summary = this.root?.querySelector<HTMLElement>('.room-export-summary');
+    if (submit) submit.disabled = !hasText && !hasAudio;
+    if (!summary) return;
+    summary.textContent = !hasText && !hasAudio
+      ? '请至少选择一种会议记录内容'
+      : hasText && hasAudio
+        ? '文字和音频将整理为 ZIP 压缩包'
+        : hasAudio
+          ? '单个音频直接下载 WAV，多个音频自动整理为 ZIP'
+          : '文字内容将生成 UTF-8 TXT 文件';
+    summary.dataset.tone = !hasText && !hasAudio ? 'error' : 'neutral';
+  }
+
+  private setExportStatus(message: string, busy: boolean, error = false) {
+    const status = this.root?.querySelector<HTMLElement>('.room-export-status');
+    const submit = this.root?.querySelector<HTMLButtonElement>('.submit-room-export');
+    if (status) {
+      status.textContent = message;
+      status.dataset.tone = error ? 'error' : 'neutral';
+    }
+    if (submit) {
+      submit.disabled = busy;
+      submit.setAttribute('aria-busy', String(busy));
+    }
+    if (!busy) this.updateExportSummary();
+  }
+
+  private async exportRoomRecords() {
+    const selection = this.exportSelection();
+    const hasText = selection.sourceText || selection.translatedText;
+    const hasAudio = selection.sourceAudio || selection.translatedAudio;
+    if (!hasText && !hasAudio) {
+      this.updateExportSummary();
+      return;
+    }
+    const params = new URLSearchParams();
+    if (selection.sourceText) params.set('source_text', 'true');
+    if (selection.translatedText) params.set('translated_text', 'true');
+    if (selection.sourceAudio) params.set('source_audio', 'true');
+    if (selection.translatedAudio) params.set('translated_audio', 'true');
+    if (isAndroidNativeShell() && hasAudio) params.set('archive', 'true');
+    const url = `/api/rooms/${this.roomId}/export?${params}`;
+    const fallbackName = hasAudio
+      ? `voice-elf-room-${this.roomId}-records.zip`
+      : `voice-elf-room-${this.roomId}-transcript.txt`;
+    const mimeType = hasAudio ? 'application/zip' : 'text/plain';
+    this.setExportStatus(isAndroidNativeShell() ? '请选择保存位置' : '正在准备下载…', true);
+    if (downloadAndroidFile(url, fallbackName, mimeType)) return;
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null) as { error?: string } | null;
+        throw new Error(payload?.error ?? `下载失败（HTTP ${response.status}）`);
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get('content-disposition') ?? '';
+      const fileName = disposition.match(/filename="?([^";]+)"?/i)?.[1] ?? fallbackName;
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = fileName;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      this.setExportStatus(`已开始下载 ${fileName}`, false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '无法下载会议记录';
+      this.setExportStatus(message, false, true);
+      this.onError(message);
     }
   }
 }

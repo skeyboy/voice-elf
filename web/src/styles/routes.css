@@ -6032,6 +6032,94 @@ body.subtitle-route {
   gap: 8px;
 }
 
+.room-export-options {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+  border: 0;
+}
+
+.room-export-options legend {
+  width: 100%;
+  margin-bottom: 7px;
+  color: #66736c;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.room-action-dialog .room-export-option {
+  min-height: 62px;
+  padding: 8px 5px;
+  display: grid;
+  grid-template-columns: 20px 36px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  color: #28362f;
+  border-bottom: 1px solid #e6eae7;
+  cursor: pointer;
+}
+
+.room-action-dialog .room-export-option:last-child {
+  border-bottom: 0;
+}
+
+.room-export-option:hover {
+  background: #f7f9f7;
+}
+
+.room-export-option input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: #287653;
+}
+
+.room-export-option > span:last-child {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.room-export-option strong {
+  font-size: 12px;
+}
+
+.room-export-option small {
+  color: #748078;
+  font-size: 10px;
+}
+
+.room-export-summary,
+.room-export-status {
+  min-height: 18px;
+  margin: -4px 0 0;
+  color: #637168;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.room-export-status:empty {
+  display: none;
+}
+
+.room-export-summary[data-tone="error"],
+.room-export-status[data-tone="error"] {
+  color: #a13d35;
+}
+
+.submit-room-export {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.submit-room-export svg {
+  width: 14px;
+  height: 14px;
+}
+
 .room-action-item {
   min-height: 64px;
   padding: 10px 8px;

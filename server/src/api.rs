@@ -28,6 +28,7 @@ use crate::{
 mod accounts;
 mod asr;
 mod authority;
+mod exports;
 mod setup;
 mod tts;
 
@@ -41,6 +42,7 @@ const MAX_VOICE_REFERENCE_MS: i64 = 15_000;
 pub fn router() -> Router<AppState> {
     Router::new()
         .merge(authority::router())
+        .merge(exports::router())
         .merge(asr::router())
         .merge(accounts::router())
         .merge(setup::router())

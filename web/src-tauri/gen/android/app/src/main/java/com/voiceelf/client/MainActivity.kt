@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import androidx.activity.enableEdgeToEdge
@@ -17,11 +18,15 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URI
+import java.net.URL
 
 class MainActivity : TauriActivity() {
   private var appWebView: WebView? = null
   private var pendingCapture: CaptureRequest? = null
   private var pendingOverlayPayload: String? = null
+  private var pendingDownload: DownloadRequest? = null
   private var safeInsetTop = 0f
   private var safeInsetRight = 0f
   private var safeInsetBottom = 0f
@@ -74,6 +79,20 @@ class MainActivity : TauriActivity() {
       return@registerForActivityResult
     }
     startSubtitleOverlay(payload)
+  }
+
+  private val downloadDestinationLauncher = registerForActivityResult(
+    ActivityResultContracts.StartActivityForResult(),
+  ) { result ->
+    val request = pendingDownload
+    pendingDownload = null
+    val destination = result.data?.data
+    if (request == null) return@registerForActivityResult
+    if (result.resultCode != Activity.RESULT_OK || destination == null) {
+      emitNativeEvent(JSONObject().put("type", "download-cancelled"))
+      return@registerForActivityResult
+    }
+    saveDownload(request, destination)
   }
 
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -209,6 +228,41 @@ class MainActivity : TauriActivity() {
 
     @JavascriptInterface
     fun subtitleOverlayVisible() = SubtitleOverlayService.visible
+
+    @JavascriptInterface
+    fun downloadFile(url: String, fileName: String, mimeType: String) =
+      runTrusted(webView, "download-error") {
+        val resolvedUrl = webView.url?.let { pageUrl ->
+          runCatching { URI(pageUrl).resolve(url).toString() }.getOrNull()
+        }
+        val resolvedUri = resolvedUrl?.let(Uri::parse)
+        if (resolvedUrl == null ||
+          (resolvedUri?.host != "127.0.0.1" && resolvedUri?.host != "localhost") ||
+          (resolvedUri.scheme != "http" && resolvedUri.scheme != "https")
+        ) {
+          emitNativeEvent(JSONObject().put("type", "download-error").put("message", "下载地址无效"))
+          return@runTrusted
+        }
+        val safeName = sanitizeFileName(fileName)
+        val safeMimeType = when (mimeType) {
+          "text/plain", "application/zip", "audio/wav" -> mimeType
+          else -> "application/octet-stream"
+        }
+        pendingDownload = DownloadRequest(
+          url = resolvedUrl,
+          fileName = safeName,
+          mimeType = safeMimeType,
+          cookie = CookieManager.getInstance().getCookie(resolvedUrl).orEmpty(),
+          userAgent = webView.settings.userAgentString.orEmpty(),
+        )
+        downloadDestinationLauncher.launch(
+          Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = safeMimeType
+            putExtra(Intent.EXTRA_TITLE, safeName)
+          },
+        )
+      }
   }
 
   private fun continueCaptureRequest() {
@@ -255,11 +309,58 @@ class MainActivity : TauriActivity() {
     )
   }
 
-  private fun runTrusted(webView: WebView, block: () -> Unit) {
+  private fun saveDownload(request: DownloadRequest, destination: Uri) {
+    emitNativeEvent(
+      JSONObject().put("type", "download-started").put("fileName", request.fileName),
+    )
+    Thread({
+      var connection: HttpURLConnection? = null
+      try {
+        connection = URL(request.url).openConnection() as HttpURLConnection
+        connection.connectTimeout = 15_000
+        connection.readTimeout = 120_000
+        connection.instanceFollowRedirects = false
+        if (request.cookie.isNotBlank()) connection.setRequestProperty("Cookie", request.cookie)
+        if (request.userAgent.isNotBlank()) connection.setRequestProperty("User-Agent", request.userAgent)
+        val status = connection.responseCode
+        if (status !in 200..299) throw IllegalStateException("下载失败（HTTP $status）")
+        val output = contentResolver.openOutputStream(destination, "w")
+          ?: throw IllegalStateException("无法写入所选文件")
+        output.buffered().use { target ->
+          connection.inputStream.buffered().use { source ->
+            source.copyTo(target, DEFAULT_BUFFER_SIZE)
+          }
+        }
+        emitNativeEvent(
+          JSONObject().put("type", "download-completed").put("fileName", request.fileName),
+        )
+      } catch (error: Exception) {
+        runCatching { contentResolver.delete(destination, null, null) }
+        emitNativeEvent(
+          JSONObject()
+            .put("type", "download-error")
+            .put("message", error.message ?: "无法保存会议记录"),
+        )
+      } finally {
+        connection?.disconnect()
+      }
+    }, "voice-elf-room-download").start()
+  }
+
+  private fun sanitizeFileName(fileName: String): String {
+    val sanitized = fileName
+      .substringAfterLast('/')
+      .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+      .trim()
+      .take(160)
+    return sanitized.ifBlank { "voice-elf-room-records.zip" }
+  }
+
+  private fun runTrusted(webView: WebView, errorType: String = "capture-error", block: () -> Unit) {
     runOnUiThread {
       val uri = webView.url?.let(Uri::parse)
       if (uri?.host == "127.0.0.1" || uri?.host == "localhost") block()
-      else emitNativeEvent(JSONObject().put("type", "capture-error").put("message", "已阻止非本地页面调用原生录音能力"))
+      else emitNativeEvent(JSONObject().put("type", errorType).put("message", "已阻止非本地页面调用原生能力"))
     }
   }
 
@@ -295,6 +396,14 @@ class MainActivity : TauriActivity() {
     val systemAudio: Boolean,
     val noiseSuppression: Boolean,
     val echoCancellation: Boolean,
+  )
+
+  private data class DownloadRequest(
+    val url: String,
+    val fileName: String,
+    val mimeType: String,
+    val cookie: String,
+    val userAgent: String,
   )
 
   companion object {

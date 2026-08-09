@@ -1393,5 +1393,5 @@ pub use tts::TtsSystemSetting;
 
 pub use history::{
     NewUtteranceAttempt, RefinementUpdate, TranscriptUpdate, TranslationUpdate,
-    UtteranceAudioUpdate, UtteranceHistory,
+    UtteranceAudioUpdate, UtteranceExport, UtteranceHistory,
 };

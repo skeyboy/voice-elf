@@ -162,6 +162,19 @@ struct UtteranceHistoryRow {
     created_at: DateTime<Utc>,
 }
 
+#[derive(diesel::Queryable, diesel::Selectable)]
+#[diesel(table_name = voice_utterances)]
+struct UtteranceExportRow {
+    id: Uuid,
+    source_text: String,
+    translated_text: String,
+    source_language: String,
+    target_language: String,
+    source_audio_path: Option<String>,
+    translated_audio_path: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct UtteranceHistory {
     pub id: Uuid,
@@ -179,6 +192,18 @@ pub struct UtteranceHistory {
     pub refinements: Vec<UtteranceRefinement>,
 }
 
+#[derive(Clone, Debug)]
+pub struct UtteranceExport {
+    pub source_text: String,
+    pub translated_text: String,
+    pub source_language: String,
+    pub target_language: String,
+    pub source_audio_path: Option<String>,
+    pub translated_audio_path: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub speakers: Vec<SpeakerIdentity>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct UtteranceRefinement {
     pub engine: String,
@@ -192,6 +217,53 @@ pub struct UtteranceRefinement {
 }
 
 impl Database {
+    pub async fn list_utterances_for_export(&self, room_id: Uuid) -> Result<Vec<UtteranceExport>> {
+        let mut connection = self.pool.get().await?;
+        let rows = voice_utterances::table
+            .filter(voice_utterances::room_id.eq(Some(room_id)))
+            .order(voice_utterances::created_at.asc())
+            .select(UtteranceExportRow::as_select())
+            .load(&mut connection)
+            .await?;
+        let utterance_ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let speaker_rows = if utterance_ids.is_empty() {
+            Vec::new()
+        } else {
+            voice_utterance_speakers::table
+                .filter(voice_utterance_speakers::utterance_id.eq_any(&utterance_ids))
+                .order(voice_utterance_speakers::created_at.asc())
+                .select(UtteranceSpeakerHistoryRow::as_select())
+                .load(&mut connection)
+                .await?
+        };
+        let mut speakers_by_utterance = HashMap::<Uuid, Vec<SpeakerIdentity>>::new();
+        for speaker in speaker_rows {
+            speakers_by_utterance
+                .entry(speaker.utterance_id)
+                .or_default()
+                .push(SpeakerIdentity {
+                    user_id: speaker.user_id,
+                    username: speaker.username,
+                });
+        }
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let id = row.id;
+                UtteranceExport {
+                    source_text: row.source_text,
+                    translated_text: row.translated_text,
+                    source_language: row.source_language,
+                    target_language: row.target_language,
+                    source_audio_path: row.source_audio_path,
+                    translated_audio_path: row.translated_audio_path,
+                    created_at: row.created_at,
+                    speakers: speakers_by_utterance.remove(&id).unwrap_or_default(),
+                }
+            })
+            .collect())
+    }
+
     pub async fn recover_interrupted_utterances(&self) -> Result<usize> {
         let mut connection = self.pool.get().await?;
         let mut updated = 0;
