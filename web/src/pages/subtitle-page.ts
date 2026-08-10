@@ -4,6 +4,11 @@ import { refreshIcons } from '../components/icons';
 import { renderPageLoading } from '../components/page-loading';
 import type { ServerEvent, SpeakerIdentity } from '../protocol';
 import {
+  connectGrpcRealtime,
+  connectWebSocket,
+  type RealtimeTransport,
+} from '../realtime-transport';
+import {
   loadSubtitlePreferences,
   subscribeSubtitlePreferences,
   type SubtitlePreferences,
@@ -31,7 +36,7 @@ const TYPEWRITER_INTERVAL_MS = 28;
 
 export class SubtitlePage implements Page {
   private root: HTMLElement | null = null;
-  private socket: WebSocket | null = null;
+  private transport: RealtimeTransport | null = null;
   private socketVersion = 0;
   private reconnectTimer = 0;
   private destroyed = false;
@@ -103,8 +108,8 @@ export class SubtitlePage implements Page {
     this.destroyed = true;
     this.socketVersion += 1;
     window.clearTimeout(this.reconnectTimer);
-    this.socket?.close();
-    this.socket = null;
+    this.transport?.close();
+    this.transport = null;
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     window.cancelAnimationFrame(this.typewriterFrame);
@@ -178,35 +183,42 @@ export class SubtitlePage implements Page {
     this.disconnect();
     const version = this.socketVersion;
     this.setConnection('connecting');
-    const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    this.socket = new WebSocket(
-      `${scheme}//${window.location.host}/ws?room_id=${encodeURIComponent(this.roomId)}`,
-    );
-    this.socket.onopen = () => this.setConnection('connected');
-    this.socket.onmessage = (message) => this.handleMessage(message);
-    this.socket.onerror = () => this.setConnection('offline');
-    this.socket.onclose = () => {
-      if (version !== this.socketVersion || this.destroyed) return;
-      this.setConnection('offline');
-      this.reconnectTimer = window.setTimeout(() => this.connect(), 1800);
+    let opened = false;
+    let usingFallback = false;
+    const callbacks = {
+      message: (message: string | ArrayBuffer) => {
+        if (typeof message === 'string') this.handleMessage(message);
+      },
+      open: () => {
+        opened = true;
+        this.setConnection('connected');
+      },
+      close: () => {
+        if (version !== this.socketVersion || this.destroyed) return;
+        if (!opened && !usingFallback) {
+          usingFallback = true;
+          this.transport?.close();
+          this.transport = connectWebSocket(this.roomId, callbacks);
+          return;
+        }
+        this.setConnection('offline');
+        this.reconnectTimer = window.setTimeout(() => this.connect(), 1800);
+      },
     };
+    this.transport = connectGrpcRealtime(this.roomId, callbacks);
   }
 
   private disconnect() {
     this.socketVersion += 1;
     window.clearTimeout(this.reconnectTimer);
-    if (this.socket) {
-      this.socket.onclose = null;
-      this.socket.close();
-    }
-    this.socket = null;
+    this.transport?.close();
+    this.transport = null;
   }
 
-  private handleMessage(message: MessageEvent) {
-    if (typeof message.data !== 'string') return;
+  private handleMessage(message: string) {
     let event: ServerEvent;
     try {
-      event = JSON.parse(message.data) as ServerEvent;
+      event = JSON.parse(message) as ServerEvent;
     } catch {
       this.onError('实时字幕收到无效消息');
       return;

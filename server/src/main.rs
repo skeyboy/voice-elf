@@ -4,6 +4,7 @@ mod audio;
 mod authority;
 mod backends;
 mod config;
+mod grpc;
 mod index_tts_runtime;
 mod mailer;
 mod media;
@@ -155,9 +156,10 @@ async fn main() -> Result<()> {
             state.clone(),
             authorize_media,
         ));
+    let grpc = grpc::router(state.clone());
     let app = Router::new()
         .route("/api/health", get(health))
-        .nest("/api", api::router())
+        .nest("/api", api::file_router())
         .route("/ws", get(websocket))
         .nest("/media", media_files)
         .route_service("/login", ServeFile::new(&index_file))
@@ -169,6 +171,8 @@ async fn main() -> Result<()> {
         .route_service("/me", ServeFile::new(&index_file))
         .route_service("/admin", ServeFile::new(&index_file))
         .route_service("/settings", ServeFile::new(&index_file))
+        .with_state(state)
+        .merge(grpc)
         .fallback_service(static_files)
         .layer(middleware::from_fn(cache_vad_assets))
         .layer(CompressionLayer::new())
@@ -185,8 +189,7 @@ async fn main() -> Result<()> {
             HeaderValue::from_static("microphone=(self), display-capture=(self)"),
         ))
         .layer(CookieManagerLayer::new())
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(

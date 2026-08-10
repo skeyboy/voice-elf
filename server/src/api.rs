@@ -84,6 +84,13 @@ pub fn router() -> Router<AppState> {
         )
 }
 
+pub fn file_router() -> Router<AppState> {
+    Router::new().merge(exports::router()).route(
+        "/voice-references/{voice_id}/audio",
+        get(voice_reference_audio),
+    )
+}
+
 #[derive(Serialize)]
 struct VoiceReferenceResponse {
     id: Uuid,
@@ -936,6 +943,19 @@ pub async fn authenticate(state: &AppState, cookies: &Cookies) -> Result<UserRec
         .ok_or_else(ApiError::unauthorized)?;
     database(state)?
         .user_by_session_hash(&token_hash(&token))
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::unauthorized)
+}
+
+pub(crate) async fn authenticate_token(
+    state: &AppState,
+    token: &str,
+) -> Result<UserRecord, ApiError> {
+    require_initialized(state).await?;
+    require_authority(state).await?;
+    database(state)?
+        .user_by_session_hash(&token_hash(token))
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(ApiError::unauthorized)

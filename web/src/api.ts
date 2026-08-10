@@ -1,4 +1,5 @@
 import type { LatencyReport, TranscriptionSegment } from './protocol';
+import { grpcApiCall } from './grpc-web';
 
 export interface User {
   id: string;
@@ -312,15 +313,22 @@ export class ApiRequestError extends Error {
 }
 
 export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const headers = new Headers(init.headers);
-  if (init.body && !(init.body instanceof FormData)) headers.set('content-type', 'application/json');
-  const response = await fetch(path, { ...init, headers });
-  if (!response.ok) {
-    const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+  const response = await grpcApiCall(path, init);
+  const text = response.body.length ? new TextDecoder().decode(response.body) : '';
+  if (response.status < 200 || response.status >= 300) {
+    const payload = safeJson<{ error?: string }>(text);
     throw new ApiRequestError(payload?.error ?? `请求失败 (${response.status})`, response.status);
   }
   if (response.status === 204) return undefined as T;
-  return (await response.json()) as T;
+  return JSON.parse(text) as T;
+}
+
+function safeJson<T>(value: string): T | null {
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return null;
+  }
 }
 
 export function listVoiceReferences() {

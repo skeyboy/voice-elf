@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package voice_elf.v1;
+
+service ApiService {
+  rpc Call(ApiRequest) returns (ApiResponse);
+  rpc SubscribeRealtime(RealtimeSubscribeRequest) returns (stream RealtimeOutput);
+  rpc SendRealtime(RealtimeInput) returns (RealtimeAck);
+}
+
+message RealtimeSubscribeRequest {
+  string room_id = 1;
+}
+
+message RealtimeOutput {
+  string session_id = 1;
+  oneof payload {
+    string event_json = 2;
+    bytes audio = 3;
+  }
+}
+
+message RealtimeInput {
+  string session_id = 1;
+  oneof payload {
+    string event_json = 2;
+    bytes audio = 3;
+  }
+}
+
+message RealtimeAck {
+  bool accepted = 1;
+}
+
+message Header {
+  string name = 1;
+  bytes value = 2;
+}
+
+message ApiRequest {
+  string method = 1;
+  string path = 2;
+  repeated Header headers = 3;
+  bytes body = 4;
+}
+
+message ApiResponse {
+  uint32 status = 1;
+  repeated Header headers = 2;
+  bytes body = 3;
+}

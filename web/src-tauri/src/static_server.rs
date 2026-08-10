@@ -217,6 +217,7 @@ fn router(state: ServerState) -> Router {
         .route("/__voice_elf/mac-audio/stop", post(stop_mac_audio))
         .route("/__voice_elf/mac-audio/status", get(mac_audio_status))
         .route("/ws", get(proxy_websocket))
+        .route("/voice_elf.v1.ApiService/{*path}", any(proxy_http))
         .route("/api", any(proxy_http))
         .route("/api/{*path}", any(proxy_http))
         .route("/media/{*path}", any(proxy_http))

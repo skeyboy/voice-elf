@@ -7,6 +7,11 @@ import {
 } from '../audio';
 import type { ServerEvent, SessionConfig } from '../protocol';
 import type { ConnectionStatus } from '../components/topbar';
+import {
+  connectGrpcRealtime,
+  connectWebSocket,
+  type RealtimeTransport,
+} from '../realtime-transport';
 
 const MIN_VALID_SPEECH_FRAMES = 3;
 const PLAYBACK_TAIL_GUARD_MS = 300;
@@ -21,7 +26,7 @@ interface VoiceSessionCallbacks {
 export class VoiceSession {
   private readonly audioCapture = new AudioCapture();
   private readonly waveform: Waveform;
-  private socket: WebSocket | null = null;
+  private transport: RealtimeTransport | null = null;
   private socketVersion = 0;
   private reconnectTimer = 0;
   private receivingAudio: {
@@ -59,22 +64,30 @@ export class VoiceSession {
     const version = this.socketVersion;
     this.destroyed = false;
     this.callbacks.onConnection('connecting');
-    const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    this.socket = new WebSocket(
-      `${scheme}//${window.location.host}/ws?room_id=${encodeURIComponent(this.roomId)}`,
-    );
-    this.socket.binaryType = 'arraybuffer';
-    this.socket.onopen = () => this.callbacks.onConnection('connected');
-    this.socket.onmessage = (message) => this.handleMessage(message);
-    this.socket.onerror = () => this.callbacks.onConnection('offline');
-    this.socket.onclose = () => {
-      if (version !== this.socketVersion || this.destroyed) return;
-      this.receivingAudio = null;
-      this.player.stop();
-      this.callbacks.onConnection('offline');
-      if (this.recording) void this.stopRecording();
-      this.reconnectTimer = window.setTimeout(() => this.connect(), 1800);
+    let opened = false;
+    let usingFallback = false;
+    const callbacks = {
+      message: (message: string | ArrayBuffer) => this.handleMessage(message),
+      open: () => {
+        opened = true;
+        this.callbacks.onConnection('connected');
+      },
+      close: () => {
+        if (version !== this.socketVersion || this.destroyed) return;
+        if (!opened && !usingFallback) {
+          usingFallback = true;
+          this.transport?.close();
+          this.transport = connectWebSocket(this.roomId, callbacks);
+          return;
+        }
+        this.receivingAudio = null;
+        this.player.stop();
+        this.callbacks.onConnection('offline');
+        if (this.recording) void this.stopRecording();
+        this.reconnectTimer = window.setTimeout(() => this.connect(), 1800);
+      },
     };
+    this.transport = connectGrpcRealtime(this.roomId, callbacks);
   }
 
   sendConfig() {
@@ -92,7 +105,7 @@ export class VoiceSession {
     if (!this.canPublish) return;
     if (this.recording) await this.stopRecording();
     else {
-      if (this.socket?.readyState !== WebSocket.OPEN) {
+      if (!this.transport?.open) {
         throw new Error('实时会话尚未连接，请稍后重试');
       }
       await this.startRecording();
@@ -152,11 +165,8 @@ export class VoiceSession {
   private disconnect() {
     this.socketVersion += 1;
     window.clearTimeout(this.reconnectTimer);
-    if (this.socket) {
-      this.socket.onclose = null;
-      this.socket.close();
-    }
-    this.socket = null;
+    this.transport?.close();
+    this.transport = null;
   }
 
   private async startRecording() {
@@ -185,8 +195,8 @@ export class VoiceSession {
       this.activeEnhancedVoiceFilter,
       options,
       (pcm) => {
-        if (this.activeTcId && this.socket?.readyState === WebSocket.OPEN) {
-          this.socket.send(pcm);
+        if (this.activeTcId && this.transport?.open) {
+          this.transport.sendAudio(pcm);
           this.activeSampleCount += pcm.byteLength / Int16Array.BYTES_PER_ELEMENT;
         }
       },
@@ -304,16 +314,16 @@ export class VoiceSession {
     this.audioCapture.setSuppressed(this.recording && this.playbackHolds.size > 0);
   }
 
-  private handleMessage(message: MessageEvent) {
-    if (message.data instanceof ArrayBuffer) {
+  private handleMessage(message: string | ArrayBuffer) {
+    if (message instanceof ArrayBuffer) {
       const playback = this.receivingAudio;
       if (!playback) return;
-      void this.player.enqueue(message.data, this.audioSampleRate, playback.channels);
+      void this.player.enqueue(message, this.audioSampleRate, playback.channels);
       return;
     }
     let event: ServerEvent;
     try {
-      event = JSON.parse(message.data as string) as ServerEvent;
+      event = JSON.parse(message) as ServerEvent;
     } catch {
       this.callbacks.onCaptureError('服务端返回了无效的实时消息');
       return;
@@ -342,6 +352,6 @@ export class VoiceSession {
   }
 
   private sendJson(payload: object) {
-    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(payload));
+    if (this.transport?.open) this.transport.sendJson(payload);
   }
 }
