@@ -18,7 +18,11 @@ import {
   updateAndroidSubtitleOverlay,
   type AndroidSubtitlePayload,
 } from '../android-native';
-import { PcmPlayer, supportsSystemAudioCapture } from '../audio';
+import {
+  PcmPlayer,
+  supportsSystemAudioCapture,
+  systemAudioCaptureHelp,
+} from '../audio';
 import { CaptureOptions, type CaptureOptionValues } from '../components/capture-options';
 import { ConversationView } from '../components/conversation-view';
 import { LanguageDialog } from '../components/language-dialog';
@@ -165,6 +169,7 @@ export class TranslatorPage implements Page {
     this.captureOptions = new CaptureOptions(
       this.captureOptionValues(),
       supportsSystemAudioCapture(),
+      systemAudioCaptureHelp(),
       (values) => this.updateCaptureOptions(values),
       {
         sourceLabel: languageNames[this.sourceLanguage] ?? this.sourceLanguage,

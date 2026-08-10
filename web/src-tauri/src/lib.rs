@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+mod macos_audio_capture;
 mod static_server;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -226,6 +228,10 @@ pub fn run() {
                 .inner_size(1180.0, 820.0)
                 .min_inner_size(360.0, 640.0)
                 .resizable(true);
+            #[cfg(target_os = "macos")]
+            let window = window.initialization_script(
+                "Object.defineProperty(window, '__VOICE_ELF_NATIVE_PLATFORM__', { value: 'macos' });",
+            );
             #[cfg(desktop)]
             let window = window.maximizable(true).minimizable(true).closable(true);
             window.build()?;

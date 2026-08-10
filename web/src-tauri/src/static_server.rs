@@ -213,6 +213,9 @@ fn router(state: ServerState) -> Router {
         .route("/__voice_elf/settings-window", post(open_settings_window))
         .route("/__voice_elf/app/quit", post(confirm_app_quit))
         .route("/__voice_elf/app/quit/cancel", post(cancel_app_quit))
+        .route("/__voice_elf/mac-audio/start", post(start_mac_audio))
+        .route("/__voice_elf/mac-audio/stop", post(stop_mac_audio))
+        .route("/__voice_elf/mac-audio/status", get(mac_audio_status))
         .route("/ws", get(proxy_websocket))
         .route("/api", any(proxy_http))
         .route("/api/{*path}", any(proxy_http))
@@ -442,6 +445,47 @@ async fn cancel_app_quit(State(state): State<ServerState>) -> Response<Body> {
     };
     crate::cancel_app_exit(&shell.app);
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(target_os = "macos")]
+async fn start_mac_audio(State(state): State<ServerState>) -> Response<Body> {
+    let Some(shell) = state.shell else {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    };
+    match crate::macos_audio_capture::start(shell.app) {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(message) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn start_mac_audio() -> Response<Body> {
+    StatusCode::NOT_IMPLEMENTED.into_response()
+}
+
+#[cfg(target_os = "macos")]
+async fn stop_mac_audio() -> Response<Body> {
+    crate::macos_audio_capture::stop();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(target_os = "macos")]
+async fn mac_audio_status() -> Response<Body> {
+    Json(crate::macos_audio_capture::status()).into_response()
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn mac_audio_status() -> Response<Body> {
+    StatusCode::NOT_IMPLEMENTED.into_response()
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn stop_mac_audio() -> Response<Body> {
+    StatusCode::NOT_IMPLEMENTED.into_response()
 }
 
 fn valid_room_id(room_id: &str) -> bool {

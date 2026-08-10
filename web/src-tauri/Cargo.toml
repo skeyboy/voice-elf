@@ -14,11 +14,13 @@ name = "voice-elf-app"
 path = "src/main.rs"
 
 [build-dependencies]
+cc = "1"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
 futures-util = "0.3"
 mime_guess = "2"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }

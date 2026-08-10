@@ -24,6 +24,7 @@ export class CaptureOptions {
   constructor(
     initial: CaptureOptionValues,
     private readonly systemAudioAvailable: boolean,
+    systemAudioHelp: string,
     private readonly onChange: (values: CaptureOptionValues) => void,
     private readonly language: CaptureLanguageOption,
   ) {
@@ -62,7 +63,7 @@ export class CaptureOptions {
         <label class="capture-source-option${systemAudioAvailable ? '' : ' is-unavailable'}">
           <input type="checkbox" data-capture-option="systemAudio" ${systemAudioAvailable ? '' : 'disabled'}>
           <span class="capture-source-icon"><i data-lucide="volume-2"></i></span>
-          <span><strong>系统内录</strong><small>${systemAudioAvailable ? '标签页、窗口或设备播放声' : '当前浏览器或设备不可用'}</small></span>
+          <span><strong>系统内录</strong><small>${systemAudioHelp}</small></span>
           <span class="capture-source-check"><i data-lucide="check"></i></span>
         </label>
       </fieldset>

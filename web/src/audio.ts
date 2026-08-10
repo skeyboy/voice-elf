@@ -7,6 +7,12 @@ import {
   supportsAndroidSystemAudio,
   updateAndroidCapture,
 } from './android-native';
+import {
+  isMacNativeShell,
+  startMacSystemAudioCapture,
+  stopMacSystemAudioCapture,
+  subscribeMacNativeAudio,
+} from './macos-native';
 
 interface CaptureMessage {
   type: 'samples';
@@ -62,6 +68,44 @@ const VAD_STAGE_TIMEOUT_MS: Record<keyof typeof VAD_STAGE_LABELS, number> = {
 
 let sharedVadWorker: Worker | null = null;
 
+type ExtendedDisplayMediaStreamOptions = Omit<DisplayMediaStreamOptions, 'audio'> & {
+  audio?: boolean | (MediaTrackConstraints & { suppressLocalAudioPlayback?: boolean });
+  preferCurrentTab?: boolean;
+  selfBrowserSurface?: 'include' | 'exclude';
+  systemAudio?: 'include' | 'exclude';
+  surfaceSwitching?: 'include' | 'exclude';
+  windowAudio?: 'exclude' | 'system' | 'window';
+};
+
+function isMacOSBrowser() {
+  return /Macintosh|Mac OS X/i.test(navigator.userAgent);
+}
+
+function isChromiumBrowser() {
+  return /Chrome|Chromium|CriOS|Edg\//i.test(navigator.userAgent);
+}
+
+function webDisplayAudioOptions(): ExtendedDisplayMediaStreamOptions {
+  return {
+    video: { displaySurface: 'browser' },
+    audio: { suppressLocalAudioPlayback: false },
+    preferCurrentTab: false,
+    selfBrowserSurface: 'exclude',
+    systemAudio: 'include',
+    surfaceSwitching: 'include',
+    windowAudio: 'window',
+  };
+}
+
+function decodeBase64(value: string) {
+  const binary = window.atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes.buffer;
+}
+
 function acquireVadWorker() {
   sharedVadWorker ??= new Worker('/vad-worker.js', {
     type: 'module',
@@ -100,10 +144,21 @@ export function scheduleVadPreload() {
 }
 
 export function supportsSystemAudioCapture() {
-  if (supportsAndroidSystemAudio()) return true;
+  if (supportsAndroidSystemAudio() || isMacNativeShell()) return true;
+  // Safari and Firefox expose getDisplayMedia on macOS but return video-only streams.
+  if (isMacOSBrowser() && !isChromiumBrowser()) return false;
   return Boolean(
     window.isSecureContext && navigator.mediaDevices?.getDisplayMedia,
   );
+}
+
+export function systemAudioCaptureHelp() {
+  if (isMacNativeShell()) return '设备播放声音';
+  if (isMacOSBrowser() && isChromiumBrowser()) {
+    return '请选择带声音的 Chrome 标签页或窗口，并开启共享音频';
+  }
+  if (isMacOSBrowser()) return 'macOS 网页内录需要使用 Chrome 浏览器';
+  return '标签页、窗口或设备播放声音';
 }
 
 async function assertMicrophonePermissionIsRequestable() {
@@ -161,8 +216,11 @@ export class AudioCapture {
   private suppressed = false;
   private stopping = false;
   private androidCapture = false;
+  private macCapture = false;
+  private macCaptureReady = false;
   private currentOptions: AudioCaptureOptions | null = null;
   private unsubscribeAndroidPcm = () => {};
+  private unsubscribeMacPcm = () => {};
 
   private async prepareVad(
     maxUtteranceSeconds: number,
@@ -263,7 +321,8 @@ export class AudioCapture {
   ) {
     if (this.context) return;
     const androidShell = isAndroidNativeShell();
-    if ((!window.isSecureContext || !navigator.mediaDevices) && !androidShell) {
+    const macShell = isMacNativeShell();
+    if ((!window.isSecureContext || !navigator.mediaDevices) && !androidShell && !macShell) {
       throw new Error('当前访问地址不是浏览器安全上下文；音频采集需要使用受信任的 HTTPS 地址');
     }
     if (!options.microphone && !options.systemAudio) {
@@ -285,11 +344,29 @@ export class AudioCapture {
       try {
         if (androidShell) {
           // MediaProjection audio arrives through the native bridge after VAD is ready.
+        } else if (macShell) {
+          // ScreenCaptureKit PCM starts after AudioWorklet and VAD are ready.
         } else {
-          const display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+          const display = await navigator.mediaDevices.getDisplayMedia(webDisplayAudioOptions());
           if (display.getAudioTracks().length === 0) {
+            const surface = display.getVideoTracks()[0]?.getSettings().displaySurface;
             display.getTracks().forEach((track) => track.stop());
-            throw new Error('所选共享来源没有系统音频，请选择带音频的标签页、窗口或屏幕');
+            if (isMacOSBrowser()) {
+              if (surface === 'browser') {
+                throw new Error(
+                  '所选 Chrome 标签页未共享音频，请重新选择正在播放声音的标签页并开启“共享标签页音频”',
+                );
+              }
+              if (surface === 'window') {
+                throw new Error(
+                  '所选窗口没有提供音频轨道，请选择支持窗口音频的来源；仍不可用时请改选带声音的 Chrome 标签页',
+                );
+              }
+              throw new Error(
+                '整个屏幕没有提供系统音频轨道，请改选带声音的 Chrome 标签页或支持音频的窗口',
+              );
+            }
+            throw new Error('所选共享来源没有音频轨道，请重新选择并开启共享音频');
           }
           streams.push(display);
         }
@@ -366,7 +443,7 @@ export class AudioCapture {
       gainNodes[index].gain.value = inputGain;
       source.connect(gainNodes[index]).connect(mixer);
     });
-    const node = sourceNodes.length > 0
+    const node = sourceNodes.length > 0 || (macShell && options.systemAudio)
       ? new AudioWorkletNode(context, 'microphone-tap-processor')
       : null;
     if (node) {
@@ -408,7 +485,25 @@ export class AudioCapture {
         this.onFatalError?.(new Error(event.message));
       }
     });
-    const displayStream = options.systemAudio && !androidShell ? streams[0] : null;
+    this.unsubscribeMacPcm = subscribeMacNativeAudio((event) => {
+      if (event.type === 'audio-pcm' && this.node && !this.stopping) {
+        const payload = decodeBase64(event.data);
+        this.node.port.postMessage(
+          { type: 'external-pcm', payload, sampleRate: event.sampleRate },
+          [payload],
+        );
+      } else if (
+        event.type === 'capture-stopped'
+        && this.macCaptureReady
+        && !this.stopping
+        && this.context
+      ) {
+        this.onFatalError?.(new Error('macOS 系统内录已停止'));
+      } else if (event.type === 'capture-error' && this.macCaptureReady && !this.stopping) {
+        this.onFatalError?.(new Error(event.message));
+      }
+    });
+    const displayStream = options.systemAudio && !androidShell && !macShell ? streams[0] : null;
     displayStream?.getAudioTracks().forEach((track) => {
       track.addEventListener(
         'ended',
@@ -428,12 +523,28 @@ export class AudioCapture {
     this.context = context;
     this.node = node;
     this.currentOptions = { ...options };
+    if (macShell && options.systemAudio) {
+      if (!node) {
+        await this.stop();
+        throw new Error('无法初始化 macOS 系统音频混音器');
+      }
+      node.port.postMessage({ type: 'external-start' });
+      this.macCapture = true;
+      try {
+        await startMacSystemAudioCapture();
+        this.macCaptureReady = true;
+      } catch (error) {
+        await this.stop();
+        throw error;
+      }
+    }
     if (this.androidCapture) markAndroidCaptureReady();
     onReady();
   }
 
   async stop() {
     this.stopping = true;
+    this.macCaptureReady = false;
     this.node?.disconnect();
     if (this.node) this.node.port.onmessage = null;
     this.sourceNodes.forEach((source) => source.disconnect());
@@ -443,7 +554,10 @@ export class AudioCapture {
     this.streams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
     this.unsubscribeAndroidPcm();
     this.unsubscribeAndroidPcm = () => {};
+    this.unsubscribeMacPcm();
+    this.unsubscribeMacPcm = () => {};
     if (this.androidCapture) stopAndroidCapture();
+    if (this.macCapture) await stopMacSystemAudioCapture();
     if (this.vadReady && this.vadWorker) {
       await new Promise<void>((resolve) => {
         const timeout = window.setTimeout(resolve, 1_000);
@@ -463,6 +577,7 @@ export class AudioCapture {
     this.limiter = null;
     this.context = null;
     this.androidCapture = false;
+    this.macCapture = false;
     this.currentOptions = null;
     this.onPcm = null;
     this.onLevel = null;
