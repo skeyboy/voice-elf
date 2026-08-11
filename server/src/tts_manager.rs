@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use reqwest::{Client, Url};
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
     authority::AuthorityService,
-    backends::{AppServices, INDEX_TTS_ID, TtsBackendInfo, TtsBackendRegistry, TtsVoiceInfo},
-    config::{AuthorityMode, IndexTtsConfig},
+    backends::{
+        AppServices, INDEX_TTS_ID, QWEN_TTS_ID, TtsBackendInfo, TtsBackendRegistry, TtsVoiceInfo,
+    },
+    config::{AuthorityMode, IndexTtsConfig, QwenTtsConfig},
     index_tts_runtime::{IndexTtsRuntime, IndexTtsRuntimeStatus},
     storage::Database,
 };
@@ -20,12 +23,24 @@ pub struct EffectiveTtsSelection {
     pub tenant_name: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct QwenTtsRuntimeStatus {
+    pub enabled: bool,
+    pub healthy: bool,
+    pub message: String,
+    pub base_url: String,
+    pub model: String,
+}
+
 #[derive(Clone)]
 pub struct TtsManager {
     registry: TtsBackendRegistry,
     database: Option<Database>,
     authority: AuthorityService,
     index_runtime: IndexTtsRuntime,
+    qwen_config: QwenTtsConfig,
+    qwen_client: Client,
+    qwen_base_url: Url,
 }
 
 impl TtsManager {
@@ -34,21 +49,40 @@ impl TtsManager {
         database: Option<Database>,
         authority: AuthorityService,
         index_config: IndexTtsConfig,
+        qwen_config: QwenTtsConfig,
     ) -> Result<Self> {
+        let mut qwen_base_url =
+            Url::parse(&qwen_config.base_url).context("TTS_QWEN_BASE_URL must be a valid URL")?;
+        if !qwen_base_url.path().ends_with('/') {
+            qwen_base_url.set_path(&format!("{}/", qwen_base_url.path()));
+        }
+        let qwen_client = Client::builder()
+            .connect_timeout(qwen_config.connect_timeout)
+            .timeout(qwen_config.connect_timeout)
+            .build()
+            .context("failed to create Qwen3-TTS health client")?;
         Ok(Self {
             registry,
             database,
             authority,
             index_runtime: IndexTtsRuntime::new(index_config)?,
+            qwen_config,
+            qwen_client,
+            qwen_base_url,
         })
     }
 
     pub async fn providers(&self) -> Vec<TtsBackendInfo> {
         let status = self.index_runtime.status().await;
-        self.providers_with_status(&status)
+        let qwen_status = self.qwen_runtime_status().await;
+        self.providers_with_status(&status, &qwen_status)
     }
 
-    pub fn providers_with_status(&self, status: &IndexTtsRuntimeStatus) -> Vec<TtsBackendInfo> {
+    pub fn providers_with_status(
+        &self,
+        status: &IndexTtsRuntimeStatus,
+        qwen_status: &QwenTtsRuntimeStatus,
+    ) -> Vec<TtsBackendInfo> {
         let mut providers = self.registry.providers();
         if let Some(provider) = providers
             .iter_mut()
@@ -56,7 +90,64 @@ impl TtsManager {
         {
             provider.available = status.healthy;
         }
+        if let Some(provider) = providers
+            .iter_mut()
+            .find(|provider| provider.id == QWEN_TTS_ID)
+        {
+            provider.available = qwen_status.healthy;
+        }
         providers
+    }
+
+    pub async fn qwen_runtime_status(&self) -> QwenTtsRuntimeStatus {
+        if !self.qwen_config.enabled {
+            return QwenTtsRuntimeStatus {
+                enabled: false,
+                healthy: false,
+                message: "Qwen3-TTS 尚未启用".to_owned(),
+                base_url: self.qwen_config.base_url.clone(),
+                model: self.qwen_config.model.clone(),
+            };
+        }
+        let endpoint = match self.qwen_base_url.join("audio/voices") {
+            Ok(mut endpoint) => {
+                endpoint
+                    .query_pairs_mut()
+                    .append_pair("model", &self.qwen_config.model);
+                endpoint
+            }
+            Err(error) => {
+                return QwenTtsRuntimeStatus {
+                    enabled: true,
+                    healthy: false,
+                    message: format!("Qwen3-TTS 健康检查地址无效: {error}"),
+                    base_url: self.qwen_config.base_url.clone(),
+                    model: self.qwen_config.model.clone(),
+                };
+            }
+        };
+        let mut request = self.qwen_client.get(endpoint);
+        if let Some(api_key) = &self.qwen_config.api_key {
+            request = request.bearer_auth(api_key);
+        }
+        let result = request.send().await;
+        let (healthy, message) = match result {
+            Ok(response) if response.status().is_success() => {
+                (true, format!("Qwen3-TTS 可用: {}", self.qwen_config.model))
+            }
+            Ok(response) => (
+                false,
+                format!("Qwen3-TTS 健康检查返回 HTTP {}", response.status()),
+            ),
+            Err(error) => (false, format!("Qwen3-TTS 无法连接: {error}")),
+        };
+        QwenTtsRuntimeStatus {
+            enabled: true,
+            healthy,
+            message,
+            base_url: self.qwen_config.base_url.clone(),
+            model: self.qwen_config.model.clone(),
+        }
     }
 
     pub async fn index_runtime_status(&self) -> IndexTtsRuntimeStatus {
@@ -125,6 +216,12 @@ impl TtsManager {
             let status = self.index_runtime.status().await;
             if !status.healthy {
                 anyhow::bail!("IndexTTS2 is not ready: {}", status.message);
+            }
+        }
+        if selection.backend_id == QWEN_TTS_ID {
+            let status = self.qwen_runtime_status().await;
+            if !status.healthy {
+                anyhow::bail!("Qwen3-TTS is not ready: {}", status.message);
             }
         }
         let selected = self

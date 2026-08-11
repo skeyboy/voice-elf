@@ -1,4 +1,38 @@
 diesel::table! {
+    data_change_history (id) {
+        id -> Uuid,
+        entity_type -> Varchar,
+        entity_id -> Varchar,
+        action -> Varchar,
+        record_status -> Varchar,
+        actor_user_id -> Nullable<Uuid>,
+        before_state -> Nullable<Jsonb>,
+        after_state -> Nullable<Jsonb>,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    system_email_settings (id) {
+        id -> Uuid,
+        version -> Int8,
+        record_status -> Varchar,
+        enabled -> Bool,
+        host -> Varchar,
+        port -> Int4,
+        security -> Varchar,
+        username -> Varchar,
+        password_secret -> Nullable<Text>,
+        from_address -> Varchar,
+        from_name -> Varchar,
+        public_url -> Nullable<Text>,
+        reset_expiry_minutes -> Int4,
+        updated_by -> Nullable<Uuid>,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     authority_tenants (id) {
         id -> Uuid,
         name -> Varchar,
@@ -31,6 +65,7 @@ diesel::table! {
         alias -> Varchar,
         updated_by -> Nullable<Uuid>,
         updated_at -> Timestamptz,
+        record_status -> Varchar,
     }
 }
 
@@ -234,6 +269,7 @@ diesel::table! {
 }
 
 diesel::joinable!(auth_sessions -> users (user_id));
+diesel::joinable!(data_change_history -> users (actor_user_id));
 diesel::joinable!(asr_system_settings -> users (updated_by));
 diesel::joinable!(tts_system_settings -> users (updated_by));
 diesel::joinable!(tts_voice_aliases -> users (updated_by));
@@ -244,6 +280,7 @@ diesel::joinable!(room_members -> rooms (room_id));
 diesel::joinable!(room_members -> users (user_id));
 diesel::joinable!(rooms -> users (owner_id));
 diesel::joinable!(system_installations -> users (initialized_by));
+diesel::joinable!(system_email_settings -> users (updated_by));
 diesel::joinable!(voice_sessions -> rooms (room_id));
 diesel::joinable!(voice_sessions -> users (user_id));
 diesel::joinable!(voice_references -> users (user_id));
@@ -253,6 +290,7 @@ diesel::joinable!(voice_utterances -> rooms (room_id));
 diesel::joinable!(voice_utterances -> voice_sessions (session_id));
 diesel::allow_tables_to_appear_in_same_query!(
     auth_sessions,
+    data_change_history,
     asr_system_settings,
     tts_system_settings,
     tts_voice_aliases,
@@ -264,6 +302,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     room_members,
     rooms,
     system_installations,
+    system_email_settings,
     users,
     voice_references,
     voice_sessions,

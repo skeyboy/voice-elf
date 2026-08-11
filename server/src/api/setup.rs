@@ -18,10 +18,12 @@ use crate::{
     storage::{InitializeSystemOutcome, SystemInstallation},
 };
 
-pub(super) fn router() -> Router<AppState> {
-    Router::new()
-        .route("/setup/status", get(setup_status))
-        .route("/setup/initialize", post(initialize))
+pub(super) fn public_router() -> Router<AppState> {
+    Router::new().route("/setup/status", get(setup_status))
+}
+
+pub(super) fn admin_router() -> Router<AppState> {
+    Router::new().route("/setup/initialize", post(initialize))
 }
 
 #[derive(Serialize)]

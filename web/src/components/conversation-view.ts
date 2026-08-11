@@ -39,12 +39,16 @@ export class ConversationView {
   private programmaticScroll = false;
   private scrollEndTimer = 0;
   private mergingHistory = false;
+  private historyLoading = false;
+  private historyHasMore = false;
+  private historyPullArmed = false;
+  private historyPointerStartY: number | null = null;
 
   constructor(
     private readonly player: PcmPlayer,
     private readonly onError: (message: string) => void,
     private readonly onMediaPlaybackChange: (active: boolean) => void = () => {},
-    onLoadOlder: () => void = () => {},
+    private readonly onLoadOlder: () => void = () => {},
   ) {
     this.element = document.createElement('div');
     this.element.className = 'conversation-scroll-region';
@@ -69,8 +73,32 @@ export class ConversationView {
     this.historyButton = this.element.querySelector('.history-older')!;
     this.speakerDialog = this.element.querySelector('.speaker-dialog')!;
     this.list.addEventListener('scroll', () => this.handleScroll(), { passive: true });
+    this.list.addEventListener('pointerdown', (event) => {
+      this.historyPullArmed = true;
+      this.historyPointerStartY = event.clientY;
+    });
+    this.list.addEventListener('pointermove', (event) => {
+      if (
+        this.historyPointerStartY !== null
+        && event.clientY - this.historyPointerStartY >= 28
+        && this.list.scrollTop <= 32
+      ) {
+        this.historyPointerStartY = event.clientY;
+        this.historyPullArmed = false;
+        this.requestOlderHistory();
+      }
+    }, { passive: true });
+    this.list.addEventListener('pointerup', () => {
+      this.historyPointerStartY = null;
+    });
+    this.list.addEventListener('wheel', (event) => {
+      if (event.deltaY < 0) {
+        this.historyPullArmed = true;
+        if (this.list.scrollTop <= 32) this.requestOlderHistory();
+      }
+    }, { passive: true });
     this.scrollButton.addEventListener('click', () => this.scrollToBottom(true));
-    this.historyButton.addEventListener('click', onLoadOlder);
+    this.historyButton.addEventListener('click', () => this.requestOlderHistory());
     this.speakerDialog.querySelector('.speaker-dialog-close')?.addEventListener('click', () =>
       this.speakerDialog.close(),
     );
@@ -103,6 +131,10 @@ export class ConversationView {
     this.historyButton.hidden = true;
     this.historyButton.disabled = false;
     this.mergingHistory = false;
+    this.historyLoading = false;
+    this.historyHasMore = false;
+    this.historyPullArmed = false;
+    this.historyPointerStartY = null;
   }
 
   destroy() {
@@ -118,7 +150,7 @@ export class ConversationView {
     this.mergingHistory = true;
     this.mergeUtterances(utterances);
     this.mergingHistory = false;
-    requestAnimationFrame(() => this.scrollToBottom(true));
+    requestAnimationFrame(() => this.scrollToBottom(false));
   }
 
   prependHistory(utterances: UtteranceHistory[]) {
@@ -147,6 +179,8 @@ export class ConversationView {
 
   setHistoryPagination(loaded: number, total: number, loading: boolean) {
     const hasMore = loaded < total;
+    this.historyLoading = loading;
+    this.historyHasMore = hasMore;
     this.historyButton.hidden = !loading && !hasMore;
     this.historyButton.disabled = loading;
     this.historyButton.classList.toggle('loading', loading);
@@ -564,6 +598,17 @@ export class ConversationView {
     }
     this.autoFollow = distance <= 56;
     this.scrollButton.hidden = this.autoFollow;
+    if (this.list.scrollTop <= 32 && this.historyPullArmed) {
+      this.historyPullArmed = false;
+      this.requestOlderHistory();
+    }
+  }
+
+  private requestOlderHistory() {
+    if (this.historyLoading || !this.historyHasMore) return;
+    this.historyPullArmed = false;
+    this.historyLoading = true;
+    this.onLoadOlder();
   }
 
   private followIfEnabled() {

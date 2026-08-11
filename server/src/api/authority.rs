@@ -27,9 +27,12 @@ use crate::{
 
 const ACCESS_TOKEN_MINUTES: i64 = 10;
 
-pub(super) fn router() -> Router<AppState> {
+pub(super) fn public_router() -> Router<AppState> {
+    Router::new().route("/instance/authorization", get(instance_authorization))
+}
+
+pub(super) fn admin_router() -> Router<AppState> {
     Router::new()
-        .route("/instance/authorization", get(instance_authorization))
         .route("/authority/oauth/token", post(issue_access_token))
         .route("/authority/entitlements/check", post(check_entitlement))
         .route(

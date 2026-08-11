@@ -35,6 +35,7 @@ pub struct TtsVoiceAlias {
     pub alias: String,
     pub updated_by: Option<Uuid>,
     pub updated_at: DateTime<Utc>,
+    pub record_status: String,
 }
 
 #[derive(Insertable)]
@@ -100,6 +101,7 @@ impl Database {
         let mut connection = self.pool.get().await?;
         tts_voice_aliases::table
             .filter(tts_voice_aliases::provider_id.eq(provider_id))
+            .filter(tts_voice_aliases::record_status.eq("current"))
             .order(tts_voice_aliases::voice_id.asc())
             .select(TtsVoiceAlias::as_select())
             .load(&mut connection)
@@ -116,7 +118,12 @@ impl Database {
     ) -> Result<Option<TtsVoiceAlias>> {
         let mut connection = self.pool.get().await?;
         let Some(alias) = alias else {
-            diesel::delete(tts_voice_aliases::table.find((provider_id, voice_id)))
+            diesel::update(tts_voice_aliases::table.find((provider_id, voice_id)))
+                .set((
+                    tts_voice_aliases::record_status.eq("deleted"),
+                    tts_voice_aliases::updated_by.eq(Some(updated_by)),
+                    tts_voice_aliases::updated_at.eq(diesel::dsl::now),
+                ))
                 .execute(&mut connection)
                 .await?;
             return Ok(None);
@@ -133,6 +140,7 @@ impl Database {
             .do_update()
             .set((
                 tts_voice_aliases::alias.eq(alias),
+                tts_voice_aliases::record_status.eq("current"),
                 tts_voice_aliases::updated_by.eq(Some(updated_by)),
                 tts_voice_aliases::updated_at.eq(diesel::dsl::now),
             ))

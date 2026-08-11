@@ -1,4 +1,5 @@
 mod asr;
+mod fun_asr;
 mod moss;
 mod translator;
 mod tts;
@@ -14,18 +15,23 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use crate::config::{AppConfig, BackendMode};
 
 pub use asr::{DemoTranscriber, NoSpeechDetected, QwenAsrTranscriber};
+pub use fun_asr::{FunAsrRuntimeStatus, FunAsrTranscriber};
 pub use moss::MossTranscribeEngine;
 pub use translator::{DemoTranslator, LlamaCppTranslator, LocalLlmTranslator};
 #[cfg(test)]
 pub use tts::DemoSynthesizer;
-pub use tts::{IndexTtsEngine, TtsChunkSink, TtsEngine, TtsRequest, build_tts_engine};
+pub use tts::{
+    IndexTtsEngine, QwenTtsEngine, TtsChunkSink, TtsEngine, TtsRequest, build_tts_engine,
+};
 
 pub use crate::protocol::TranscriptionSegment;
 
 pub const QWEN_LOCAL_ASR_ID: &str = "qwen-local";
+pub const FUN_ASR_ID: &str = "funasr-streaming";
 pub const DEMO_ASR_ID: &str = "demo";
 pub const LOCAL_TTS_ID: &str = "local-fallback";
 pub const INDEX_TTS_ID: &str = "index-tts2";
+pub const QWEN_TTS_ID: &str = "qwen3-tts";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AsrBackendInfo {
@@ -47,6 +53,7 @@ struct AsrBackendEntry {
 pub struct AsrBackendRegistry {
     entries: Arc<HashMap<&'static str, AsrBackendEntry>>,
     default_backend_id: &'static str,
+    fun_asr: Option<Arc<FunAsrTranscriber>>,
 }
 
 impl AsrBackendRegistry {
@@ -64,6 +71,28 @@ impl AsrBackendRegistry {
                     production: false,
                 },
                 transcriber: Some(Arc::new(DemoTranscriber::new())),
+            },
+        );
+
+        let fun_asr = if config.fun_asr.enabled {
+            Some(Arc::new(FunAsrTranscriber::new(config.fun_asr.clone())?))
+        } else {
+            None
+        };
+        entries.insert(
+            FUN_ASR_ID,
+            AsrBackendEntry {
+                info: AsrBackendInfo {
+                    id: FUN_ASR_ID,
+                    name: "FunASR Paraformer 流式服务",
+                    engine: "FunASR 2-pass WebSocket",
+                    description: "面向中文实时识别，在线增量输出并在句末用离线模型纠错",
+                    available: fun_asr.is_some(),
+                    production: true,
+                },
+                transcriber: fun_asr
+                    .as_ref()
+                    .map(|engine| engine.clone() as Arc<dyn Transcriber>),
             },
         );
 
@@ -97,7 +126,8 @@ impl AsrBackendRegistry {
 
         let default_backend_id = match config.backend_mode {
             BackendMode::Demo => DEMO_ASR_ID,
-            BackendMode::Local => QWEN_LOCAL_ASR_ID,
+            BackendMode::Local if qwen_available => QWEN_LOCAL_ASR_ID,
+            BackendMode::Local => FUN_ASR_ID,
         };
         if !entries
             .get(default_backend_id)
@@ -108,6 +138,7 @@ impl AsrBackendRegistry {
         Ok(Self {
             entries: Arc::new(entries),
             default_backend_id,
+            fun_asr,
         })
     }
 
@@ -123,6 +154,19 @@ impl AsrBackendRegistry {
             .collect::<Vec<_>>();
         providers.sort_by_key(|provider| (!provider.production, provider.name));
         providers
+    }
+
+    pub fn is_available(&self, backend_id: &str) -> bool {
+        self.entries
+            .get(backend_id)
+            .is_some_and(|entry| entry.transcriber.is_some())
+    }
+
+    pub async fn fun_asr_runtime_status(&self) -> FunAsrRuntimeStatus {
+        match &self.fun_asr {
+            Some(engine) => engine.runtime_status().await,
+            None => FunAsrRuntimeStatus::disabled(),
+        }
     }
 
     pub fn services_for(
@@ -210,6 +254,27 @@ impl TtsBackendRegistry {
                 },
                 synthesizer: index,
                 voices: index_tts_voices(config),
+            },
+        );
+        let qwen = if config.tts.qwen_tts.enabled {
+            Some(Arc::new(QwenTtsEngine::new(config.tts.qwen_tts.clone())?) as Arc<dyn TtsEngine>)
+        } else {
+            None
+        };
+        entries.insert(
+            QWEN_TTS_ID,
+            TtsBackendEntry {
+                info: TtsBackendInfo {
+                    id: QWEN_TTS_ID,
+                    name: "Qwen3-TTS",
+                    engine: "Qwen3-TTS CustomVoice / vLLM-Omni",
+                    description: "通过 OpenAI 兼容语音接口提供十语种低延迟语音合成",
+                    available: qwen.is_some(),
+                    production: true,
+                    voice_clone: false,
+                },
+                synthesizer: qwen,
+                voices: qwen_tts_voices(),
             },
         );
         Ok(Self {
@@ -402,6 +467,36 @@ fn index_tts_voices(config: &AppConfig) -> Vec<TtsVoiceInfo> {
             group: "IndexTTS2 参考声".to_owned(),
             description: "IndexTTS2 零样本参考音色，支持中文与 English".to_owned(),
             languages: vec!["zh".to_owned(), "en".to_owned()],
+        })
+        .collect()
+}
+
+fn qwen_tts_voices() -> Vec<TtsVoiceInfo> {
+    const LANGUAGES: &[&str] = &["zh", "en", "ja", "ko", "de", "fr", "ru", "pt", "es", "it"];
+    const VOICES: &[(&str, &str, &str, &str)] = &[
+        ("vivian", "Vivian", "中文音色", "明亮、略带棱角的年轻女声"),
+        ("serena", "Serena", "中文音色", "温暖柔和的年轻女声"),
+        ("uncle_fu", "Uncle Fu", "中文音色", "低沉醇厚的成熟男声"),
+        ("dylan", "Dylan", "中文方言", "清晰自然的年轻北京男声"),
+        ("eric", "Eric", "中文方言", "活泼、略带沙哑明亮感的成都男声"),
+        (
+            "ryan",
+            "Ryan",
+            "English voices",
+            "节奏感强、富有动感的英文男声",
+        ),
+        ("aiden", "Aiden", "English voices", "阳光清晰的美式英文男声"),
+        ("ono_anna", "Ono Anna", "日本語音声", "轻快灵动的日语女声"),
+        ("sohee", "Sohee", "한국어 음성", "温暖且情感丰富的韩语女声"),
+    ];
+    VOICES
+        .iter()
+        .map(|(id, name, group, description)| TtsVoiceInfo {
+            id: (*id).to_owned(),
+            name: (*name).to_owned(),
+            group: (*group).to_owned(),
+            description: (*description).to_owned(),
+            languages: LANGUAGES.iter().map(|value| (*value).to_owned()).collect(),
         })
         .collect()
 }

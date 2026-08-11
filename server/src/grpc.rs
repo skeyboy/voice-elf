@@ -36,6 +36,7 @@ struct GrpcApi {
     router: Router,
     state: AppState,
     sessions: Arc<RwLock<HashMap<Uuid, RealtimeSession>>>,
+    realtime_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -119,6 +120,11 @@ impl ApiService for GrpcApi {
         &self,
         request: Request<RealtimeSubscribeRequest>,
     ) -> Result<Response<Self::SubscribeRealtimeStream>, Status> {
+        if !self.realtime_enabled {
+            return Err(Status::unimplemented(
+                "the admin service does not expose realtime room streams",
+            ));
+        }
         let token =
             auth_token(request.metadata()).ok_or_else(|| Status::unauthenticated("请先登录"))?;
         let user = crate::api::authenticate_token(&self.state, &token)
@@ -236,6 +242,11 @@ impl ApiService for GrpcApi {
         &self,
         request: Request<RealtimeInput>,
     ) -> Result<Response<RealtimeAck>, Status> {
+        if !self.realtime_enabled {
+            return Err(Status::unimplemented(
+                "the admin service does not expose realtime room streams",
+            ));
+        }
         let auth_hash = auth_token(request.metadata())
             .map(|token| crate::api::token_hash(&token))
             .ok_or_else(|| Status::unauthenticated("请先登录"))?;
@@ -292,16 +303,17 @@ fn is_transport_header(name: &HeaderName) -> bool {
     )
 }
 
-pub(crate) fn router(state: AppState) -> Router {
+pub(crate) fn router(state: AppState, routes: Router<AppState>, realtime_enabled: bool) -> Router {
     let api_router = Router::new()
         .route("/api/health", axum::routing::get(crate::health))
-        .nest("/api", crate::api::router())
+        .nest("/api", routes)
         .layer(tower_cookies::CookieManagerLayer::new())
         .with_state(state.clone());
     let service = ApiServiceServer::new(GrpcApi {
         router: api_router,
         state,
         sessions: Arc::default(),
+        realtime_enabled,
     });
     tonic::service::Routes::new(tonic_web::GrpcWebLayer::new().layer(service)).into_axum_router()
 }

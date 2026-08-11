@@ -102,6 +102,25 @@ export interface AdminOverview {
   total_rooms: number;
 }
 
+export interface RuntimeDependency {
+  name: string;
+  kind: string;
+  required: boolean;
+  status: 'ready' | 'degraded' | 'unavailable' | 'unknown';
+  message: string;
+  checked_at: string;
+}
+
+export interface RuntimeSnapshot {
+  service: string;
+  overall_status: 'ready' | 'degraded' | 'unavailable' | 'unknown';
+  generated_at: string;
+  initialized: boolean;
+  authorized: boolean;
+  dependencies: RuntimeDependency[];
+  version: string;
+}
+
 export interface InstanceAuthorization {
   mode: 'standalone' | 'bus' | 'tenant';
   allowed: boolean;
@@ -221,6 +240,13 @@ export interface AsrManagement {
   effective: EffectiveAsrSelection;
   can_update_system: boolean;
   applies_to: 'new_room_pipelines';
+  fun_asr_runtime: FunAsrRuntimeStatus;
+}
+
+export interface FunAsrRuntimeStatus {
+  enabled: boolean;
+  healthy: boolean;
+  message: string;
 }
 
 export interface TtsProvider extends AsrProvider {
@@ -255,6 +281,14 @@ export interface IndexTtsRuntimeStatus {
   log_path: string;
 }
 
+export interface QwenTtsRuntimeStatus {
+  enabled: boolean;
+  healthy: boolean;
+  message: string;
+  base_url: string;
+  model: string;
+}
+
 export interface TtsManagement {
   providers: TtsProvider[];
   system_setting: AsrSystemSetting;
@@ -263,6 +297,7 @@ export interface TtsManagement {
   applies_to: 'new_room_pipelines';
   voices: TtsVoice[];
   index_tts_runtime: IndexTtsRuntimeStatus;
+  qwen_tts_runtime: QwenTtsRuntimeStatus;
 }
 
 export interface AdminUser {
@@ -281,13 +316,29 @@ export interface AdminUser {
 }
 
 export interface MailStatus {
+  enabled: boolean;
   configured: boolean;
+  password_configured: boolean;
   host: string;
   port: number;
   security: 'wrapper' | 'starttls' | 'none';
   username: string;
   from_address: string;
+  from_name: string;
+  public_url: string | null;
   reset_expiry_minutes: number;
+}
+
+export interface ChangeHistoryRecord {
+  id: string;
+  entity_type: string;
+  entity_id: string;
+  action: 'create' | 'update' | 'delete';
+  record_status: 'current' | 'historical' | 'deleted';
+  actor_user_id: string | null;
+  before_state: Record<string, unknown> | null;
+  after_state: Record<string, unknown> | null;
+  created_at: string;
 }
 
 export interface PasswordResetStatus {

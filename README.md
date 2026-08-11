@@ -53,6 +53,34 @@ The demo backend is opt-in and returns placeholder transcripts only. Normal star
 
 System administrators can switch the effective ASR provider from `/admin` without restarting the service. The database stores only stable provider IDs; model paths and provider credentials remain server-side environment configuration. A change applies when a new room audio pipeline starts, while an already running pipeline keeps its provider snapshot until the room disconnects. In authorization-bus mode, administrators can assign a tenant override or leave it inheriting the system default. Tenant instances receive the resolved provider ID in their regular authorization check and verify that the provider is configured locally.
 
+FunASR Paraformer is available as an optional production streaming provider. Deploy the official
+[FunASR WebSocket runtime](https://github.com/modelscope/FunASR/tree/main/runtime/python/websocket),
+set `FUNASR_ENABLED=true`, and point `FUNASR_WEBSOCKET_URL` at the service. The adapter uses the
+official 16 kHz PCM `2pass` protocol: online responses drive live transcript deltas, while the
+offline pass supplies the corrected final sentence. Chunk size, look-back windows, connection
+timeout, and final-result timeout are configurable in `.env.example`.
+
+The repository includes a managed CPU runtime for macOS and Linux. Install it once, then start or
+inspect it with:
+
+```bash
+make funasr-setup
+make funasr-start
+make funasr-status
+```
+
+The first start downloads the official Paraformer online/offline, VAD, punctuation, and speaker
+models. Configure `.env` with `FUNASR_ENABLED=true`,
+`FUNASR_MANAGER_SCRIPT=scripts/funasr.sh`, and
+`FUNASR_WEBSOCKET_URL=ws://127.0.0.1:10095/`. Subsequent Public or compatibility-server starts
+automatically start an installed FunASR sidecar. Use `./scripts/funasr.sh logs` while models load.
+
+Admin > ASR Management shows the live FunASR handshake status and exposes `funasr-streaming` in
+the existing system and tenant selectors. The dedicated dependency page probes the WebSocket on
+every refresh. In `local` mode, either a valid Qwen model directory or enabled FunASR is sufficient
+to start; when both are configured, Qwen remains the initial fallback until an administrator changes
+the persisted provider selection.
+
 After the initial model setup, the complete development stack can be managed from one terminal. `make dev` verifies PostgreSQL, the project-local Python/MOSS environment, Web dependencies, Rust VAD, and the server build before starting MOSS-TTS-Nano, the Rust server, and Vite. The processes run in project-specific detached sessions, so they remain available after the command exits without requiring a global service installation. Stop only removes processes owned by this stack and waits for ports `18083`, `3001`, and `5173` to be released; an unrelated process occupying one of those ports is reported and left untouched.
 
 ```bash
@@ -69,6 +97,22 @@ npm run stack:stop
 ```
 
 Open <http://127.0.0.1:3001>. Microphone access works on localhost in current browsers.
+
+### Split backend services
+
+The compatibility binary still serves every route in one process. For independent deployment, start the internal control plane and public data plane separately:
+
+```bash
+# Terminal 1: internal admin HTTP on 3002 and tonic gRPC on 50051
+VOICE_ELF_BACKEND=demo make admin-server
+
+# Terminal 2: public HTTP/WebSocket on 3001; checks admin over gRPC
+VOICE_ELF_BACKEND=demo make public-server
+```
+
+Set `VOICE_ELF_CONTROL_TOKEN` to the same random value of at least 32 bytes in both services. It is required whenever `VOICE_ELF_ADMIN_GRPC_BIND` is not a loopback address. The admin service exposes setup and `/api/admin/*`; the public service exposes account, room, media, and WebSocket traffic but no management routes. `/api/runtime/dependencies` returns structured readiness information. Administrators can use the dedicated `/admin/dependencies` observatory or the compact **部署检测** tab; both support automatic validation and manual refresh. See [the service splitting analysis](docs/service-splitting-analysis.md) for ownership, rollout, and storage migration boundaries.
+
+The public service also keeps a server-streaming tonic command connection to admin. Suspending a user or ending/archiving a room publishes an idempotent runtime command so existing public WebSocket sessions are revoked without giving admin direct network access to public. The dependency view reports this link as `public_command_stream`.
 
 With `VOICE_ELF_BIND=0.0.0.0:3001`, other devices on the same LAN can open `http://<server-lan-ip>:3001` for account, room, history, and audio playback testing. Browser microphone capture requires a secure context: `localhost` works over HTTP, while a LAN IP normally requires a trusted HTTPS certificate. The client reports this explicitly instead of failing silently.
 
@@ -109,6 +153,46 @@ The server loads `.env` automatically. Relative filesystem paths in the server c
 MOSS-TTS-Nano runs as its official Python 3.12 ONNX service on `127.0.0.1:18083`; `scripts/moss-nano-tts.sh` pins the tested upstream revision and manages setup and runtime state. Setup bootstraps pinned `uv 0.11.32`, managed CPython 3.12.13, the locked Python dependencies, virtual environment, source, dependency cache, and model cache below the ignored project `.local/` directory. On macOS ARM, it also builds the OpenFST dependency for WeTextProcessing inside `.local/openfst/`; it does not install a global Homebrew package. No system Python or shell profile is modified, so a new checkout can recreate the same isolated runtime with `setup`; use `doctor` to verify it. Configure its URL, CPU threads, timeout, and the application voice-to-demo mapping with `TTS_MOSS_NANO_*`. Set `TTS_MOSS_NANO_ENABLED=false` to use only the stable Kokoro/Supertonic engines. `TTS_KOKORO_MODEL_DIR`, `TTS_SUPERTONIC_MODEL_DIR`, and `TTS_THREADS` override fallback defaults.
 
 IndexTTS2 is an optional second TTS provider. Admin > TTS Management can download the model in the background, start or stop its project-owned sidecar, show installation and health state, and enable the provider once its `/health` check succeeds. `scripts/index-tts.sh enable` provides the same install-and-start flow from a terminal. The script manages the official `index-tts/index-tts` source, its isolated `uv` environment, the complete `IndexTeam/IndexTTS-2` checkpoint set, the official example reference audio, and the HTTP sidecar on `127.0.0.1:18084`; progress is written to `.local/run/index-tts/manager.log`. Set `TTS_INDEX_ENABLED=true` to auto-start an already installed model when the main server starts. `TTS_INDEX_MANAGER_SCRIPT`, `TTS_INDEX_MODEL_DIR`, and `TTS_INDEX_RUNTIME_DIR` override the managed local paths. `INDEX_TTS_MODEL_SOURCE=modelscope` uses the upstream-documented ModelScope alternative instead of Hugging Face. `INDEX_TTS_REPOSITORY_URL` can point the source clone at a trusted mirror when direct GitHub access is slow; deployments should verify the resulting revision against the official repository.
+
+Qwen3-TTS is an optional OpenAI-compatible provider for a separately deployed
+[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) CustomVoice model. The adapter calls
+`POST /v1/audio/speech`, requests PCM16 WAV, and validates readiness through
+`GET /v1/audio/voices?model=...`.
+
+On Apple Silicon, install the project-owned [MLX-Audio](https://github.com/Blaizzy/mlx-audio)
+runtime and model once:
+
+```bash
+make qwen-tts-setup
+make qwen-tts-start
+make qwen-tts-status
+```
+
+Use these settings in `.env`:
+
+```dotenv
+TTS_QWEN_ENABLED=true
+TTS_QWEN_MANAGER_SCRIPT=scripts/qwen-tts.sh
+TTS_QWEN_BASE_URL=http://127.0.0.1:18085/v1/
+TTS_QWEN_MODEL=mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16
+TTS_QWEN_DEFAULT_VOICE_ID=vivian
+```
+
+After the one-time setup, starting Public or the compatibility server automatically starts the
+installed sidecar whenever `TTS_QWEN_ENABLED=true`. Linux/CUDA deployments can instead use
+vLLM-Omni:
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
+  --omni --port 18085 --trust-remote-code --enforce-eager
+```
+
+For vLLM-Omni set `TTS_QWEN_MODEL=Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`. You can also point
+`TTS_QWEN_BASE_URL` at another compatible protected endpoint. `TTS_QWEN_MODEL`,
+`TTS_QWEN_DEFAULT_VOICE_ID`, `TTS_QWEN_API_KEY`, timeout, and retry-backoff settings are listed
+in `.env.example`. Admin > TTS Management exposes Qwen health and its nine official preset
+speakers. Qwen remains unavailable for selection until the voices health check succeeds.
 
 `TTS_INDEX_DEFAULT_REFERENCE_AUDIO` supplies the preset fallback voice; without it the official `examples/voice_01.wav` is used. `TTS_INDEX_DEFAULT_VOICE_ID` assigns that reference a stable voice ID, while `TTS_INDEX_VOICE_MAP` accepts comma-separated `VOICE=/absolute/reference.wav` entries. Uploaded user voice references are sent directly for zero-shot cloning. System changes and authority-bus tenant overrides apply to newly created room audio pipelines. IndexTTS2 code and weights are distributed under Bilibili's model license rather than the project's application license; review the upstream `LICENSE` and `INDEX_MODEL_LICENSE` before production or high-scale commercial use.
 

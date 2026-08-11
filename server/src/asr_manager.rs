@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     authority::AuthorityService,
-    backends::{AppServices, AsrBackendInfo, AsrBackendRegistry},
+    backends::{AppServices, AsrBackendInfo, AsrBackendRegistry, FunAsrRuntimeStatus},
     config::AuthorityMode,
     storage::Database,
 };
@@ -41,6 +41,14 @@ impl AsrManager {
 
     pub fn providers(&self) -> Vec<AsrBackendInfo> {
         self.registry.providers()
+    }
+
+    pub async fn fun_asr_runtime_status(&self) -> FunAsrRuntimeStatus {
+        self.registry.fun_asr_runtime_status().await
+    }
+
+    pub fn provider_available(&self, backend_id: &str) -> bool {
+        self.registry.is_available(backend_id)
     }
 
     pub fn default_backend_id(&self) -> &'static str {

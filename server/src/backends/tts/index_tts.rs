@@ -148,7 +148,7 @@ impl TtsEngine for IndexTtsEngine {
     }
 }
 
-fn decode_pcm16_wav(bytes: &[u8]) -> Result<(Vec<i16>, u32, u16)> {
+pub(super) fn decode_pcm16_wav(bytes: &[u8]) -> Result<(Vec<i16>, u32, u16)> {
     let mut reader = hound::WavReader::new(Cursor::new(bytes)).context("invalid IndexTTS WAV")?;
     let spec = reader.spec();
     if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {

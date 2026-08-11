@@ -1,6 +1,7 @@
 mod fallback;
 mod index_tts;
 mod moss_nano;
+mod qwen;
 mod sherpa;
 
 use std::{
@@ -20,6 +21,7 @@ use crate::config::TtsConfig;
 pub use fallback::FallbackTtsEngine;
 pub use index_tts::IndexTtsEngine;
 pub use moss_nano::MossNanoOnnxEngine;
+pub use qwen::QwenTtsEngine;
 pub use sherpa::{KokoroEngine, SupertonicEngine};
 
 #[derive(Clone, Debug)]

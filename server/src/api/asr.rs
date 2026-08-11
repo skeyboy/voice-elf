@@ -16,7 +16,7 @@ use crate::{
     storage::{AsrSystemSetting, AuthorityTenantRecord},
 };
 
-pub(super) fn router() -> Router<AppState> {
+pub(super) fn admin_router() -> Router<AppState> {
     Router::new()
         .route("/admin/asr", get(management).patch(update_system))
         .route(
@@ -32,6 +32,7 @@ struct AsrManagement {
     effective: EffectiveAsrSelection,
     can_update_system: bool,
     applies_to: &'static str,
+    fun_asr_runtime: crate::backends::FunAsrRuntimeStatus,
 }
 
 async fn management(
@@ -55,6 +56,7 @@ async fn management(
         effective,
         can_update_system: state.authority.mode() != AuthorityMode::Tenant,
         applies_to: "new_room_pipelines",
+        fun_asr_runtime: state.asr.fun_asr_runtime_status().await,
     }))
 }
 

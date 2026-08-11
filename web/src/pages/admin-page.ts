@@ -6,12 +6,14 @@ import {
   type AsrProvider,
   type AuthorityInstance,
   type AuthorityTenant,
+  type ChangeHistoryRecord,
   type InstanceAuthorization,
   type IssuedAuthorityCredential,
   type MailStatus,
   type Paginated,
   type RoomDetail,
   type RoomSummary,
+  type RuntimeSnapshot,
   type TtsManagement,
   type TtsProvider,
   type User,
@@ -19,7 +21,7 @@ import {
 import { refreshIcons } from '../components/icons';
 import type { Page } from './page';
 
-type AdminSection = 'users' | 'rooms' | 'asr' | 'tts' | 'authority';
+type AdminSection = 'deployment' | 'users' | 'rooms' | 'asr' | 'tts' | 'email' | 'history' | 'authority';
 type SortOrder = 'asc' | 'desc';
 
 const USER_STATUS = {
@@ -53,12 +55,19 @@ export class AdminPage implements Page {
   private requestId = 0;
   private searchTimer = 0;
   private ttsPollTimer = 0;
+  private deploymentPollTimer = 0;
+  private deploymentCountdownTimer = 0;
+  private deploymentRefreshSeconds = 15;
+  private deploymentNextRefreshAt = 0;
+  private deploymentRefreshing = false;
+  private deploymentLastError = '';
   private authorityEnabled = false;
   private asrManagement: AsrManagement | null = null;
   private ttsManagement: TtsManagement | null = null;
   private tenants = new Map<string, AuthorityTenant>();
   private users = new Map<string, AdminUser>();
   private mailStatus: MailStatus | null = null;
+  private historyEntityType = '';
 
   constructor(
     private readonly currentUser: User,
@@ -75,7 +84,10 @@ export class AdminPage implements Page {
             <span class="section-kicker"><i data-lucide="shield-check"></i> ADMIN</span>
             <h1>系统管理</h1>
           </div>
-          <button class="icon-button admin-refresh" type="button" title="刷新管理数据" aria-label="刷新管理数据"><i data-lucide="refresh-cw"></i></button>
+          <div class="admin-heading-actions">
+            <a class="button-secondary" href="/admin/dependencies"><i data-lucide="activity"></i><span>依赖观测</span></a>
+            <button class="icon-button admin-refresh" type="button" title="刷新管理数据" aria-label="刷新管理数据"><i data-lucide="refresh-cw"></i></button>
+          </div>
         </header>
 
         <dl class="admin-overview" aria-label="系统概览" aria-busy="true">
@@ -87,10 +99,13 @@ export class AdminPage implements Page {
 
         <section class="admin-workspace">
           <div class="admin-section-tabs" role="tablist" aria-label="管理对象">
+            <button type="button" role="tab" data-section="deployment"><i data-lucide="server"></i><span>部署检测</span></button>
             <button class="active" type="button" role="tab" data-section="users"><i data-lucide="users"></i><span>人员管理</span></button>
             <button type="button" role="tab" data-section="rooms"><i data-lucide="calendar-clock"></i><span>会议管理</span></button>
             <button type="button" role="tab" data-section="asr"><i data-lucide="audio-waveform"></i><span>ASR 管理</span></button>
             <button type="button" role="tab" data-section="tts"><i data-lucide="speech"></i><span>TTS 管理</span></button>
+            <button type="button" role="tab" data-section="email"><i data-lucide="mail-cog"></i><span>邮箱配置</span></button>
+            <button type="button" role="tab" data-section="history"><i data-lucide="history"></i><span>变更历史</span></button>
             <button type="button" role="tab" data-section="authority" hidden><i data-lucide="key-round"></i><span>授权管理</span></button>
           </div>
 
@@ -122,7 +137,7 @@ export class AdminPage implements Page {
           <div class="admin-result-bar">
             <span class="admin-result-count" role="status" aria-live="polite"></span>
             <span class="admin-result-actions">
-              <span class="admin-mail-state" hidden></span>
+              <button class="admin-mail-state" type="button" hidden></button>
               <button class="admin-import-users button-secondary" type="button" hidden><i data-lucide="file-up"></i><span>批量导入</span></button>
               <button class="admin-create-user button-primary" type="button" hidden><i data-lucide="user-plus"></i><span>新建用户</span></button>
               <button class="admin-create-tenant button-secondary" type="button" hidden><i data-lucide="plus"></i><span>创建租户</span></button>
@@ -155,6 +170,7 @@ export class AdminPage implements Page {
   destroy() {
     window.clearTimeout(this.searchTimer);
     window.clearTimeout(this.ttsPollTimer);
+    this.stopDeploymentPolling();
     this.requestId += 1;
     this.root?.querySelector<HTMLDialogElement>('.admin-inspector')?.close();
     this.root = null;
@@ -169,6 +185,7 @@ export class AdminPage implements Page {
       const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-section]');
       if (!button || button.dataset.section === this.section) return;
       this.section = button.dataset.section as AdminSection;
+      if (this.section !== 'deployment') this.stopDeploymentPolling();
       this.query = '';
       this.status = '';
       this.role = '';
@@ -244,8 +261,22 @@ export class AdminPage implements Page {
       if (systemTts) void this.changeSystemTts(systemTts);
       const tenantTts = (event.target as HTMLElement).closest<HTMLSelectElement>('[data-tenant-tts]');
       if (tenantTts) void this.changeTenantTts(tenantTts);
+      const historyEntity = (event.target as HTMLElement).closest<HTMLSelectElement>('[data-history-entity]');
+      if (historyEntity) {
+        this.historyEntityType = historyEntity.value;
+        this.page = 1;
+        void this.loadList();
+      }
+      const deploymentInterval = (event.target as HTMLElement).closest<HTMLSelectElement>('[data-deployment-interval]');
+      if (deploymentInterval) {
+        this.deploymentRefreshSeconds = Number(deploymentInterval.value);
+        this.scheduleDeploymentPolling();
+        this.updateDeploymentCountdown();
+      }
     });
     this.root.querySelector('.admin-table-shell')?.addEventListener('click', (event) => {
+      const deploymentRefresh = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-deployment-refresh]');
+      if (deploymentRefresh) void this.refreshDeployment(false);
       const userAction = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-user-action]');
       if (userAction) void this.changeUserStatus(userAction);
       const editUser = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-edit-user]');
@@ -264,6 +295,15 @@ export class AdminPage implements Page {
     this.root.querySelector('.admin-create-user')?.addEventListener('click', () => this.openUserEditor());
     this.root.querySelector('.admin-import-users')?.addEventListener('click', () => this.openUserImport());
     this.root.querySelector('.admin-create-tenant')?.addEventListener('click', () => this.openTenantEditor());
+    this.root.querySelector('.admin-mail-state')?.addEventListener('click', () => {
+      this.root?.querySelector<HTMLButtonElement>('[data-section="email"]')?.click();
+    });
+    this.root.querySelector('.admin-table-shell')?.addEventListener('submit', (event) => {
+      const form = event.target as HTMLFormElement;
+      if (!form.matches('[data-email-config-form]')) return;
+      event.preventDefault();
+      void this.saveMailConfig(form);
+    });
     const dialog = this.root.querySelector<HTMLDialogElement>('.admin-inspector')!;
     dialog.querySelector('.inspector-close')?.addEventListener('click', () => dialog.close());
     dialog.addEventListener('click', (event) => {
@@ -298,7 +338,7 @@ export class AdminPage implements Page {
       button.setAttribute('aria-selected', String(active));
     });
     const query = this.root.querySelector<HTMLInputElement>('[name="q"]')!;
-    const compact = this.section === 'asr' || this.section === 'tts';
+    const compact = ['deployment', 'asr', 'tts', 'email', 'history'].includes(this.section);
     this.root.querySelector<HTMLFormElement>('.admin-filters')!.hidden = compact;
     this.root.querySelector<HTMLElement>('.admin-result-bar')!.hidden = compact;
     if (compact) this.root.querySelector<HTMLElement>('.admin-pagination')!.replaceChildren();
@@ -378,7 +418,7 @@ export class AdminPage implements Page {
       state.className = `admin-mail-state ${this.mailStatus.configured ? 'configured' : 'unconfigured'}`;
       state.title = this.mailStatus.configured
         ? `${this.mailStatus.host}:${this.mailStatus.port} · ${this.mailStatus.from_address}`
-        : '设置 VOICE_ELF_SMTP_PASSWORD 后重启服务';
+        : '打开邮箱配置完成 SMTP 设置';
       state.innerHTML = `<i data-lucide="${this.mailStatus.configured ? 'mail-check' : 'mail-warning'}"></i><span>${this.mailStatus.configured ? 'SMTP 已配置' : 'SMTP 未配置'}</span>`;
       refreshIcons(state);
     } catch (error) {
@@ -388,6 +428,7 @@ export class AdminPage implements Page {
 
   private async loadList() {
     if (!this.root) return;
+    if (this.section === 'deployment') this.stopDeploymentPolling();
     const requestId = ++this.requestId;
     const shell = this.root.querySelector<HTMLElement>('.admin-table-shell')!;
     shell.setAttribute('aria-busy', 'true');
@@ -403,7 +444,13 @@ export class AdminPage implements Page {
     if (this.status) params.set('status', this.status);
     if (this.section === 'users' && this.role) params.set('role', this.role);
     try {
-      if (this.section === 'users') {
+      if (this.section === 'deployment') {
+        const data = await apiRequest<RuntimeSnapshot>('/api/runtime/dependencies');
+        if (!this.root || requestId !== this.requestId) return;
+        this.deploymentLastError = '';
+        this.renderDeployment(data);
+        this.scheduleDeploymentPolling();
+      } else if (this.section === 'users') {
         const data = await apiRequest<Paginated<AdminUser>>(`/api/admin/users?${params}`);
         if (!this.root || requestId !== this.requestId) return;
         this.users = new Map(data.items.map((user) => [user.id, user]));
@@ -422,6 +469,20 @@ export class AdminPage implements Page {
         if (!this.root || requestId !== this.requestId) return;
         this.ttsManagement = data;
         this.renderTts(data);
+      } else if (this.section === 'email') {
+        const data = await apiRequest<MailStatus>('/api/admin/email/config');
+        if (!this.root || requestId !== this.requestId) return;
+        this.mailStatus = data;
+        this.renderMailConfig(data);
+      } else if (this.section === 'history') {
+        const historyParams = new URLSearchParams({
+          page: String(this.page),
+          page_size: String(this.pageSize),
+        });
+        if (this.historyEntityType) historyParams.set('entity_type', this.historyEntityType);
+        const data = await apiRequest<Paginated<ChangeHistoryRecord>>(`/api/admin/change-history?${historyParams}`);
+        if (!this.root || requestId !== this.requestId) return;
+        this.renderChangeHistory(data);
       } else {
         const data = await apiRequest<Paginated<AuthorityTenant>>(`/api/admin/authority/tenants?${params}`);
         if (!this.root || requestId !== this.requestId) return;
@@ -438,18 +499,237 @@ export class AdminPage implements Page {
     }
   }
 
+  private renderDeployment(data: RuntimeSnapshot) {
+    if (!this.root) return;
+    const shell = this.root.querySelector<HTMLElement>('.admin-table-shell')!;
+    const statusLabel = data.overall_status === 'ready' ? '可以接收流量' : data.overall_status === 'degraded' ? '部分能力降级' : '依赖尚未就绪';
+    const statusIcon = data.overall_status === 'ready' ? 'circle-check' : data.overall_status === 'degraded' ? 'triangle-alert' : 'circle-x';
+    const readyCount = data.dependencies.filter((dependency) => dependency.status === 'ready').length;
+    const degradedCount = data.dependencies.filter((dependency) => dependency.status === 'degraded').length;
+    const unavailableCount = data.dependencies.filter((dependency) => ['unavailable', 'unknown'].includes(dependency.status)).length;
+    const dependencyNames: Record<string, string> = {
+      postgresql: 'PostgreSQL',
+      system_installation: '系统初始化',
+      instance_authorization: '实例授权',
+      asr_provider: 'ASR Provider',
+      tts_provider: 'TTS Provider',
+      public_command_stream: 'Public gRPC 命令流',
+      smtp: 'SMTP 邮件服务',
+      qwen_tts: 'Qwen3-TTS',
+    };
+    shell.innerHTML = `
+      <section class="deployment-diagnostics">
+        <div class="deployment-monitor-bar">
+          <div class="deployment-monitor-state"><i></i><span>持续校验</span><strong data-deployment-countdown>${this.deploymentRefreshSeconds ? '准备刷新' : '已暂停'}</strong></div>
+          <label><span>自动刷新</span><select data-deployment-interval>
+            ${[5, 15, 30, 60].map((seconds) => `<option value="${seconds}" ${seconds === this.deploymentRefreshSeconds ? 'selected' : ''}>${seconds} 秒</option>`).join('')}
+            <option value="0" ${this.deploymentRefreshSeconds === 0 ? 'selected' : ''}>暂停</option>
+          </select></label>
+          <button class="button-secondary deployment-refresh-now" type="button" data-deployment-refresh ${this.deploymentRefreshing ? 'disabled' : ''}><i data-lucide="${this.deploymentRefreshing ? 'loader-circle' : 'refresh-cw'}"></i><span>${this.deploymentRefreshing ? '检测中' : '立即检测'}</span></button>
+        </div>
+        ${this.deploymentLastError ? `<div class="deployment-stale-alert" role="alert"><i data-lucide="wifi-off"></i><span>自动校验失败，当前展示最近一次成功快照</span><small>${escapeHtml(this.deploymentLastError)}</small></div>` : ''}
+        <header class="deployment-summary deployment-status-${escapeAttribute(data.overall_status)}">
+          <span class="deployment-summary-icon"><i data-lucide="${statusIcon}"></i></span>
+          <div><span>${escapeHtml(data.service)}</span><strong>${statusLabel}</strong><small>版本 ${escapeHtml(data.version)} · 检测于 ${formatDate(data.generated_at)}</small></div>
+          <dl><div><dt>正常</dt><dd>${readyCount}</dd></div><div><dt>降级</dt><dd>${degradedCount}</dd></div><div><dt>异常</dt><dd>${unavailableCount}</dd></div><div><dt>必需项</dt><dd>${data.dependencies.filter((dependency) => dependency.required).length}</dd></div></dl>
+        </header>
+        <div class="deployment-check-list">
+          ${data.dependencies.map((dependency) => {
+            const label = dependency.status === 'ready' ? '正常' : dependency.status === 'degraded' ? '降级' : dependency.status === 'unavailable' ? '不可用' : '未知';
+            const icon = dependency.status === 'ready' ? 'check' : dependency.status === 'degraded' ? 'triangle-alert' : 'x';
+            return `<article class="deployment-check deployment-check-${escapeAttribute(dependency.status)}">
+              <span class="deployment-check-icon"><i data-lucide="${icon}"></i></span>
+              <div><header><strong>${escapeHtml(dependencyNames[dependency.name] ?? dependency.name)}</strong><code>${escapeHtml(dependency.name)}</code><span>${escapeHtml(dependency.kind)}</span>${dependency.required ? '<em>必需</em>' : '<em>可选</em>'}</header><p>${escapeHtml(dependency.message)}</p><small>校验时间 ${formatDate(dependency.checked_at)}</small></div>
+              <span class="deployment-check-state">${label}</span>
+            </article>`;
+          }).join('')}
+        </div>
+      </section>
+    `;
+    refreshIcons(shell);
+    this.updateDeploymentCountdown();
+  }
+
+  private scheduleDeploymentPolling() {
+    window.clearTimeout(this.deploymentPollTimer);
+    window.clearInterval(this.deploymentCountdownTimer);
+    if (!this.root || this.section !== 'deployment' || this.deploymentRefreshSeconds <= 0) {
+      this.deploymentNextRefreshAt = 0;
+      this.updateDeploymentCountdown();
+      return;
+    }
+    this.deploymentNextRefreshAt = Date.now() + this.deploymentRefreshSeconds * 1_000;
+    this.deploymentPollTimer = window.setTimeout(() => void this.refreshDeployment(true), this.deploymentRefreshSeconds * 1_000);
+    this.deploymentCountdownTimer = window.setInterval(() => this.updateDeploymentCountdown(), 1_000);
+    this.updateDeploymentCountdown();
+  }
+
+  private stopDeploymentPolling() {
+    window.clearTimeout(this.deploymentPollTimer);
+    window.clearInterval(this.deploymentCountdownTimer);
+    this.deploymentPollTimer = 0;
+    this.deploymentCountdownTimer = 0;
+    this.deploymentNextRefreshAt = 0;
+  }
+
+  private updateDeploymentCountdown() {
+    const countdown = this.root?.querySelector<HTMLElement>('[data-deployment-countdown]');
+    if (!countdown) return;
+    if (this.deploymentRefreshing) {
+      countdown.textContent = '正在执行校验';
+    } else if (!this.deploymentRefreshSeconds || !this.deploymentNextRefreshAt) {
+      countdown.textContent = '已暂停';
+    } else {
+      const seconds = Math.max(0, Math.ceil((this.deploymentNextRefreshAt - Date.now()) / 1_000));
+      countdown.textContent = `${seconds} 秒后刷新`;
+    }
+  }
+
+  private async refreshDeployment(silent: boolean) {
+    if (!this.root || this.section !== 'deployment' || this.deploymentRefreshing) return;
+    window.clearTimeout(this.deploymentPollTimer);
+    window.clearInterval(this.deploymentCountdownTimer);
+    this.deploymentRefreshing = true;
+    this.updateDeploymentCountdown();
+    const button = this.root.querySelector<HTMLButtonElement>('[data-deployment-refresh]');
+    if (button) {
+      button.disabled = true;
+      button.innerHTML = '<i data-lucide="loader-circle"></i><span>检测中</span>';
+      refreshIcons(button);
+    }
+    try {
+      const data = await apiRequest<RuntimeSnapshot>('/api/runtime/dependencies');
+      if (!this.root || this.section !== 'deployment') return;
+      this.deploymentLastError = '';
+      this.renderDeployment(data);
+    } catch (error) {
+      if (!this.root || this.section !== 'deployment') return;
+      this.deploymentLastError = error instanceof Error ? error.message : '依赖检测接口不可用';
+      const alert = this.root.querySelector<HTMLElement>('.deployment-stale-alert');
+      if (!alert) {
+        const diagnostics = this.root.querySelector<HTMLElement>('.deployment-diagnostics');
+        diagnostics?.insertAdjacentHTML('afterbegin', `<div class="deployment-stale-alert" role="alert"><i data-lucide="wifi-off"></i><span>自动校验失败，当前展示最近一次成功快照</span><small>${escapeHtml(this.deploymentLastError)}</small></div>`);
+        if (diagnostics) refreshIcons(diagnostics);
+      }
+      if (!silent) this.onError(this.deploymentLastError);
+    } finally {
+      this.deploymentRefreshing = false;
+      const currentButton = this.root?.querySelector<HTMLButtonElement>('[data-deployment-refresh]');
+      if (currentButton) {
+        currentButton.disabled = false;
+        currentButton.innerHTML = '<i data-lucide="refresh-cw"></i><span>立即检测</span>';
+        refreshIcons(currentButton);
+      }
+      this.scheduleDeploymentPolling();
+    }
+  }
+
+  private renderMailConfig(data: MailStatus) {
+    if (!this.root) return;
+    const shell = this.root.querySelector<HTMLElement>('.admin-table-shell')!;
+    shell.innerHTML = `
+      <section class="email-management">
+        <header class="asr-current">
+          <span class="asr-current-icon"><i data-lucide="${data.configured ? 'mail-check' : 'mail-warning'}"></i></span>
+          <div><span>密码重置邮件</span><strong>${data.configured ? 'SMTP 可以发送' : 'SMTP 尚未就绪'}</strong><small>${escapeHtml(data.host)}:${data.port} · ${escapeHtml(data.from_address)}</small></div>
+          <span class="asr-live-status ${data.configured ? '' : 'unavailable'}"><i></i>${data.enabled ? '已启用' : '已停用'}</span>
+        </header>
+        <form class="email-config-form" data-email-config-form>
+          <header><div><span class="section-kicker">VERSIONED CONFIG</span><h2>邮件服务配置</h2></div><label class="email-enabled"><input name="enabled" type="checkbox" ${data.enabled ? 'checked' : ''}><span>启用发送</span></label></header>
+          <div class="authority-form-grid">
+            <label><span>SMTP 主机</span><input name="host" maxlength="255" required value="${escapeAttribute(data.host)}"></label>
+            <label><span>端口</span><input name="port" type="number" min="1" max="65535" required value="${data.port}"></label>
+            <label><span>安全模式</span><select name="security"><option value="wrapper" ${data.security === 'wrapper' ? 'selected' : ''}>TLS / SSL</option><option value="starttls" ${data.security === 'starttls' ? 'selected' : ''}>STARTTLS</option><option value="none" ${data.security === 'none' ? 'selected' : ''}>无加密</option></select></label>
+            <label><span>SMTP 用户名</span><input name="username" maxlength="255" autocomplete="off" value="${escapeAttribute(data.username)}"></label>
+            <label class="account-form-wide"><span>SMTP 密码</span><input name="password" type="password" autocomplete="new-password" placeholder="${data.password_configured ? '已保存，留空保持不变' : '输入 SMTP 密码或授权码'}"></label>
+            <label><span>发件邮箱</span><input name="from_address" type="email" maxlength="254" required value="${escapeAttribute(data.from_address)}"></label>
+            <label><span>发件人名称</span><input name="from_name" maxlength="128" required value="${escapeAttribute(data.from_name)}"></label>
+            <label class="account-form-wide"><span>系统访问地址</span><input name="public_url" type="url" placeholder="https://voice.example.com" value="${escapeAttribute(data.public_url ?? '')}"></label>
+            <label><span>重置链接有效期</span><input name="reset_expiry_minutes" type="number" min="5" max="1440" required value="${data.reset_expiry_minutes}"></label>
+            <label class="email-clear-password"><input name="clear_password" type="checkbox"><span>清除已保存密码</span></label>
+          </div>
+          <footer class="authority-form-actions"><span class="email-version-note"><i data-lucide="history"></i>保存会创建新版本，旧配置保留为历史记录</span><button class="button-primary" type="submit"><i data-lucide="save"></i><span>保存配置</span></button></footer>
+        </form>
+      </section>
+    `;
+    refreshIcons(shell);
+  }
+
+  private async saveMailConfig(form: HTMLFormElement) {
+    if (!form.reportValidity()) return;
+    const data = new FormData(form);
+    const submit = form.querySelector<HTMLButtonElement>('[type="submit"]')!;
+    submit.disabled = true;
+    try {
+      const status = await apiRequest<MailStatus>('/api/admin/email/config', {
+        method: 'PUT',
+        body: JSON.stringify({
+          enabled: form.querySelector<HTMLInputElement>('[name="enabled"]')!.checked,
+          host: String(data.get('host') ?? ''),
+          port: Number(data.get('port')),
+          security: String(data.get('security') ?? 'wrapper'),
+          username: String(data.get('username') ?? ''),
+          password: String(data.get('password') ?? '') || null,
+          clear_password: form.querySelector<HTMLInputElement>('[name="clear_password"]')!.checked,
+          from_address: String(data.get('from_address') ?? ''),
+          from_name: String(data.get('from_name') ?? ''),
+          public_url: String(data.get('public_url') ?? '') || null,
+          reset_expiry_minutes: Number(data.get('reset_expiry_minutes')),
+        }),
+      });
+      this.mailStatus = status;
+      this.renderMailConfig(status);
+      await this.loadMailStatus();
+      this.onMessage('邮箱配置新版本已生效');
+    } catch (error) {
+      submit.disabled = false;
+      this.onError(error instanceof Error ? error.message : '无法保存邮箱配置');
+    }
+  }
+
+  private renderChangeHistory(data: Paginated<ChangeHistoryRecord>) {
+    if (!this.root) return;
+    const shell = this.root.querySelector<HTMLElement>('.admin-table-shell')!;
+    shell.innerHTML = `
+      <section class="change-history-management">
+        <header class="change-history-heading"><div><span class="section-kicker">IMMUTABLE HISTORY</span><h2>数据变更历史</h2></div><label><span>对象类型</span><select data-history-entity>${historyEntityOptions(this.historyEntityType)}</select></label></header>
+        ${data.items.length ? `<table class="admin-table change-history-table">
+          <thead><tr><th>时间</th><th>对象</th><th>操作</th><th>版本状态</th><th>变化字段</th></tr></thead>
+          <tbody>${data.items.map((item) => `<tr>
+            <td><strong class="admin-date">${formatDate(item.created_at)}</strong></td>
+            <td><strong>${escapeHtml(historyEntityLabel(item.entity_type))}</strong><code>${escapeHtml(item.entity_id)}</code></td>
+            <td><span class="admin-status ${item.action === 'delete' ? 'suspended' : item.action === 'create' ? 'active' : 'pending'}"><i></i>${item.action === 'create' ? '新增' : item.action === 'update' ? '修改' : '删除'}</span></td>
+            <td><span class="history-record-status ${escapeAttribute(item.record_status)}">${item.record_status === 'current' ? '当前版本' : item.record_status === 'historical' ? '历史版本' : '已删除'}</span></td>
+            <td><span class="history-change-fields">${escapeHtml(changeFieldSummary(item))}</span></td>
+          </tr>`).join('')}</tbody>
+        </table>` : '<div class="admin-empty"><i data-lucide="history"></i><strong>暂无变更历史</strong></div>'}
+      </section>
+    `;
+    this.renderResultMeta(data);
+    refreshIcons(shell);
+  }
+
   private renderAsr(data: AsrManagement) {
     if (!this.root) return;
     const shell = this.root.querySelector<HTMLElement>('.admin-table-shell')!;
     const effective = data.providers.find((provider) => provider.id === data.effective.backend_id);
     const system = data.providers.find((provider) => provider.id === data.system_setting.backend_id);
+    const funAsrRuntime = data.fun_asr_runtime;
+    const effectiveAvailable = effective?.available !== false
+      && (effective?.id !== 'funasr-streaming' || funAsrRuntime.healthy);
     shell.innerHTML = `
       <section class="asr-management">
         <header class="asr-current">
           <span class="asr-current-icon"><i data-lucide="audio-waveform"></i></span>
           <div><span>当前生效</span><strong>${escapeHtml(effective?.name ?? data.effective.backend_id)}</strong><small>${data.effective.source === 'tenant' ? `租户策略 · ${escapeHtml(data.effective.tenant_name ?? '')}` : '系统默认策略'}</small></div>
-          <span class="asr-live-status"><i></i>已启用</span>
+          <span class="asr-live-status ${effectiveAvailable ? '' : 'offline'}"><i></i>${effectiveAvailable ? '已启用' : '不可用'}</span>
         </header>
+
+        <section class="qwen-tts-runtime ${funAsrRuntime.healthy ? 'healthy' : funAsrRuntime.enabled ? 'unavailable' : 'disabled'}">
+          <span class="qwen-tts-runtime-icon"><i data-lucide="radio-tower"></i></span>
+          <div><span class="section-kicker">FUNASR STREAMING RUNTIME</span><strong>${funAsrRuntime.healthy ? '流式服务可用' : funAsrRuntime.enabled ? '流式服务不可用' : '尚未启用'}</strong><small>${escapeHtml(funAsrRuntime.message)}</small></div>
+          <dl><div><dt>传输</dt><dd>WebSocket</dd></div><div><dt>识别模式</dt><dd>2-pass</dd></div><div><dt>健康检查</dt><dd>${funAsrRuntime.healthy ? '通过' : '未通过'}</dd></div></dl>
+        </section>
 
         <section class="asr-system-setting">
           <div><span class="section-kicker">SYSTEM DEFAULT</span><h2>系统默认后端</h2></div>
@@ -471,7 +751,7 @@ export class AdminPage implements Page {
                 <td><span class="asr-provider-name"><i data-lucide="${provider.production ? 'cpu' : 'flask-conical'}"></i><span><strong>${escapeHtml(provider.name)}</strong><code>${escapeHtml(provider.id)}</code></span></span></td>
                 <td><strong>${escapeHtml(provider.engine)}</strong></td>
                 <td><span class="admin-cell-note">${escapeHtml(provider.description)}</span></td>
-                <td><span class="admin-status ${provider.available ? 'active' : 'suspended'}"><i></i>${provider.available ? '可用' : '未配置'}</span>${provider.production ? '' : '<small class="admin-cell-note warning">非生产</small>'}</td>
+                <td><span class="admin-status ${provider.available && (provider.id !== 'funasr-streaming' || funAsrRuntime.healthy) ? 'active' : 'suspended'}"><i></i>${provider.available ? provider.id === 'funasr-streaming' && !funAsrRuntime.healthy ? '连接异常' : '可用' : '未配置'}</span>${provider.production ? '' : '<small class="admin-cell-note warning">非生产</small>'}</td>
               </tr>`).join('')}</tbody>
           </table>
         </section>
@@ -488,6 +768,7 @@ export class AdminPage implements Page {
     const system = data.providers.find((provider) => provider.id === data.system_setting.backend_id);
     const effectiveAvailable = effective?.available !== false;
     const runtime = data.index_tts_runtime;
+    const qwenRuntime = data.qwen_tts_runtime;
     const runtimeBusy = Boolean(runtime.action) || ['installing', 'starting', 'stopping'].includes(runtime.phase);
     const runtimeAction = !runtime.model_ready ? 'install' : runtime.running || runtime.healthy ? 'stop' : 'start';
     const runtimeActionLabel = runtimeAction === 'install' ? '安装并启动' : runtimeAction === 'start' ? '启动服务' : '停止服务';
@@ -528,6 +809,12 @@ export class AdminPage implements Page {
             <button class="button-primary" type="button" data-index-tts-action="${runtimeAction}" ${runtimeBusy || !runtime.script_available ? 'disabled' : ''}><i data-lucide="${runtimeBusy ? 'loader-circle' : runtimeActionIcon}"></i><span>${runtimeBusy ? '正在处理' : runtimeActionLabel}</span></button>
           </div>
           <small class="index-tts-runtime-path" title="${escapeAttribute(runtime.model_dir)}">模型目录：${escapeHtml(runtime.model_dir)}</small>
+        </section>
+
+        <section class="qwen-tts-runtime ${qwenRuntime.healthy ? 'healthy' : qwenRuntime.enabled ? 'unavailable' : 'disabled'}">
+          <span class="qwen-tts-runtime-icon"><i data-lucide="audio-lines"></i></span>
+          <div><span class="section-kicker">QWEN3-TTS RUNTIME</span><strong>${qwenRuntime.healthy ? '模型服务可用' : qwenRuntime.enabled ? '模型服务不可用' : '尚未启用'}</strong><small>${escapeHtml(qwenRuntime.message)}</small></div>
+          <dl><div><dt>模型</dt><dd>${escapeHtml(qwenRuntime.model)}</dd></div><div><dt>服务地址</dt><dd>${escapeHtml(qwenRuntime.base_url)}</dd></div><div><dt>健康检查</dt><dd>${qwenRuntime.healthy ? '通过' : '未通过'}</dd></div></dl>
         </section>
 
         <section class="asr-provider-list">
@@ -707,9 +994,13 @@ export class AdminPage implements Page {
     const options = includeInherited
       ? `<option value="" ${selected ? '' : 'selected'}>继承系统 · ${escapeHtml(inherited?.name ?? '默认后端')}</option>`
       : '';
-    return options + providers.map((provider) => `
-      <option value="${escapeAttribute(provider.id)}" ${provider.id === selected ? 'selected' : ''} ${provider.available ? '' : 'disabled'}>${escapeHtml(provider.name)}${provider.production ? '' : ' · 非生产'}${provider.available ? '' : ' · 未配置'}</option>
-    `).join('');
+    return options + providers.map((provider) => {
+      const runtimeAvailable = provider.available
+        && (provider.id !== 'funasr-streaming' || this.asrManagement?.fun_asr_runtime.healthy);
+      return `
+        <option value="${escapeAttribute(provider.id)}" ${provider.id === selected ? 'selected' : ''} ${runtimeAvailable ? '' : 'disabled'}>${escapeHtml(provider.name)}${provider.production ? '' : ' · 非生产'}${provider.available ? runtimeAvailable ? '' : ' · 连接异常' : ' · 未配置'}</option>
+      `;
+    }).join('');
   }
 
   private ttsOptions(providers: TtsProvider[], selected: string, includeInherited: boolean) {
@@ -1286,6 +1577,42 @@ function paginationWindow(current: number, total: number) {
     result.push(page);
   });
   return result;
+}
+
+const HISTORY_ENTITIES = [
+  ['users', '人员'],
+  ['rooms', '会议'],
+  ['room_members', '会议成员'],
+  ['voice_sessions', '语音会话'],
+  ['voice_utterances', '对话记录'],
+  ['voice_utterance_speakers', '发言人'],
+  ['voice_utterance_refinements', '识别精修'],
+  ['voice_references', '参考音色'],
+  ['system_installations', '系统初始化'],
+  ['system_email_settings', '邮箱配置'],
+  ['asr_system_settings', 'ASR 配置'],
+  ['tts_system_settings', 'TTS 配置'],
+  ['tts_voice_aliases', '音色别名'],
+  ['authority_tenants', '授权租户'],
+  ['authority_instances', '授权实例'],
+] as const;
+
+function historyEntityLabel(entityType: string) {
+  return HISTORY_ENTITIES.find(([value]) => value === entityType)?.[1] ?? entityType;
+}
+
+function historyEntityOptions(selected: string) {
+  return `<option value="">全部对象</option>${HISTORY_ENTITIES.map(([value, label]) => `<option value="${value}" ${selected === value ? 'selected' : ''}>${label}</option>`).join('')}`;
+}
+
+function changeFieldSummary(item: ChangeHistoryRecord) {
+  const before = item.before_state ?? {};
+  const after = item.after_state ?? {};
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+  const changed = [...keys].filter((key) => JSON.stringify(before[key]) !== JSON.stringify(after[key]));
+  if (!changed.length) return '状态记录';
+  const visible = changed.slice(0, 7).join('、');
+  return changed.length > 7 ? `${visible} 等 ${changed.length} 项` : visible;
 }
 
 function formatDate(value: string) {

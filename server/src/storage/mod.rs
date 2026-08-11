@@ -1382,6 +1382,7 @@ mod database_setup_tests {
 mod asr;
 mod authority;
 mod history;
+mod settings;
 mod tts;
 
 pub use asr::AsrSystemSetting;
@@ -1395,3 +1396,4 @@ pub use history::{
     NewUtteranceAttempt, RefinementUpdate, TranscriptUpdate, TranslationUpdate,
     UtteranceAudioUpdate, UtteranceExport, UtteranceHistory,
 };
+pub use settings::ChangeHistoryRecord;

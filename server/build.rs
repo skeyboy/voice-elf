@@ -4,9 +4,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.protoc_executable(protoc);
     tonic_prost_build::configure().compile_with_config(
         config,
-        &["proto/voice_elf.proto"],
+        &["proto/voice_elf.proto", "proto/control.proto"],
         &["proto"],
     )?;
     println!("cargo:rerun-if-changed=proto/voice_elf.proto");
+    println!("cargo:rerun-if-changed=proto/control.proto");
+    println!("cargo:rerun-if-changed=migrations");
     Ok(())
 }

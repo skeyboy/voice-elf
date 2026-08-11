@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package voiceelf.control.v1;
+
+service ControlPlane {
+  rpc GetRuntimeSnapshot(RuntimeSnapshotRequest) returns (RuntimeSnapshotResponse);
+  rpc CheckReadiness(ReadinessRequest) returns (ReadinessResponse);
+  rpc WatchRuntimeCommands(RuntimeCommandStreamRequest) returns (stream RuntimeCommand);
+}
+
+message RuntimeSnapshotRequest {
+  string caller = 1;
+}
+
+message DependencyCheck {
+  string name = 1;
+  string kind = 2;
+  bool required = 3;
+  string status = 4;
+  string message = 5;
+  string checked_at = 6;
+}
+
+message RuntimeSnapshotResponse {
+  string service = 1;
+  string overall_status = 2;
+  string generated_at = 3;
+  bool initialized = 4;
+  bool authorized = 5;
+  repeated DependencyCheck dependencies = 6;
+  string version = 7;
+}
+
+message ReadinessRequest {
+  string caller = 1;
+}
+
+message ReadinessResponse {
+  bool ready = 1;
+  RuntimeSnapshotResponse snapshot = 2;
+}
+
+message RuntimeCommandStreamRequest {
+  string caller = 1;
+  uint64 after_sequence = 2;
+}
+
+message RuntimeCommand {
+  string command_id = 1;
+  uint64 sequence = 2;
+  string issued_at = 3;
+
+  oneof action {
+    RevokeUserSessions revoke_user_sessions = 10;
+    CloseRoom close_room = 11;
+  }
+}
+
+message RevokeUserSessions {
+  string user_id = 1;
+}
+
+message CloseRoom {
+  string room_id = 1;
+}

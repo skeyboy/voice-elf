@@ -1,3 +1,5 @@
+use std::sync::{Arc, RwLock};
+
 use anyhow::{Context, Result};
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
@@ -13,6 +15,10 @@ use crate::config::{MailConfig, SmtpSecurity};
 
 #[derive(Clone)]
 pub struct MailService {
+    runtime: Arc<RwLock<MailRuntime>>,
+}
+
+struct MailRuntime {
     config: MailConfig,
     transport: Option<AsyncSmtpTransport<Tokio1Executor>>,
     from: Mailbox,
@@ -20,72 +26,89 @@ pub struct MailService {
 
 #[derive(Serialize)]
 pub struct MailStatus {
+    pub enabled: bool,
     pub configured: bool,
+    pub password_configured: bool,
     pub host: String,
     pub port: u16,
     pub security: &'static str,
     pub username: String,
     pub from_address: String,
+    pub from_name: String,
+    pub public_url: Option<String>,
     pub reset_expiry_minutes: u64,
 }
 
 impl MailService {
     pub fn new(config: MailConfig) -> Result<Self> {
-        let from_address = config
-            .from_address
-            .parse()
-            .context("VOICE_ELF_SMTP_FROM_ADDRESS is invalid")?;
-        let from = Mailbox::new(Some(config.from_name.clone()), from_address);
-        let transport = if config.configured() {
-            let tls_parameters =
-                TlsParameters::new(config.host.clone()).context("failed to configure SMTP TLS")?;
-            let mut builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&config.host)
-                .port(config.port)
-                .credentials(Credentials::new(
-                    config.username.clone(),
-                    config.password.clone().unwrap_or_default(),
-                ));
-            builder = match config.security {
-                SmtpSecurity::Wrapper => builder.tls(Tls::Wrapper(tls_parameters)),
-                SmtpSecurity::StartTls => builder.tls(Tls::Required(tls_parameters)),
-                SmtpSecurity::None => builder.tls(Tls::None),
-            };
-            Some(builder.build())
-        } else {
-            None
-        };
         Ok(Self {
-            config,
-            transport,
-            from,
+            runtime: Arc::new(RwLock::new(build_runtime(config)?)),
         })
     }
 
+    pub fn update(&self, config: MailConfig) -> Result<()> {
+        let runtime = build_runtime(config)?;
+        *self
+            .runtime
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = runtime;
+        Ok(())
+    }
+
+    pub fn config(&self) -> MailConfig {
+        self.runtime
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config
+            .clone()
+    }
+
     pub fn configured(&self) -> bool {
-        self.transport.is_some()
+        self.runtime
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .transport
+            .is_some()
     }
 
     pub fn reset_expiry(&self) -> std::time::Duration {
-        self.config.reset_expiry
+        self.runtime
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config
+            .reset_expiry
     }
 
-    pub fn public_url(&self) -> Option<&str> {
-        self.config.public_url.as_deref()
+    pub fn public_url(&self) -> Option<String> {
+        self.runtime
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config
+            .public_url
+            .clone()
     }
 
     pub fn status(&self) -> MailStatus {
+        let runtime = self
+            .runtime
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         MailStatus {
-            configured: self.configured(),
-            host: self.config.host.clone(),
-            port: self.config.port,
-            security: match self.config.security {
+            enabled: runtime.config.enabled,
+            configured: runtime.transport.is_some(),
+            password_configured: runtime.config.password.is_some(),
+            host: runtime.config.host.clone(),
+            port: runtime.config.port,
+            security: match runtime.config.security {
                 SmtpSecurity::Wrapper => "wrapper",
                 SmtpSecurity::StartTls => "starttls",
                 SmtpSecurity::None => "none",
             },
-            username: self.config.username.clone(),
-            from_address: self.config.from_address.clone(),
-            reset_expiry_minutes: self.config.reset_expiry.as_secs() / 60,
+            username: runtime.config.username.clone(),
+            from_address: runtime.config.from_address.clone(),
+            from_name: runtime.config.from_name.clone(),
+            public_url: runtime.config.public_url.clone(),
+            reset_expiry_minutes: runtime.config.reset_expiry.as_secs() / 60,
         }
     }
 
@@ -96,12 +119,21 @@ impl MailService {
         system_name: &str,
         reset_url: &str,
     ) -> Result<()> {
-        let transport = self
-            .transport
-            .as_ref()
-            .context("SMTP password is not configured")?;
+        let (transport, from, expiry_minutes) = {
+            let runtime = self
+                .runtime
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                runtime
+                    .transport
+                    .clone()
+                    .context("SMTP password is not configured")?,
+                runtime.from.clone(),
+                runtime.config.reset_expiry.as_secs() / 60,
+            )
+        };
         let recipient = recipient.parse().context("user email address is invalid")?;
-        let expiry_minutes = self.config.reset_expiry.as_secs() / 60;
         let plain = format!(
             "{username}，你好：\n\n有人申请重置你在 {system_name} 的登录密码。请在 {expiry_minutes} 分钟内打开以下链接：\n\n{reset_url}\n\n如果不是你本人操作，请忽略此邮件。该链接只能使用一次。"
         );
@@ -112,7 +144,7 @@ impl MailService {
             reset_url = escape_html(reset_url),
         );
         let message = Message::builder()
-            .from(self.from.clone())
+            .from(from)
             .to(Mailbox::new(None, recipient))
             .subject(format!("重置 {system_name} 登录密码"))
             .multipart(MultiPart::alternative_plain_html(plain, html))
@@ -123,6 +155,37 @@ impl MailService {
             .context("failed to send password reset email")?;
         Ok(())
     }
+}
+
+fn build_runtime(config: MailConfig) -> Result<MailRuntime> {
+    let from_address = config
+        .from_address
+        .parse()
+        .context("VOICE_ELF_SMTP_FROM_ADDRESS is invalid")?;
+    let from = Mailbox::new(Some(config.from_name.clone()), from_address);
+    let transport = if config.configured() {
+        let tls_parameters =
+            TlsParameters::new(config.host.clone()).context("failed to configure SMTP TLS")?;
+        let mut builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&config.host)
+            .port(config.port)
+            .credentials(Credentials::new(
+                config.username.clone(),
+                config.password.clone().unwrap_or_default(),
+            ));
+        builder = match config.security {
+            SmtpSecurity::Wrapper => builder.tls(Tls::Wrapper(tls_parameters)),
+            SmtpSecurity::StartTls => builder.tls(Tls::Required(tls_parameters)),
+            SmtpSecurity::None => builder.tls(Tls::None),
+        };
+        Some(builder.build())
+    } else {
+        None
+    };
+    Ok(MailRuntime {
+        config,
+        transport,
+        from,
+    })
 }
 
 fn escape_html(value: &str) -> String {
@@ -136,10 +199,53 @@ fn escape_html(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::escape_html;
+    use std::time::Duration;
+
+    use super::{MailService, escape_html};
+    use crate::config::{MailConfig, SmtpSecurity};
 
     #[test]
     fn escapes_untrusted_email_content() {
         assert_eq!(escape_html("<a & 'b'>"), "&lt;a &amp; &#39;b&#39;&gt;");
+    }
+
+    #[test]
+    fn replaces_runtime_mail_configuration_without_restart() {
+        let service = MailService::new(MailConfig {
+            enabled: false,
+            host: "smtp.old.example".to_owned(),
+            port: 465,
+            security: SmtpSecurity::Wrapper,
+            username: "old@example.com".to_owned(),
+            password: None,
+            from_address: "old@example.com".to_owned(),
+            from_name: "Old".to_owned(),
+            public_url: None,
+            reset_expiry: Duration::from_secs(30 * 60),
+        })
+        .unwrap();
+        service
+            .update(MailConfig {
+                enabled: false,
+                host: "smtp.new.example".to_owned(),
+                port: 587,
+                security: SmtpSecurity::StartTls,
+                username: "new@example.com".to_owned(),
+                password: Some("secret".to_owned()),
+                from_address: "new@example.com".to_owned(),
+                from_name: "New".to_owned(),
+                public_url: Some("https://voice.example.com".to_owned()),
+                reset_expiry: Duration::from_secs(60 * 60),
+            })
+            .unwrap();
+
+        let status = service.status();
+        assert_eq!(status.host, "smtp.new.example");
+        assert_eq!(status.port, 587);
+        assert!(status.password_configured);
+        assert_eq!(
+            service.public_url().as_deref(),
+            Some("https://voice.example.com")
+        );
     }
 }

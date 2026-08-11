@@ -14,6 +14,8 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
+    config::{MailConfig, SmtpSecurity},
+    mailer::MailService,
     storage::{ManagedUserInput, UserRecord},
 };
 
@@ -27,11 +29,19 @@ const MAX_IMPORT_BYTES: usize = 1024 * 1024;
 const MAX_IMPORT_USERS: usize = 500;
 const PUBLIC_RESET_LIMIT: i64 = 3;
 
-pub(super) fn router() -> Router<AppState> {
+pub(super) fn public_router() -> Router<AppState> {
     Router::new()
         .route("/auth/password/status", get(password_reset_status))
         .route("/auth/password/forgot", post(forgot_password))
         .route("/auth/password/reset", post(reset_password))
+}
+
+pub(super) fn admin_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/admin/email/config",
+            get(admin_mail_status).put(admin_update_mail_config),
+        )
         .route("/admin/email/status", get(admin_mail_status))
         .route("/admin/users", post(admin_create_user))
         .route(
@@ -131,6 +141,106 @@ async fn admin_mail_status(
     cookies: Cookies,
 ) -> Result<Json<crate::mailer::MailStatus>, ApiError> {
     require_admin(&state, &cookies).await?;
+    Ok(Json(state.mail.status()))
+}
+
+#[derive(Deserialize)]
+struct AdminMailConfigInput {
+    enabled: bool,
+    host: String,
+    port: u16,
+    security: String,
+    username: String,
+    password: Option<String>,
+    #[serde(default)]
+    clear_password: bool,
+    from_address: String,
+    from_name: String,
+    public_url: Option<String>,
+    reset_expiry_minutes: u64,
+}
+
+async fn admin_update_mail_config(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Json(input): Json<AdminMailConfigInput>,
+) -> Result<Json<crate::mailer::MailStatus>, ApiError> {
+    let admin = require_admin(&state, &cookies).await?;
+    validate_enum(
+        &input.security,
+        &["wrapper", "starttls", "none"],
+        "SMTP 安全模式",
+    )?;
+    let host = input.host.trim();
+    let username = input.username.trim();
+    let from_address = validate_email(&input.from_address)?;
+    let from_name = input.from_name.trim();
+    if host.is_empty() || host.chars().count() > 255 {
+        return Err(ApiError::bad_request(
+            "SMTP 主机不能为空且不能超过 255 个字符",
+        ));
+    }
+    if input.port == 0 {
+        return Err(ApiError::bad_request("SMTP 端口必须在 1 到 65535 之间"));
+    }
+    if !(5..=1440).contains(&input.reset_expiry_minutes) {
+        return Err(ApiError::bad_request(
+            "重置链接有效期必须在 5 到 1440 分钟之间",
+        ));
+    }
+    if username.chars().count() > 255 || from_name.is_empty() || from_name.chars().count() > 128 {
+        return Err(ApiError::bad_request("SMTP 用户名或发件人名称格式无效"));
+    }
+    let public_url = input
+        .public_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_owned());
+    if let Some(public_url) = &public_url {
+        let url = Url::parse(public_url).map_err(|_| ApiError::bad_request("系统访问地址无效"))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(ApiError::bad_request(
+                "系统访问地址必须是无凭据的 HTTP(S) 地址",
+            ));
+        }
+    }
+    let current = state.mail.config();
+    let password = if input.clear_password {
+        None
+    } else {
+        input
+            .password
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .or(current.password)
+    };
+    let config = MailConfig {
+        enabled: input.enabled,
+        host: host.to_owned(),
+        port: input.port,
+        security: match input.security.as_str() {
+            "starttls" => SmtpSecurity::StartTls,
+            "none" => SmtpSecurity::None,
+            _ => SmtpSecurity::Wrapper,
+        },
+        username: username.to_owned(),
+        password,
+        from_address,
+        from_name: from_name.to_owned(),
+        public_url,
+        reset_expiry: std::time::Duration::from_secs(input.reset_expiry_minutes * 60),
+    };
+    MailService::new(config.clone()).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    database(&state)?
+        .save_email_setting(admin.id, &config)
+        .await
+        .map_err(ApiError::internal)?;
+    state.mail.update(config).map_err(ApiError::internal)?;
     Ok(Json(state.mail.status()))
 }
 
@@ -297,7 +407,7 @@ async fn admin_send_password_reset(
     require_admin(&state, &cookies).await?;
     if !state.mail.configured() {
         return Err(ApiError::unavailable(
-            "SMTP 尚未配置，请先设置 VOICE_ELF_SMTP_PASSWORD 并重启服务",
+            "SMTP 尚未配置，请先在管理端完成邮箱配置",
         ));
     }
     let user = database(&state)?
@@ -363,7 +473,7 @@ async fn issue_password_reset(
     let public_url = state
         .mail
         .public_url()
-        .or(installation.public_url.as_deref())
+        .or_else(|| installation.public_url.clone())
         .ok_or_else(|| ApiError::unavailable("系统访问地址尚未配置"))?;
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let expires_at =
@@ -373,7 +483,7 @@ async fn issue_password_reset(
         .await
         .map_err(ApiError::internal)?;
     let mut reset_url =
-        Url::parse(public_url).map_err(|_| ApiError::unavailable("系统访问地址配置无效"))?;
+        Url::parse(&public_url).map_err(|_| ApiError::unavailable("系统访问地址配置无效"))?;
     reset_url.set_path("/reset-password");
     reset_url.set_query(None);
     reset_url.query_pairs_mut().append_pair("token", &token);

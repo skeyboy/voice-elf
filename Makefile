@@ -1,4 +1,4 @@
-.PHONY: dev dev-start dev-stop dev-restart dev-status dev-logs server web web-deploy-watch web-public web-dev-public web-public-status web-public-stop app-dev app-build app-android-dev app-android-build app-ios-dev app-ios-build setup-models build test
+.PHONY: dev dev-start dev-stop dev-restart dev-status dev-logs server public-server admin-server funasr-setup funasr-start funasr-stop funasr-status qwen-tts-setup qwen-tts-start qwen-tts-stop qwen-tts-status web web-deploy-watch web-public web-dev-public web-public-status web-public-stop app-dev app-build app-android-dev app-android-build app-ios-dev app-ios-build setup-models build test
 
 dev: dev-start
 
@@ -19,6 +19,36 @@ dev-logs:
 
 server:
 	cargo run --bin voice-elf-server
+
+public-server:
+	cargo run --bin voice-elf-public
+
+admin-server:
+	cargo run --bin voice-elf-admin
+
+funasr-setup:
+	./scripts/funasr.sh setup
+
+funasr-start:
+	./scripts/funasr.sh start
+
+funasr-stop:
+	./scripts/funasr.sh stop
+
+funasr-status:
+	./scripts/funasr.sh status
+
+qwen-tts-setup:
+	./scripts/qwen-tts.sh setup
+
+qwen-tts-start:
+	./scripts/qwen-tts.sh start
+
+qwen-tts-stop:
+	./scripts/qwen-tts.sh stop
+
+qwen-tts-status:
+	./scripts/qwen-tts.sh status
 
 web:
 	cd web && npm run dev
@@ -61,7 +91,7 @@ setup-models:
 
 build:
 	cd web && npm run build
-	cargo build --release --bin voice-elf-server
+	cargo build --release --bin voice-elf-server --bin voice-elf-public --bin voice-elf-admin
 
 test:
 	cargo test --workspace

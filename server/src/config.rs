@@ -32,6 +32,7 @@ pub struct AppConfig {
     pub media_dir: PathBuf,
     pub backend_mode: BackendMode,
     pub asr: AsrConfig,
+    pub fun_asr: FunAsrConfig,
     pub moss_transcribe: MossTranscribeConfig,
     pub translator: TranslatorConfig,
     pub tts: TtsConfig,
@@ -146,6 +147,20 @@ pub struct AsrConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct FunAsrConfig {
+    pub enabled: bool,
+    pub manager_script: PathBuf,
+    pub websocket_url: String,
+    pub mode: String,
+    pub chunk_size: [u32; 3],
+    pub chunk_interval: u32,
+    pub encoder_chunk_look_back: u32,
+    pub decoder_chunk_look_back: u32,
+    pub connect_timeout: Duration,
+    pub result_timeout: Duration,
+}
+
+#[derive(Clone, Debug)]
 pub struct MossTranscribeConfig {
     pub enabled: bool,
     pub base_url: String,
@@ -172,6 +187,7 @@ pub struct TtsConfig {
     pub threads: usize,
     pub moss_nano: MossNanoTtsConfig,
     pub index_tts: IndexTtsConfig,
+    pub qwen_tts: QwenTtsConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -197,6 +213,19 @@ pub struct IndexTtsConfig {
     pub runtime_dir: PathBuf,
     pub default_voice_id: String,
     pub voice_map: HashMap<String, String>,
+    pub connect_timeout: Duration,
+    pub timeout: Duration,
+    pub retry_backoff: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct QwenTtsConfig {
+    pub enabled: bool,
+    pub manager_script: PathBuf,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    pub default_voice_id: String,
     pub connect_timeout: Duration,
     pub timeout: Duration,
     pub retry_backoff: Duration,
@@ -247,6 +276,42 @@ impl AppConfig {
                     .ok()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(4),
+            },
+            fun_asr: FunAsrConfig {
+                enabled: env_flag("FUNASR_ENABLED"),
+                manager_script: env::var("FUNASR_MANAGER_SCRIPT")
+                    .map(resolve_workspace_path)
+                    .unwrap_or_else(|_| resolve_workspace_path("scripts/funasr.sh")),
+                websocket_url: env::var("FUNASR_WEBSOCKET_URL")
+                    .unwrap_or_else(|_| "ws://127.0.0.1:10095/".to_owned()),
+                mode: env::var("FUNASR_MODE").unwrap_or_else(|_| "2pass".to_owned()),
+                chunk_size: parse_chunk_size(
+                    &env::var("FUNASR_CHUNK_SIZE").unwrap_or_else(|_| "5,10,5".to_owned()),
+                )?,
+                chunk_interval: env::var("FUNASR_CHUNK_INTERVAL")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(10),
+                encoder_chunk_look_back: env::var("FUNASR_ENCODER_CHUNK_LOOK_BACK")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(4),
+                decoder_chunk_look_back: env::var("FUNASR_DECODER_CHUNK_LOOK_BACK")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0),
+                connect_timeout: Duration::from_secs(
+                    env::var("FUNASR_CONNECT_TIMEOUT_SECONDS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(3),
+                ),
+                result_timeout: Duration::from_secs(
+                    env::var("FUNASR_RESULT_TIMEOUT_SECONDS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(30),
+                ),
             },
             moss_transcribe: MossTranscribeConfig {
                 enabled: env_flag("MOSS_TRANSCRIBE_ENABLED"),
@@ -377,6 +442,39 @@ impl AppConfig {
                             .unwrap_or(30),
                     ),
                 },
+                qwen_tts: QwenTtsConfig {
+                    enabled: env_flag("TTS_QWEN_ENABLED"),
+                    manager_script: env::var("TTS_QWEN_MANAGER_SCRIPT")
+                        .map(resolve_workspace_path)
+                        .unwrap_or_else(|_| resolve_workspace_path("scripts/qwen-tts.sh")),
+                    base_url: env::var("TTS_QWEN_BASE_URL")
+                        .unwrap_or_else(|_| "http://127.0.0.1:18085/v1/".to_owned()),
+                    model: env::var("TTS_QWEN_MODEL")
+                        .unwrap_or_else(|_| "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice".to_owned()),
+                    api_key: env::var("TTS_QWEN_API_KEY")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty()),
+                    default_voice_id: env::var("TTS_QWEN_DEFAULT_VOICE_ID")
+                        .unwrap_or_else(|_| "vivian".to_owned()),
+                    connect_timeout: Duration::from_secs(
+                        env::var("TTS_QWEN_CONNECT_TIMEOUT_SECONDS")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(3),
+                    ),
+                    timeout: Duration::from_secs(
+                        env::var("TTS_QWEN_TIMEOUT_SECONDS")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(300),
+                    ),
+                    retry_backoff: Duration::from_secs(
+                        env::var("TTS_QWEN_RETRY_BACKOFF_SECONDS")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(30),
+                    ),
+                },
             },
             inference_timeout: Duration::from_secs(timeout_seconds),
             database_url: env::var("DATABASE_URL").ok().filter(|url| !url.is_empty()),
@@ -389,15 +487,14 @@ impl AppConfig {
         if self.backend_mode != BackendMode::Local {
             return Ok(());
         }
-        let asr_model = self
+        let qwen_ready = self
             .asr
             .model_dir
             .as_ref()
-            .context("QWEN_ASR_MODEL_DIR is required when VOICE_ELF_BACKEND=local")?;
-        if !asr_model.is_dir() {
+            .is_some_and(|model_dir| model_dir.is_dir());
+        if !qwen_ready && !self.fun_asr.enabled {
             anyhow::bail!(
-                "QWEN_ASR_MODEL_DIR is not a directory: {}",
-                asr_model.display()
+                "VOICE_ELF_BACKEND=local requires a valid QWEN_ASR_MODEL_DIR or FUNASR_ENABLED=true"
             );
         }
         if let Some(model) = &self.translator.model_path
@@ -477,6 +574,17 @@ fn parse_backend_mode(value: Option<String>) -> Result<BackendMode> {
         "local" => Ok(BackendMode::Local),
         value => anyhow::bail!("VOICE_ELF_BACKEND must be 'demo' or 'local', got '{value}'"),
     }
+}
+
+fn parse_chunk_size(value: &str) -> Result<[u32; 3]> {
+    let values = value
+        .split(',')
+        .map(|part| part.trim().parse::<u32>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("FUNASR_CHUNK_SIZE must contain three comma-separated integers")?;
+    values.try_into().map_err(|_| {
+        anyhow::anyhow!("FUNASR_CHUNK_SIZE must contain exactly three comma-separated integers")
+    })
 }
 
 fn authority_config_from_env() -> Result<AuthorityConfig> {

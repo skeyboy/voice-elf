@@ -32,6 +32,9 @@ export default defineConfig({
     strictPort: false,
     proxy: {
       '/voice_elf.v1.ApiService': 'http://127.0.0.1:3001',
+      '/api/admin': 'http://127.0.0.1:3002',
+      '/api/setup': 'http://127.0.0.1:3002',
+      '/api/runtime/dependencies': 'http://127.0.0.1:3002',
       '/api': 'http://127.0.0.1:3001',
       '/media': 'http://127.0.0.1:3001',
       '/ws': {

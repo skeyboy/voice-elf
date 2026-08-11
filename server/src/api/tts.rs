@@ -16,13 +16,16 @@ use crate::{
     config::AuthorityMode,
     index_tts_runtime::IndexTtsRuntimeStatus,
     storage::{AuthorityTenantRecord, TtsSystemSetting},
-    tts_manager::EffectiveTtsSelection,
+    tts_manager::{EffectiveTtsSelection, QwenTtsRuntimeStatus},
 };
 
-pub(super) fn router() -> Router<AppState> {
+pub(super) fn public_router() -> Router<AppState> {
+    Router::new().route("/tts/voices", get(voice_catalog))
+}
+
+pub(super) fn admin_router() -> Router<AppState> {
     Router::new()
         .route("/admin/tts", get(management).patch(update_system))
-        .route("/tts/voices", get(voice_catalog))
         .route("/admin/tts/index-tts/{action}", post(index_runtime_action))
         .route("/admin/tts/voices/{voice_id}", patch(update_voice_alias))
         .route(
@@ -40,6 +43,7 @@ struct TtsManagement {
     applies_to: &'static str,
     voices: Vec<ManagedTtsVoice>,
     index_tts_runtime: IndexTtsRuntimeStatus,
+    qwen_tts_runtime: QwenTtsRuntimeStatus,
 }
 
 #[derive(Clone, Serialize)]
@@ -71,15 +75,19 @@ async fn management(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::unavailable("系统 TTS 默认配置尚未初始化"))?;
     let index_tts_runtime = state.tts.index_runtime_status().await;
+    let qwen_tts_runtime = state.tts.qwen_runtime_status().await;
     let (effective, _, voices) = load_voice_catalog(&state).await?;
     Ok(Json(TtsManagement {
-        providers: state.tts.providers_with_status(&index_tts_runtime),
+        providers: state
+            .tts
+            .providers_with_status(&index_tts_runtime, &qwen_tts_runtime),
         system_setting,
         effective,
         can_update_system: state.authority.mode() != AuthorityMode::Tenant,
         applies_to: "new_room_pipelines",
         voices,
         index_tts_runtime,
+        qwen_tts_runtime,
     }))
 }
 

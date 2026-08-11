@@ -40,23 +40,18 @@ const MIN_VOICE_REFERENCE_MS: i64 = 3_000;
 const MAX_VOICE_REFERENCE_MS: i64 = 15_000;
 
 pub fn router() -> Router<AppState> {
+    public_router().merge(admin_router())
+}
+
+pub fn public_router() -> Router<AppState> {
     Router::new()
-        .merge(authority::router())
+        .merge(authority::public_router())
         .merge(exports::router())
-        .merge(asr::router())
-        .merge(accounts::router())
-        .merge(setup::router())
-        .merge(tts::router())
+        .merge(accounts::public_router())
+        .merge(setup::public_router())
+        .merge(tts::public_router())
         .route("/auth/register", post(register))
-        .route("/auth/login", post(login))
-        .route("/auth/logout", delete(logout))
-        .route("/auth/me", get(me))
-        .route("/admin/overview", get(admin_overview))
-        .route("/admin/users", get(admin_list_users))
-        .route("/admin/users/{user_id}", patch(admin_update_user))
-        .route("/admin/rooms", get(admin_list_rooms))
-        .route("/admin/rooms/{room_id}", patch(admin_update_room))
-        .route("/admin/rooms/{room_id}/inspect", get(admin_inspect_room))
+        .merge(session_router())
         .route(
             "/voice-references",
             get(list_voice_references)
@@ -89,6 +84,36 @@ pub fn file_router() -> Router<AppState> {
         "/voice-references/{voice_id}/audio",
         get(voice_reference_audio),
     )
+}
+
+fn session_router() -> Router<AppState> {
+    Router::new()
+        .route("/auth/login", post(login))
+        .route("/auth/logout", delete(logout))
+        .route("/auth/me", get(me))
+}
+
+pub fn admin_router() -> Router<AppState> {
+    Router::new()
+        .merge(authority::admin_router())
+        .merge(asr::admin_router())
+        .merge(accounts::admin_router())
+        .merge(setup::admin_router())
+        .merge(tts::admin_router())
+        .route("/admin/overview", get(admin_overview))
+        .route("/admin/users", get(admin_list_users))
+        .route("/admin/users/{user_id}", patch(admin_update_user))
+        .route("/admin/rooms", get(admin_list_rooms))
+        .route("/admin/rooms/{room_id}", patch(admin_update_room))
+        .route("/admin/rooms/{room_id}/inspect", get(admin_inspect_room))
+        .route("/admin/change-history", get(admin_change_history))
+}
+
+pub fn admin_http_router() -> Router<AppState> {
+    admin_router()
+        .merge(session_router())
+        .merge(authority::public_router())
+        .merge(setup::public_router())
 }
 
 #[derive(Serialize)]
@@ -567,6 +592,8 @@ async fn admin_update_user(
         .ok_or_else(|| ApiError::not_found("人员不存在"))?;
     if user.status != "active" {
         state.rooms.disconnect_user(user.id).await;
+        let command_id = state.commands.revoke_user_sessions(user.id);
+        tracing::info!(%command_id, user_id = %user.id, "user session revocation command published");
     }
     Ok(Json(user.into()))
 }
@@ -620,6 +647,8 @@ async fn admin_update_room(
         .ok_or_else(|| ApiError::not_found("会议不存在"))?;
     if room.status != "active" {
         state.rooms.close_room(room.id).await;
+        let command_id = state.commands.close_room(room.id);
+        tracing::info!(%command_id, room_id = %room.id, "room closure command published");
     }
     Ok(Json(
         database(&state)?
@@ -660,6 +689,56 @@ async fn admin_inspect_room(
         members,
         utterances,
     }))
+}
+
+#[derive(Deserialize)]
+struct ChangeHistoryQuery {
+    entity_type: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+async fn admin_change_history(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Query(query): Query<ChangeHistoryQuery>,
+) -> Result<Json<crate::storage::Paginated<crate::storage::ChangeHistoryRecord>>, ApiError> {
+    require_admin(&state, &cookies).await?;
+    let entity_type = query
+        .entity_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(entity_type) = entity_type {
+        validate_enum(
+            entity_type,
+            &[
+                "users",
+                "rooms",
+                "room_members",
+                "voice_sessions",
+                "voice_utterances",
+                "voice_utterance_speakers",
+                "voice_utterance_refinements",
+                "voice_references",
+                "system_installations",
+                "system_email_settings",
+                "asr_system_settings",
+                "tts_system_settings",
+                "tts_voice_aliases",
+                "authority_tenants",
+                "authority_instances",
+            ],
+            "历史对象类型",
+        )?;
+    }
+    let (page, page_size) = pagination(query.page, query.page_size);
+    Ok(Json(
+        database(&state)?
+            .list_change_history(entity_type, page, page_size)
+            .await
+            .map_err(ApiError::internal)?,
+    ))
 }
 
 #[derive(Deserialize)]
