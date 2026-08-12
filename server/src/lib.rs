@@ -7,6 +7,7 @@ mod config;
 mod control;
 mod grpc;
 mod index_tts_runtime;
+mod language_policy;
 mod mailer;
 mod media;
 mod pipeline;
@@ -305,6 +306,7 @@ fn with_public_assets(
     let app = if include_admin_pages {
         app.route_service("/admin", ServeFile::new(&index_file))
             .route_service("/admin/dependencies", ServeFile::new(&index_file))
+            .route_service("/admin/lexicons", ServeFile::new(&index_file))
     } else {
         app
     };
@@ -337,6 +339,7 @@ fn admin_app(state: AppState, config: &AppConfig) -> Router {
         .route_service("/setup", ServeFile::new(&index_file))
         .route_service("/admin", ServeFile::new(&index_file))
         .route_service("/admin/dependencies", ServeFile::new(&index_file))
+        .route_service("/admin/lexicons", ServeFile::new(&index_file))
         .fallback_service(ServeDir::new(&config.web_dist).append_index_html_on_directories(true))
         .layer(CompressionLayer::new())
         .layer(CookieManagerLayer::new())

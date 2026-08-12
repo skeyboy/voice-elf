@@ -114,6 +114,7 @@ pub(super) struct PipelineWorkers {
     transcription_tx: mpsc::Sender<UtteranceJob>,
     transcriber: Arc<dyn Transcriber>,
     translator: Arc<dyn Translator>,
+    language_policy: crate::language_policy::LanguagePolicy,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -121,6 +122,7 @@ impl PipelineWorkers {
     pub(super) fn start(context: PipelineContext) -> Self {
         let transcriber = context.services.transcriber.clone();
         let translator = context.services.translator.clone();
+        let language_policy = context.language_policy.clone();
         let (transcription_tx, transcription_rx) = mpsc::channel(TEXT_QUEUE_CAPACITY);
         let (translation_tx, translation_rx) = mpsc::channel(TEXT_QUEUE_CAPACITY);
         let (synthesis_tx, synthesis_rx) = mpsc::channel(TEXT_QUEUE_CAPACITY);
@@ -146,6 +148,7 @@ impl PipelineWorkers {
             transcription_tx,
             transcriber,
             translator,
+            language_policy,
             handles,
         }
     }
@@ -175,6 +178,7 @@ impl PipelineWorkers {
                     event_id.clone(),
                     language.clone(),
                     config.target_language.clone(),
+                    self.language_policy.clone(),
                     preview_rx,
                 ));
                 let updates = tokio::spawn(async move {
@@ -314,6 +318,7 @@ async fn run_live_translation_preview(
     utterance_id: String,
     source_language: String,
     target_language: String,
+    policy: crate::language_policy::LanguagePolicy,
     mut source: watch::Receiver<String>,
 ) {
     let mut source_ready = false;
@@ -336,16 +341,18 @@ async fn run_live_translation_preview(
                 }
             }
         }
-        let source_text = source.borrow_and_update().trim().to_owned();
+        let source_text = policy.sanitize(source.borrow_and_update().trim());
         if source_text.is_empty() {
             continue;
         }
 
         let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+        let terminology = policy.translation_terms();
         let translation = translator.translate_streaming(
             &source_text,
             &source_language,
             &target_language,
+            &terminology,
             updates_tx,
         );
         tokio::pin!(translation);
@@ -361,12 +368,13 @@ async fn run_live_translation_preview(
                 }
                 Some(delta) = updates_rx.recv() => {
                     translated_text.push_str(&delta);
+                    let visible_text = policy.normalize_translation(&translated_text);
                     if send_live_translation_delta(
                         &output,
                         &utterance_id,
                         &target_language,
-                        delta,
-                        &translated_text,
+                        String::new(),
+                        &visible_text,
                     ).await.is_err() {
                         return;
                     }
@@ -376,12 +384,13 @@ async fn run_live_translation_preview(
                         Ok(final_text) => {
                             while let Ok(delta) = updates_rx.try_recv() {
                                 translated_text.push_str(&delta);
+                                let visible_text = policy.normalize_translation(&translated_text);
                                 if send_live_translation_delta(
                                     &output,
                                     &utterance_id,
                                     &target_language,
-                                    delta,
-                                    &translated_text,
+                                    String::new(),
+                                    &visible_text,
                                 ).await.is_err() {
                                     return;
                                 }
@@ -391,8 +400,8 @@ async fn run_live_translation_preview(
                                     &output,
                                     &utterance_id,
                                     &target_language,
-                                    final_text.clone(),
-                                    &final_text,
+                                    String::new(),
+                                    &policy.normalize_translation(&final_text),
                                 ).await.is_err()
                             {
                                 return;
@@ -456,6 +465,7 @@ mod tests {
             text: &str,
             _source_language: &str,
             _target_language: &str,
+            _terminology: &[crate::backends::TranslationTerm],
             updates: mpsc::UnboundedSender<String>,
         ) -> anyhow::Result<String> {
             if text == "first" {
@@ -477,6 +487,7 @@ mod tests {
             "utterance-1".to_owned(),
             "en".to_owned(),
             "zh".to_owned(),
+            crate::language_policy::LanguagePolicy::default(),
             source_updates,
         ));
 
@@ -520,6 +531,7 @@ mod tests {
         let context = PipelineContext {
             services,
             database: None,
+            language_policy: crate::language_policy::LanguagePolicy::default(),
             media,
             session_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),
@@ -632,6 +644,7 @@ mod tests {
         let context = PipelineContext {
             services,
             database: None,
+            language_policy: crate::language_policy::LanguagePolicy::default(),
             media,
             session_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),
@@ -700,6 +713,7 @@ mod tests {
         let context = PipelineContext {
             services,
             database: None,
+            language_policy: crate::language_policy::LanguagePolicy::default(),
             media,
             session_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),

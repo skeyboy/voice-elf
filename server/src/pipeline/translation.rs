@@ -65,11 +65,14 @@ async fn translate(context: &PipelineContext, mut job: TranslationJob) -> Result
     let mut live_text = String::new();
     let started_at = Instant::now();
     let mut first_delta = true;
+    let source_text = context.language_policy.sanitize(&job.transcription.text);
+    let terminology = context.language_policy.translation_terms();
     let translated = {
         let translation = context.services.translator.translate_streaming(
-            &job.transcription.text,
+            &source_text,
             &job.transcription.language,
             &job.utterance.config.target_language,
+            &terminology,
             updates_tx,
         );
         tokio::pin!(translation);
@@ -86,12 +89,13 @@ async fn translate(context: &PipelineContext, mut job: TranslationJob) -> Result
                         );
                     }
                     live_text.push_str(&delta);
+                    let visible_text = context.language_policy.normalize_translation(&live_text);
                     send_event(
                         &context.output,
                         ServerEvent::TranslationDelta {
                             utterance_id: utterance_id.clone(),
-                            delta,
-                            text: live_text.clone(),
+                            delta: String::new(),
+                            text: visible_text,
                             target_language: job.utterance.config.target_language.clone(),
                             done: false,
                         },
@@ -103,18 +107,20 @@ async fn translate(context: &PipelineContext, mut job: TranslationJob) -> Result
     };
     while let Ok(delta) = updates_rx.try_recv() {
         live_text.push_str(&delta);
+        let visible_text = context.language_policy.normalize_translation(&live_text);
         send_event(
             &context.output,
             ServerEvent::TranslationDelta {
                 utterance_id: utterance_id.clone(),
-                delta,
-                text: live_text.clone(),
+                delta: String::new(),
+                text: visible_text,
                 target_language: job.utterance.config.target_language.clone(),
                 done: false,
             },
         )
         .await?;
     }
+    let translated = context.language_policy.normalize_translation(&translated);
     job.utterance.latency.mark_translation_complete();
     let text_latency = job.utterance.latency.text_report(job.utterance.audio.len());
     if let Some(database) = &context.database {

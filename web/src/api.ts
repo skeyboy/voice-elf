@@ -86,6 +86,43 @@ export interface RoomInput {
   max_utterance_seconds: number;
 }
 
+export interface TerminologyDictionary {
+  id: string;
+  name: string;
+  industry: string;
+  description: string;
+  source_language: string;
+  target_language: string;
+  status: 'active' | 'disabled';
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TerminologyEntry {
+  id: string;
+  dictionary_id: string;
+  source_term: string;
+  aliases: string[];
+  target_term: string;
+  priority: number;
+  status: 'active' | 'disabled';
+}
+
+export interface BlockedWord {
+  id: string;
+  word: string;
+  replacement: string;
+  match_mode: 'substring' | 'word';
+  case_sensitive: boolean;
+  status: 'active' | 'disabled';
+  note: string;
+}
+
+export interface RoomTerminologyBinding {
+  dictionary_id: string | null;
+  dictionary_name: string | null;
+}
+
 export interface VoiceReference {
   id: string;
   name: string;

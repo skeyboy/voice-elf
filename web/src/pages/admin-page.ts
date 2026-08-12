@@ -85,6 +85,7 @@ export class AdminPage implements Page {
             <h1>系统管理</h1>
           </div>
           <div class="admin-heading-actions">
+            <a class="button-secondary" href="/admin/lexicons"><i data-lucide="library"></i><span>词库管理</span></a>
             <a class="button-secondary" href="/admin/dependencies"><i data-lucide="activity"></i><span>依赖观测</span></a>
             <button class="icon-button admin-refresh" type="button" title="刷新管理数据" aria-label="刷新管理数据"><i data-lucide="refresh-cw"></i></button>
           </div>

@@ -87,6 +87,12 @@ pub async fn run_pipeline(
     let workers = PipelineWorkers::start(PipelineContext {
         services,
         database: database.clone(),
+        language_policy: crate::language_policy::LanguagePolicy::load(
+            database.as_ref(),
+            identity.room_id,
+        )
+        .await
+        .context("failed to load room language policy")?,
         media,
         session_id,
         user_id: identity.user_id,

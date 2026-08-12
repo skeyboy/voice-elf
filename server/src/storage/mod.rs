@@ -15,6 +15,12 @@ use serde::Serialize;
 use url::Url;
 use uuid::Uuid;
 
+mod lexicons;
+pub use lexicons::{
+    BlockedWord, BlockedWordInput, RoomTerminologyBinding, TerminologyDictionary,
+    TerminologyDictionaryInput, TerminologyEntry, TerminologyEntryInput,
+};
+
 use crate::{
     protocol::SessionConfig,
     schema::{

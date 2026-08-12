@@ -706,8 +706,16 @@ pub trait Translator: Send + Sync {
         text: &str,
         source_language: &str,
         target_language: &str,
+        terminology: &[TranslationTerm],
         updates: mpsc::UnboundedSender<String>,
     ) -> Result<String>;
+}
+
+#[derive(Clone, Debug)]
+pub struct TranslationTerm {
+    pub source: String,
+    pub target: String,
+    pub aliases: Vec<String>,
 }
 
 #[derive(Clone)]

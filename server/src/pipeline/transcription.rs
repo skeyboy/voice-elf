@@ -77,7 +77,7 @@ async fn transcribe(context: &PipelineContext, mut job: UtteranceJob) -> Result<
     )
     .await?;
     prepare_utterance(context, &mut job).await?;
-    let transcription = if let Some(live) = job.live.take() {
+    let mut transcription = if let Some(live) = job.live.take() {
         match live.finish().await {
             Ok(primary) => primary,
             Err(error) => {
@@ -88,6 +88,9 @@ async fn transcribe(context: &PipelineContext, mut job: UtteranceJob) -> Result<
     } else {
         transcribe_completed_audio(context, &job, &utterance_id).await?
     };
+    transcription.text = context
+        .language_policy
+        .normalize_transcript(&transcription.text);
     send_event(
         &context.output,
         ServerEvent::TranscriptDelta {

@@ -29,6 +29,7 @@ mod accounts;
 mod asr;
 mod authority;
 mod exports;
+mod lexicons;
 mod setup;
 mod tts;
 
@@ -50,6 +51,7 @@ pub fn public_router() -> Router<AppState> {
         .merge(accounts::public_router())
         .merge(setup::public_router())
         .merge(tts::public_router())
+        .merge(lexicons::public_router())
         .route("/auth/register", post(register))
         .merge(session_router())
         .route(
@@ -100,6 +102,7 @@ pub fn admin_router() -> Router<AppState> {
         .merge(accounts::admin_router())
         .merge(setup::admin_router())
         .merge(tts::admin_router())
+        .merge(lexicons::admin_router())
         .route("/admin/overview", get(admin_overview))
         .route("/admin/users", get(admin_list_users))
         .route("/admin/users/{user_id}", patch(admin_update_user))

@@ -39,7 +39,13 @@ pub(super) async fn run_refinement_worker(
                 .transcribe_completed(&job.audio, &job.source_language)
                 .await
             {
-                Ok(transcription) => {
+                Ok(mut transcription) => {
+                    transcription.text = context
+                        .language_policy
+                        .normalize_transcript(&transcription.text);
+                    for segment in &mut transcription.segments {
+                        segment.text = context.language_policy.normalize_transcript(&segment.text);
+                    }
                     if let Some(database) = &context.database
                         && let Err(error) = database
                             .save_utterance_refinement(RefinementUpdate {

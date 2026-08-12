@@ -1,4 +1,20 @@
 diesel::table! {
+    blocked_words (id) {
+        id -> Uuid,
+        word -> Varchar,
+        replacement -> Varchar,
+        match_mode -> Varchar,
+        case_sensitive -> Bool,
+        status -> Varchar,
+        note -> Text,
+        updated_by -> Nullable<Uuid>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+        deleted_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
     data_change_history (id) {
         id -> Uuid,
         entity_type -> Varchar,
@@ -9,6 +25,51 @@ diesel::table! {
         before_state -> Nullable<Jsonb>,
         after_state -> Nullable<Jsonb>,
         created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    room_terminology_bindings (room_id) {
+        room_id -> Uuid,
+        id -> Uuid,
+        dictionary_id -> Uuid,
+        status -> Varchar,
+        updated_by -> Nullable<Uuid>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+        deleted_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    terminology_dictionaries (id) {
+        id -> Uuid,
+        name -> Varchar,
+        industry -> Varchar,
+        description -> Text,
+        source_language -> Varchar,
+        target_language -> Varchar,
+        status -> Varchar,
+        updated_by -> Nullable<Uuid>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+        deleted_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    terminology_entries (id) {
+        id -> Uuid,
+        dictionary_id -> Uuid,
+        source_term -> Varchar,
+        aliases -> Array<Text>,
+        target_term -> Varchar,
+        priority -> Int4,
+        status -> Varchar,
+        updated_by -> Nullable<Uuid>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+        deleted_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -270,6 +331,9 @@ diesel::table! {
 
 diesel::joinable!(auth_sessions -> users (user_id));
 diesel::joinable!(data_change_history -> users (actor_user_id));
+diesel::joinable!(room_terminology_bindings -> rooms (room_id));
+diesel::joinable!(room_terminology_bindings -> terminology_dictionaries (dictionary_id));
+diesel::joinable!(terminology_entries -> terminology_dictionaries (dictionary_id));
 diesel::joinable!(asr_system_settings -> users (updated_by));
 diesel::joinable!(tts_system_settings -> users (updated_by));
 diesel::joinable!(tts_voice_aliases -> users (updated_by));
@@ -289,6 +353,7 @@ diesel::joinable!(voice_utterance_refinements -> voice_utterances (utterance_id)
 diesel::joinable!(voice_utterances -> rooms (room_id));
 diesel::joinable!(voice_utterances -> voice_sessions (session_id));
 diesel::allow_tables_to_appear_in_same_query!(
+    blocked_words,
     auth_sessions,
     data_change_history,
     asr_system_settings,
@@ -301,7 +366,10 @@ diesel::allow_tables_to_appear_in_same_query!(
     password_reset_tokens,
     room_members,
     rooms,
+    room_terminology_bindings,
     system_installations,
+    terminology_dictionaries,
+    terminology_entries,
     system_email_settings,
     users,
     voice_references,

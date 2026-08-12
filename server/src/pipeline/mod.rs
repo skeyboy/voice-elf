@@ -40,6 +40,7 @@ pub struct PipelineIdentity {
 struct PipelineContext {
     services: Arc<AppServices>,
     database: Option<Database>,
+    language_policy: crate::language_policy::LanguagePolicy,
     media: MediaStore,
     session_id: Uuid,
     user_id: Uuid,

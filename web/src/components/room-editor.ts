@@ -1,4 +1,4 @@
-import { apiRequest, type RoomInput, type RoomSummary } from '../api';
+import { apiRequest, type RoomInput, type RoomSummary, type RoomTerminologyBinding, type TerminologyDictionary } from '../api';
 import { languageOptions } from '../shared/languages';
 import { refreshIcons } from './icons';
 
@@ -15,6 +15,7 @@ export class RoomEditor {
           <div><small>ROOM SETTINGS</small><h2>新建房间</h2></div>
           <button class="icon-button close-editor" type="button" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
         </div>
+        <label><span>行业术语库</span><select name="terminology_dictionary_id"><option value="">不使用行业词库</option></select><small>用于当前会议的识别纠正和译文规范</small></label>
         <label><span>房间名称</span><input name="name" maxlength="120" required></label>
         <div class="editor-language-pair">
           <label><span>源语言</span><select name="source_language">${languageOptions(true)}</select></label>
@@ -44,6 +45,7 @@ export class RoomEditor {
     );
     this.dialog.querySelector('.form-error')!.textContent = '';
     this.dialog.showModal();
+    void this.loadTerminology(room?.id);
   }
 
   destroy() {
@@ -60,21 +62,47 @@ export class RoomEditor {
       target_language: String(values.get('target_language') ?? 'zh'),
       max_utterance_seconds: Number(values.get('max_utterance_seconds') ?? 20),
     };
+    const dictionaryId = String(values.get('terminology_dictionary_id') ?? '') || null;
     const errorElement = form.querySelector<HTMLElement>('.form-error')!;
     const submit = form.querySelector<HTMLButtonElement>('[type="submit"]')!;
     errorElement.textContent = '';
     submit.disabled = true;
+    let savedRoom: RoomSummary | null = null;
     try {
       const saved = await apiRequest<RoomSummary>(
         this.room ? `/api/rooms/${this.room.id}` : '/api/rooms',
         { method: this.room ? 'PATCH' : 'POST', body: JSON.stringify(input) },
       );
+      savedRoom = saved;
+      await apiRequest(`/api/rooms/${saved.id}/terminology-dictionary`, {
+        method: 'PATCH', body: JSON.stringify({ dictionary_id: dictionaryId }),
+      });
       this.dialog.close();
       this.onSaved(saved);
     } catch (error) {
+      if (!this.room && savedRoom) this.room = savedRoom;
       errorElement.textContent = error instanceof Error ? error.message : '无法保存房间';
     } finally {
       submit.disabled = false;
     }
+  }
+
+  private async loadTerminology(roomId?: string) {
+    const select = this.dialog.querySelector<HTMLSelectElement>('[name="terminology_dictionary_id"]')!;
+    select.disabled = true;
+    try {
+      const [dictionaries, binding] = await Promise.all([
+        apiRequest<TerminologyDictionary[]>('/api/terminology-dictionaries'),
+        roomId ? apiRequest<RoomTerminologyBinding>(`/api/rooms/${roomId}/terminology-dictionary`) : Promise.resolve(null),
+      ]);
+      select.innerHTML = '<option value="">不使用行业词库</option>' + dictionaries.map((item) => `<option value="${item.id}">${this.escape(item.industry)} · ${this.escape(item.name)}</option>`).join('');
+      select.value = binding?.dictionary_id ?? '';
+    } catch (error) {
+      this.dialog.querySelector('.form-error')!.textContent = error instanceof Error ? error.message : '无法加载行业词库';
+    } finally { select.disabled = false; }
+  }
+
+  private escape(value: string) {
+    const node = document.createElement('span'); node.textContent = value; return node.innerHTML;
   }
 }

@@ -44,6 +44,7 @@ pub(super) async fn run_synthesis_worker(
 }
 
 async fn synthesize(context: &PipelineContext, mut job: SynthesisJob) -> Result<()> {
+    job.translated_text = context.language_policy.sanitize(&job.translated_text);
     let utterance_id = job.utterance.id.to_string();
     send_state(
         &context.output,

@@ -8,7 +8,7 @@ use tokio::{io::AsyncReadExt, process::Command, sync::mpsc, time::timeout};
 
 use crate::config::TranslatorConfig;
 
-use super::{Translator, language_name, short_demo_delay};
+use super::{TranslationTerm, Translator, language_name, short_demo_delay};
 
 pub struct DemoTranslator;
 
@@ -25,6 +25,7 @@ impl Translator for DemoTranslator {
         text: &str,
         _source_language: &str,
         target_language: &str,
+        _terminology: &[TranslationTerm],
         updates: mpsc::UnboundedSender<String>,
     ) -> Result<String> {
         short_demo_delay(Duration::from_millis(110)).await;
@@ -103,12 +104,14 @@ impl Translator for LocalLlmTranslator {
         text: &str,
         source_language: &str,
         target_language: &str,
+        terminology: &[TranslationTerm],
         updates: mpsc::UnboundedSender<String>,
     ) -> Result<String> {
         let system = format!(
-            "Translate from {} to {}. Return only the translation. Preserve names, numbers, and meaning.",
+            "Translate from {} to {}. Return only the translation. Preserve names, numbers, and meaning.{}",
             language_name(source_language),
-            language_name(target_language)
+            language_name(target_language),
+            glossary_instruction(terminology)
         );
         let request = ChatRequest {
             model: &self.model,
@@ -181,12 +184,14 @@ impl Translator for LlamaCppTranslator {
         text: &str,
         source_language: &str,
         target_language: &str,
+        terminology: &[TranslationTerm],
         updates: mpsc::UnboundedSender<String>,
     ) -> Result<String> {
         let prompt = format!(
-            "<|im_start|>system\nTranslate from {} to {}. Return only the translation. Preserve names, numbers, and meaning. /no_think<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>system\nTranslate from {} to {}. Return only the translation. Preserve names, numbers, and meaning.{} /no_think<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
             language_name(source_language),
             language_name(target_language),
+            glossary_instruction(terminology),
             text
         );
         let mut child = Command::new(&self.binary)
@@ -269,6 +274,26 @@ impl Translator for LlamaCppTranslator {
         }
         Ok(translated)
     }
+}
+
+fn glossary_instruction(terms: &[TranslationTerm]) -> String {
+    if terms.is_empty() {
+        return String::new();
+    }
+    let mappings = terms
+        .iter()
+        .take(200)
+        .map(|term| {
+            let aliases = if term.aliases.is_empty() {
+                String::new()
+            } else {
+                format!(" (aliases: {})", term.aliases.join(", "))
+            };
+            format!("{}{} => {}", term.source, aliases, term.target)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(" Apply this mandatory terminology glossary exactly: {mappings}.")
 }
 
 fn take_valid_utf8(pending: &mut Vec<u8>) -> Result<Option<String>> {
