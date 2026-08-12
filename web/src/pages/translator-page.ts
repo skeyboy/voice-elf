@@ -112,6 +112,7 @@ export class TranslatorPage implements Page {
     private readonly onDeleted: () => void,
     private readonly onConnection: (status: ConnectionStatus) => void,
     private readonly onError: (message: string) => void,
+    private readonly onWarning: (message: string) => void,
   ) {}
 
   async mount(root: HTMLElement) {
@@ -255,6 +256,7 @@ export class TranslatorPage implements Page {
         onConnection: (status) => this.setConnection(status),
         onRecording: (recording) => this.setRecording(recording),
         onCaptureError: this.onError,
+        onSystemAudioFallback: (message) => this.handleSystemAudioFallback(message),
       },
     );
     this.voiceSession.connect();
@@ -499,6 +501,16 @@ export class TranslatorPage implements Page {
       return;
     }
     void this.voiceSession?.reconfigureCapture();
+  }
+
+  private handleSystemAudioFallback(message: string) {
+    const values = {
+      ...this.captureOptionValues(),
+      systemAudio: false,
+    };
+    this.updateCaptureOptions(values);
+    this.captureOptions?.setValues(values);
+    this.onWarning(message);
   }
 
   private handleEvent(event: ServerEvent) {

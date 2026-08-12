@@ -303,7 +303,11 @@ fn is_transport_header(name: &HeaderName) -> bool {
     )
 }
 
-pub(crate) fn router(state: AppState, routes: Router<AppState>, realtime_enabled: bool) -> Router {
+pub(crate) fn router(
+    state: AppState,
+    routes: Router<AppState>,
+    realtime_enabled: bool,
+) -> Router<AppState> {
     let api_router = Router::new()
         .route("/api/health", axum::routing::get(crate::health))
         .nest("/api", routes)
@@ -315,5 +319,7 @@ pub(crate) fn router(state: AppState, routes: Router<AppState>, realtime_enabled
         sessions: Arc::default(),
         realtime_enabled,
     });
-    tonic::service::Routes::new(tonic_web::GrpcWebLayer::new().layer(service)).into_axum_router()
+    tonic::service::Routes::new(tonic_web::GrpcWebLayer::new().layer(service))
+        .into_axum_router()
+        .with_state(())
 }

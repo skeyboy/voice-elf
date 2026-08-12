@@ -3,7 +3,7 @@
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
   import { TranslatorPage } from '../../../pages/translator-page';
-  import { connectionStatus, currentUser, showError } from '$lib/session';
+  import { connectionStatus, currentUser, showError, showToast } from '$lib/session';
 
   let host: HTMLElement;
 
@@ -18,6 +18,7 @@
         () => void goto('/rooms', { replaceState: true }),
         (status) => connectionStatus.set(status),
         showError,
+        (message) => showToast(message, 5200, 'warning'),
       );
       void translatorPage.mount(host);
       destroyPage = () => void translatorPage.destroy();

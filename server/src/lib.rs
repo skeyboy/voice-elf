@@ -263,8 +263,9 @@ fn combined_app(state: AppState, config: &AppConfig, media: &MediaStore) -> Rout
         .route("/api/health", get(health))
         .route("/api/runtime/dependencies", get(runtime_dependencies))
         .nest("/api", api::file_router())
-        .route("/ws", get(websocket));
-    with_public_assets(app, state, config, media, true).merge(grpc)
+        .route("/ws", get(websocket))
+        .merge(grpc);
+    with_public_assets(app, state, config, media, true)
 }
 
 fn public_app(state: AppState, config: &AppConfig, media: &MediaStore) -> Router {
@@ -273,8 +274,9 @@ fn public_app(state: AppState, config: &AppConfig, media: &MediaStore) -> Router
         .route("/api/health", get(health))
         .route("/api/runtime/dependencies", get(runtime_dependencies))
         .nest("/api", api::file_router())
-        .route("/ws", get(websocket));
-    with_public_assets(app, state, config, media, false).merge(grpc)
+        .route("/ws", get(websocket))
+        .merge(grpc);
+    with_public_assets(app, state, config, media, false)
 }
 
 fn with_public_assets(
@@ -336,6 +338,7 @@ fn admin_app(state: AppState, config: &AppConfig) -> Router {
         .route("/api/health", get(admin_health))
         .route("/api/runtime/dependencies", get(local_runtime_dependencies))
         .nest("/api", api::admin_http_router())
+        .merge(grpc)
         .route_service("/setup", ServeFile::new(&index_file))
         .route_service("/admin", ServeFile::new(&index_file))
         .route_service("/admin/dependencies", ServeFile::new(&index_file))
@@ -345,7 +348,6 @@ fn admin_app(state: AppState, config: &AppConfig) -> Router {
         .layer(CookieManagerLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
-        .merge(grpc)
 }
 
 async fn serve_http(

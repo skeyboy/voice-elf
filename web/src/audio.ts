@@ -85,7 +85,15 @@ function isChromiumBrowser() {
   return /Chrome|Chromium|CriOS|Edg\//i.test(navigator.userAgent);
 }
 
+function isSafariBrowser() {
+  return /Safari\//i.test(navigator.userAgent) && !isChromiumBrowser();
+}
+
 function webDisplayAudioOptions(): ExtendedDisplayMediaStreamOptions {
+  if (!isChromiumBrowser()) {
+    // WebKit rejects or ignores Chromium-only display capture constraints.
+    return { video: true, audio: true };
+  }
   return {
     video: { displaySurface: 'browser' },
     audio: { suppressLocalAudioPlayback: false },
@@ -145,8 +153,6 @@ export function scheduleVadPreload() {
 
 export function supportsSystemAudioCapture() {
   if (supportsAndroidSystemAudio() || isMacNativeShell()) return true;
-  // Safari and Firefox expose getDisplayMedia on macOS but return video-only streams.
-  if (isMacOSBrowser() && !isChromiumBrowser()) return false;
   return Boolean(
     window.isSecureContext && navigator.mediaDevices?.getDisplayMedia,
   );
@@ -157,7 +163,9 @@ export function systemAudioCaptureHelp() {
   if (isMacOSBrowser() && isChromiumBrowser()) {
     return '请选择带声音的 Chrome 标签页或窗口，并开启共享音频';
   }
-  if (isMacOSBrowser()) return 'macOS 网页内录需要使用 Chrome 浏览器';
+  if (isMacOSBrowser() && isSafariBrowser()) {
+    return 'Safari 将尝试读取共享来源音频；无音轨时混合录音会保留麦克风';
+  }
   return '标签页、窗口或设备播放声音';
 }
 
@@ -317,6 +325,7 @@ export class AudioCapture {
     onLevel: (level: number) => void,
     onBoundary: (boundary: VadBoundary) => void,
     onReady: () => void,
+    onSystemAudioFallback: (message: string) => void,
     onFatalError: (error: Error) => void,
   ) {
     if (this.context) return;
@@ -329,6 +338,8 @@ export class AudioCapture {
       throw new Error('请至少选择麦克风或系统音频');
     }
     const streams: MediaStream[] = [];
+    let displayStream: MediaStream | null = null;
+    let systemAudioActive = options.systemAudio;
     if (androidShell) {
       this.androidCapture = await startAndroidCapture(
         options.microphone,
@@ -351,7 +362,14 @@ export class AudioCapture {
           if (display.getAudioTracks().length === 0) {
             const surface = display.getVideoTracks()[0]?.getSettings().displaySurface;
             display.getTracks().forEach((track) => track.stop());
-            if (isMacOSBrowser()) {
+            if (isSafariBrowser() && options.microphone) {
+              systemAudioActive = false;
+              onSystemAudioFallback('Safari 未提供共享来源音频，已自动切换为麦克风录音；如需系统内录，请使用 Voice Elf 桌面端或 Chrome');
+            } else if (isSafariBrowser()) {
+              throw new Error(
+                'Safari 当前未提供系统音频轨道。请改用 Voice Elf macOS 桌面端，或使用 Chrome 选择带声音的标签页并开启共享音频',
+              );
+            } else if (isMacOSBrowser()) {
               if (surface === 'browser') {
                 throw new Error(
                   '所选 Chrome 标签页未共享音频，请重新选择正在播放声音的标签页并开启“共享标签页音频”',
@@ -365,10 +383,13 @@ export class AudioCapture {
               throw new Error(
                 '整个屏幕没有提供系统音频轨道，请改选带声音的 Chrome 标签页或支持音频的窗口',
               );
+            } else {
+              throw new Error('所选共享来源没有音频轨道，请重新选择并开启共享音频');
             }
-            throw new Error('所选共享来源没有音频轨道，请重新选择并开启共享音频');
+          } else {
+            displayStream = display;
+            streams.push(display);
           }
-          streams.push(display);
         }
       } catch (error) {
         if (this.androidCapture) stopAndroidCapture();
@@ -503,7 +524,6 @@ export class AudioCapture {
         this.onFatalError?.(new Error(event.message));
       }
     });
-    const displayStream = options.systemAudio && !androidShell && !macShell ? streams[0] : null;
     displayStream?.getAudioTracks().forEach((track) => {
       track.addEventListener(
         'ended',
@@ -522,7 +542,7 @@ export class AudioCapture {
     this.limiter = limiter;
     this.context = context;
     this.node = node;
-    this.currentOptions = { ...options };
+    this.currentOptions = { ...options, systemAudio: systemAudioActive };
     if (macShell && options.systemAudio) {
       if (!node) {
         await this.stop();

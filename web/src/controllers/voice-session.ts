@@ -21,6 +21,7 @@ interface VoiceSessionCallbacks {
   onConnection: (status: ConnectionStatus) => void;
   onRecording: (recording: boolean) => void;
   onCaptureError: (message: string) => void;
+  onSystemAudioFallback: (message: string) => void;
 }
 
 export class VoiceSession {
@@ -203,6 +204,7 @@ export class VoiceSession {
       (level) => this.waveform.push(level),
       (boundary) => this.handleVadBoundary(boundary),
       () => this.sendConfig(),
+      (message) => this.callbacks.onSystemAudioFallback(message),
       (error) => void this.handleCaptureFailure(error),
     );
   }
